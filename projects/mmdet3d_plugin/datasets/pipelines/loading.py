@@ -24,6 +24,18 @@ class LoadMultiViewImageFromFilesInCeph(object):
         self.file_client = mmcv.FileClient(**self.file_client_args)
         self.img_root = img_root
 
+    def _resolve_img_path(self, img_path):
+        if not self.img_root:
+            return img_path
+
+        if self.file_client_args['backend'] == 'disk':
+            if os.path.isabs(img_path) or os.path.exists(img_path):
+                return img_path
+        elif '://' in img_path or os.path.isabs(img_path):
+            return img_path
+
+        return os.path.join(self.img_root, img_path)
+
     def __call__(self, results):
         """Call function to load multi-view image from files.
 
@@ -45,7 +57,7 @@ class LoadMultiViewImageFromFilesInCeph(object):
         images_multiView = []
         filename = results['img_filename']
         for img_path in filename:
-            img_path = os.path.join(self.img_root, img_path)
+            img_path = self._resolve_img_path(img_path)
             if self.file_client_args['backend'] == 'petrel':
                 img_bytes = self.file_client.get(img_path)
                 img = mmcv.imfrombytes(img_bytes)
