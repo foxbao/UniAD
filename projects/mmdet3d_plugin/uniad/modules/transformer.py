@@ -70,6 +70,7 @@ class PerceptionTransformer(BaseModule):
             self.num_feature_levels, self.embed_dims))
         self.cams_embeds = nn.Parameter(
             torch.Tensor(self.num_cams, self.embed_dims))
+        self.reference_points = nn.Linear(self.embed_dims, 3)
         self.can_bus_mlp = nn.Sequential(
             nn.Linear(18, self.embed_dims // 2),
             nn.ReLU(inplace=True),
@@ -102,6 +103,8 @@ class PerceptionTransformer(BaseModule):
             bev_queries,
             bev_h,
             bev_w,
+            real_h=None,
+            real_w=None,
             grid_length=[0.512, 0.512],
             bev_pos=None,
             prev_bev=None,
@@ -114,21 +117,37 @@ class PerceptionTransformer(BaseModule):
         bev_queries = bev_queries.unsqueeze(1).repeat(1, bs, 1)
         bev_pos = bev_pos.flatten(2).permute(2, 0, 1)
         # obtain rotation angle and shift with ego motion
-        delta_x = np.array([each['can_bus'][0]
-                           for each in img_metas])
-        delta_y = np.array([each['can_bus'][1]
-                           for each in img_metas])
-        ego_angle = np.array(
-            [each['can_bus'][-2] / np.pi * 180 for each in img_metas])
-        grid_length_y = grid_length[0]
-        grid_length_x = grid_length[1]
-        translation_length = np.sqrt(delta_x ** 2 + delta_y ** 2)
-        translation_angle = np.arctan2(delta_y, delta_x) / np.pi * 180
-        bev_angle = ego_angle - translation_angle
-        shift_y = translation_length * \
-            np.cos(bev_angle / 180 * np.pi) / grid_length_y / bev_h
-        shift_x = translation_length * \
-            np.sin(bev_angle / 180 * np.pi) / grid_length_x / bev_w
+        use_lidar_frame_shift = (
+            real_h is not None and real_w is not None and
+            img_metas is not None and len(img_metas) > 0 and
+            'l2g_r_mat' in img_metas[0])
+        if use_lidar_frame_shift:
+            delta_global = np.array([each['can_bus'][:3] for each in img_metas])
+            lidar2global_rotation = np.array(
+                [each['l2g_r_mat'] for each in img_metas])
+            delta_lidar = []
+            for i in range(bs):
+                delta_lidar.append(
+                    np.linalg.inv(lidar2global_rotation[i]) @ delta_global[i])
+            delta_lidar = np.array(delta_lidar)
+            shift_y = delta_lidar[:, 1] / real_h
+            shift_x = delta_lidar[:, 0] / real_w
+        else:
+            delta_x = np.array([each['can_bus'][0]
+                               for each in img_metas])
+            delta_y = np.array([each['can_bus'][1]
+                               for each in img_metas])
+            ego_angle = np.array(
+                [each['can_bus'][-2] / np.pi * 180 for each in img_metas])
+            grid_length_y = grid_length[0]
+            grid_length_x = grid_length[1]
+            translation_length = np.sqrt(delta_x ** 2 + delta_y ** 2)
+            translation_angle = np.arctan2(delta_y, delta_x) / np.pi * 180
+            bev_angle = ego_angle - translation_angle
+            shift_y = translation_length * \
+                np.cos(bev_angle / 180 * np.pi) / grid_length_y / bev_h
+            shift_x = translation_length * \
+                np.sin(bev_angle / 180 * np.pi) / grid_length_x / bev_w
         shift_y = shift_y * self.use_shift
         shift_x = shift_x * self.use_shift
         shift = bev_queries.new_tensor(
@@ -230,3 +249,60 @@ class PerceptionTransformer(BaseModule):
         inter_references_out = inter_references
 
         return inter_states, init_reference_out, inter_references_out
+
+    @auto_fp16(apply_to=('mlvl_feats', 'bev_queries', 'object_query_embed', 'prev_bev', 'bev_pos'))
+    def forward(self,
+                mlvl_feats,
+                bev_queries,
+                object_query_embed,
+                bev_h,
+                bev_w,
+                real_h=None,
+                real_w=None,
+                grid_length=[0.512, 0.512],
+                bev_pos=None,
+                reg_branches=None,
+                cls_branches=None,
+                prev_bev=None,
+                **kwargs):
+        """Forward path used by the standalone BEVFormer detector."""
+
+        bev_embed = self.get_bev_features(
+            mlvl_feats,
+            bev_queries,
+            bev_h,
+            bev_w,
+            real_h=real_h,
+            real_w=real_w,
+            grid_length=grid_length,
+            bev_pos=bev_pos,
+            prev_bev=prev_bev,
+            **kwargs)
+
+        bs = mlvl_feats[0].size(0)
+        query_pos, query = torch.split(
+            object_query_embed, self.embed_dims, dim=1)
+        query_pos = query_pos.unsqueeze(0).expand(bs, -1, -1)
+        query = query.unsqueeze(0).expand(bs, -1, -1)
+        reference_points = self.reference_points(query_pos).sigmoid()
+        init_reference_out = reference_points
+
+        query = query.permute(1, 0, 2)
+        query_pos = query_pos.permute(1, 0, 2)
+        bev_embed = bev_embed.permute(1, 0, 2)
+
+        inter_states, inter_references = self.decoder(
+            query=query,
+            key=None,
+            value=bev_embed,
+            query_pos=query_pos,
+            reference_points=reference_points,
+            reg_branches=reg_branches,
+            cls_branches=cls_branches,
+            spatial_shapes=torch.tensor([[bev_h, bev_w]], device=query.device),
+            level_start_index=torch.tensor([0], device=query.device),
+            **kwargs)
+
+        inter_references_out = inter_references
+
+        return bev_embed, inter_states, init_reference_out, inter_references_out
