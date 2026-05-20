@@ -171,14 +171,13 @@ def _get_can_bus_info(nusc, nusc_can_bus, sample):
     can_bus.extend([0., 0.])
     return np.array(can_bus)
 
-def _get_future_traj_info(nusc, sample, predict_steps=16):
+def _get_future_traj_info(nusc, sample, predict_helper, predict_steps=16):
     sample_token = sample['token']
     ann_tokens = np.array(sample['anns'])
     sd_rec = nusc.get('sample', sample_token)
     fut_traj_all = []
     fut_traj_valid_mask_all = []
     _, boxes, _ = nusc.get_sample_data(sd_rec['data']['LIDAR_TOP'], selected_anntokens=ann_tokens)
-    predict_helper = PredictHelper(nusc)
     for i, ann_token in enumerate(ann_tokens):
         box = boxes[i]
         instance_token = nusc.get('sample_annotation', ann_token)['instance_token']
@@ -230,6 +229,7 @@ def _fill_trainval_infos(nusc,
     train_nusc_infos = []
     val_nusc_infos = []
     frame_idx = 0
+    predict_helper = None if test else PredictHelper(nusc)
     for sample in mmcv.track_iter_progress(nusc.sample):
         lidar_token = sample['data']['LIDAR_TOP']
         sd_rec = nusc.get('sample_data', sample['data']['LIDAR_TOP'])
@@ -317,7 +317,8 @@ def _fill_trainval_infos(nusc,
                 dtype=bool).reshape(-1)
             instance_inds = [nusc.getind('instance', ann['instance_token'])
                              for ann in annotations]
-            future_traj_all, future_traj_valid_mask_all = _get_future_traj_info(nusc, sample)
+            future_traj_all, future_traj_valid_mask_all = _get_future_traj_info(
+                nusc, sample, predict_helper)
             instance_tokens = [ann['instance_token'] for ann in annotations]  # dtype('<U[length_of_str]')
 
             # TODO: Add traj in next dataset_version
@@ -718,4 +719,3 @@ def generate_record(ann_rec: dict, x1: float, y1: float, x2: float, y2: float,
     coco_rec['iscrowd'] = 0
 
     return coco_rec
-    

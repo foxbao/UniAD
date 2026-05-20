@@ -192,6 +192,36 @@ class CustomNuScenesDataset(NuScenesDataset):
                 continue
             return data
 
+    def evaluate(self,
+                 results,
+                 metric='bbox',
+                 logger=None,
+                 jsonfile_prefix=None,
+                 result_names=['pts_bbox'],
+                 show=False,
+                 out_dir=None,
+                 pipeline=None):
+        """Evaluate detection results.
+
+        The custom distributed test helper returns a dict with
+        ``bbox_results`` as the actual nuScenes detection outputs.
+        MMCV's nuScenes evaluator expects a plain list, so unwrap that
+        format here before delegating to the base implementation.
+        """
+        if isinstance(results, dict):
+            if 'bbox_results' not in results:
+                raise KeyError('results dict must contain "bbox_results"')
+            results = results['bbox_results']
+        return super().evaluate(
+            results,
+            metric=metric,
+            logger=logger,
+            jsonfile_prefix=jsonfile_prefix,
+            result_names=result_names,
+            show=show,
+            out_dir=out_dir,
+            pipeline=pipeline)
+
     def _evaluate_single(self,
                          result_path,
                          logger=None,

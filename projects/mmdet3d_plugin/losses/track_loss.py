@@ -80,6 +80,8 @@ class ClipMatcher(nn.Module):
                           alpha=0.25,
                           loss_weight=2.0),
             loss_bbox=dict(type="L1Loss", loss_weight=0.25),
+            with_sdc=True,
+            sdc_query_index=900,
     ):
         """Create the criterion.
         Parameters:
@@ -98,6 +100,8 @@ class ClipMatcher(nn.Module):
 
         self.weight_dict = weight_dict
         self.loss_past_traj_weight = loss_past_traj_weight
+        self.with_sdc = with_sdc
+        self.sdc_query_index = sdc_query_index
         # self.losses = ['labels', 'boxes', 'cardinality']
         self.losses = ["labels", "boxes", "past_trajs"]
         self.focal_loss = True
@@ -248,8 +252,6 @@ class ClipMatcher(nn.Module):
         indices = filtered_idx
         idx = self._get_src_permutation_idx(indices)
         src_boxes = outputs["pred_boxes"][idx]
-        sdc_boxes = outputs["pred_sdc_boxes"][0, -1:]
-        target_sdc_boxes = gt_instances[0].sdc_boxes[:1]
         target_boxes = torch.cat(
             [
                 gt_per_img.boxes[i]
@@ -257,9 +259,6 @@ class ClipMatcher(nn.Module):
             ],
             dim=0,
         )
-        
-        src_boxes = torch.cat([src_boxes, sdc_boxes], dim=0)
-        target_boxes = torch.cat([target_boxes, target_sdc_boxes], dim=0)
 
         # for pad target, don't calculate regression loss, judged by whether obj_id=-1
         target_obj_ids = torch.cat(
@@ -271,7 +270,16 @@ class ClipMatcher(nn.Module):
         )
         # [num_matched]
 
-        target_obj_ids = torch.cat([target_obj_ids, torch.zeros(1).to(target_obj_ids.device)], dim=0)
+        if self.with_sdc:
+            sdc_boxes = outputs["pred_sdc_boxes"][0, -1:]
+            target_sdc_boxes = gt_instances[0].sdc_boxes[:1]
+            src_boxes = torch.cat([src_boxes, sdc_boxes], dim=0)
+            target_boxes = torch.cat([target_boxes, target_sdc_boxes], dim=0)
+            target_obj_ids = torch.cat([
+                target_obj_ids,
+                torch.zeros(1).to(target_obj_ids.device)
+            ], dim=0)
+
         mask = target_obj_ids != -1
         bbox_weights = torch.ones_like(target_boxes) * self.code_weights
         avg_factor = src_boxes[mask].size(0)
@@ -322,15 +330,16 @@ class ClipMatcher(nn.Module):
         target_classes_o = torch.cat(labels)
         # [bs, num_query]
         target_classes[idx] = target_classes_o
-        target_sdc_classes = gt_instances[0].sdc_labels[0:1].unsqueeze(0)
-        if sdc_logits is not None:
+        if self.with_sdc and sdc_logits is not None:
+            target_sdc_classes = gt_instances[0].sdc_labels[0:1].unsqueeze(0)
             src_logits = torch.cat([src_logits, sdc_logits], dim=1)
             target_classes = torch.cat([target_classes, target_sdc_classes], dim=1)
         label_weights = torch.ones_like(target_classes)
         # float tensor
         avg_factor = target_classes_o.numel(
         )  # pos + mathced gt for disapper track
-        avg_factor += 1 # sdc
+        if self.with_sdc:
+            avg_factor += 1 # sdc
         
         avg_factor = reduce_mean(src_logits.new_tensor([avg_factor]))
         loss_ce = self.loss_cls(
@@ -364,11 +373,19 @@ class ClipMatcher(nn.Module):
         track_instances: Instances = outputs_without_aux["track_instances"]
         pred_logits_i = track_instances.pred_logits
         pred_boxes_i = track_instances.pred_boxes
-        # modified the hard code, 900:901, sdc query
-        pred_sdc_logits_i = track_instances.pred_logits[900:901].unsqueeze(0) 
-        pred_sdc_boxes_i = track_instances.pred_boxes[900:901].unsqueeze(0) 
-        # -2 means the sdc query in this code
-        track_instances.obj_idxes[900]=-2
+        if self.with_sdc:
+            # -2 means the sdc query in this code.
+            sdc_idx = self.sdc_query_index
+            pred_sdc_logits_i = (
+                track_instances.pred_logits[sdc_idx:sdc_idx + 1]
+                .unsqueeze(0))
+            pred_sdc_boxes_i = (
+                track_instances.pred_boxes[sdc_idx:sdc_idx + 1]
+                .unsqueeze(0))
+            track_instances.obj_idxes[sdc_idx] = -2
+        else:
+            pred_sdc_logits_i = None
+            pred_sdc_boxes_i = None
         pred_past_trajs_i = track_instances.pred_past_trajs  # predicted past trajs of i-th image.
 
         obj_idxes = gt_instances_i.obj_ids
