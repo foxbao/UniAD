@@ -72,7 +72,7 @@ model = dict(
         upsample_cfg=dict(type='deconv', bias=False),
         use_conv_for_no_stride=True),
     pts_bbox_head=dict(
-        type='BEVFormerLidarTrackHead',
+        type='BEVFormerLidarHead',
         in_channels=_dim_,
         num_classes=num_classes,
         num_query=900,
@@ -189,7 +189,7 @@ test_pipeline = [
 ]
 
 data = dict(
-    samples_per_gpu=4,
+    samples_per_gpu=3,
     workers_per_gpu=4,
     train=dict(
         type=dataset_type,

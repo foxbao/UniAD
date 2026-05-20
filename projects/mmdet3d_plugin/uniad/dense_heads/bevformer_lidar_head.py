@@ -57,7 +57,7 @@ def denormalize_bbox(preds: Tensor) -> Tensor:
 
 
 @HEADS.register_module()
-class BEVFormerLidarTrackHead(BaseModule):
+class BEVFormerLidarHead(BaseModule):
     """UniAD-aligned DETR head over BEVFormer-style BEV features.
 
     The detector supplies object queries and inverse-sigmoid reference points
@@ -116,11 +116,11 @@ class BEVFormerLidarTrackHead(BaseModule):
         self.embed_dims = embed_dims
         self.as_two_stage = as_two_stage
         if self.as_two_stage:
-            raise ValueError('BEVFormerLidarTrackHead does not support '
+            raise ValueError('BEVFormerLidarHead does not support '
                              'as_two_stage=True.')
         self.code_size = code_size
         if bbox_coder is None:
-            raise ValueError('BEVFormerLidarTrackHead requires bbox_coder, '
+            raise ValueError('BEVFormerLidarHead requires bbox_coder, '
                              'matching BEVFormerHead/NMSFreeCoder decoding.')
         self.bbox_coder = build_bbox_coder(bbox_coder)
         self.pc_range = list(self.bbox_coder.pc_range)
@@ -187,7 +187,7 @@ class BEVFormerLidarTrackHead(BaseModule):
         self.transformer = LidarPerceptionTransformer(**transformer)
         if getattr(self.transformer, 'decoder', None) is None:
             raise ValueError('transformer.decoder is required for '
-                             'BEVFormerLidarTrackHead.')
+                             'BEVFormerLidarHead.')
         self.num_decoder_layers = self.transformer.decoder.num_layers
 
         # ---- DETR decoder over BEV memory ----------------------------------
@@ -223,7 +223,7 @@ class BEVFormerLidarTrackHead(BaseModule):
             return
         cfg = dict(positional_encoding)
         if cfg.get('type') != 'LearnedPositionalEncoding':
-            raise ValueError('BEVFormerLidarTrackHead only supports '
+            raise ValueError('BEVFormerLidarHead only supports '
                              'LearnedPositionalEncoding-style BEV position '
                              f'config, got {cfg.get("type")}.')
         expected = dict(

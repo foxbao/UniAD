@@ -272,6 +272,16 @@ class UniADTrackLidar(BEVFormerLidar):
             track_instances, _ = self.criterion.match_for_single_frame(
                 out, dec_id, if_step=(dec_id == nb_dec - 1))
 
+        active_index = (
+            (track_instances.obj_idxes >= 0)
+            & (track_instances.iou >= self.gt_iou_threshold)
+            & (track_instances.matched_gt_idxes >= 0))
+        out['active_track_instances'] = track_instances[active_index]
+        out['active_track_query_embeddings'] = (
+            track_instances.output_embedding[active_index])
+        out['active_track_query_matched_idxes'] = (
+            track_instances.matched_gt_idxes[active_index])
+
         if self.memory_bank is not None:
             track_instances = self.memory_bank(track_instances)
         out_track_instances = self.query_interact(

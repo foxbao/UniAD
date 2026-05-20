@@ -13,6 +13,7 @@ dataset_type = 'KlTrackDataset'
 queue_length = 4
 past_steps = 0
 fut_steps = 6
+train_gt_iou_threshold = 0.3
 
 model = dict(
     type='UniADTrackLidar',
@@ -22,7 +23,7 @@ model = dict(
     freeze_bev_encoder=True,
     score_thresh=0.4,
     filter_score_thresh=0.35,
-    gt_iou_threshold=0.3,
+    gt_iou_threshold=train_gt_iou_threshold,
     qim_args=dict(
         qim_type='QIMBase',
         merger_dropout=0,
@@ -84,6 +85,7 @@ train_pipeline = [
 ]
 
 data = dict(
+    samples_per_gpu=1,
     train=dict(
         type=dataset_type,
         pipeline=train_pipeline,
