@@ -23,7 +23,7 @@ input_modality = dict(use_lidar=True, use_camera=False)
 point_cloud_range = [-80.0, -48.0, -2.0, 80.0, 48.0, 6.0]
 voxel_size = [0.1, 0.1, 0.2]
 sparse_shape = [41, 960, 1600]
-queue_length = 3
+queue_length = 4
 _dim_ = 256
 _pos_dim_ = _dim_ // 2
 _ffn_dim_ = _dim_ * 2
@@ -34,7 +34,7 @@ bev_w_ = 200
 model = dict(
     type='BEVFormerLidar',
     point_cloud_range=point_cloud_range,
-    num_query=600,
+    num_query=900,
     embed_dims=_dim_,
     video_test_mode=True,
     return_query_feats=False,
@@ -45,7 +45,7 @@ model = dict(
         max_voxels=(120000, 160000)),
     pts_voxel_encoder=dict(type='HardSimpleVFE', num_features=4),
     pts_middle_encoder=dict(
-        type='SparseEncoder',
+        type='SparseEncoderSpconv2',
         in_channels=4,
         sparse_shape=sparse_shape,
         order=('conv', 'norm', 'act'),
@@ -75,7 +75,7 @@ model = dict(
         type='BEVFormerLidarTrackHead',
         in_channels=_dim_,
         num_classes=num_classes,
-        num_query=600,
+        num_query=900,
         embed_dims=_dim_,
         code_size=10,
         with_box_refine=True,
@@ -189,7 +189,7 @@ test_pipeline = [
 ]
 
 data = dict(
-    samples_per_gpu=1,
+    samples_per_gpu=4,
     workers_per_gpu=4,
     train=dict(
         type=dataset_type,

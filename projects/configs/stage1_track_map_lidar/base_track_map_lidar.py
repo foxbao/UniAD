@@ -10,7 +10,7 @@ num_classes = len(class_names)
 point_cloud_range = [-80.0, -48.0, -2.0, 80.0, 48.0, 6.0]
 file_client_args = dict(backend='disk')
 dataset_type = 'KlTrackDataset'
-queue_length = 3
+queue_length = 4
 past_steps = 0
 fut_steps = 6
 
@@ -87,11 +87,13 @@ data = dict(
     train=dict(
         type=dataset_type,
         pipeline=train_pipeline,
-        queue_length=queue_length))
+        queue_length=queue_length),
+    val=dict(queue_length=queue_length),
+    test=dict(queue_length=queue_length))
 
 total_epochs = 12
 runner = dict(type='EpochBasedRunner', max_epochs=total_epochs)
 
 load_from = './projects/work_dirs/bevformer_lidar/base_bevformer_lidar/latest.pth'
 resume_from = None
-work_dir = './projects/work_dirs/stage1_track_map/base_track_map_lidar'
+work_dir = './projects/work_dirs/stage1_track_map_lidar/base_track_map_lidar'
