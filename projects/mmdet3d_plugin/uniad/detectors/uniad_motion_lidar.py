@@ -1,0 +1,77 @@
+import torch
+from mmcv.runner import auto_fp16
+from mmdet.models import DETECTORS, build_head
+
+from .uniad_track_lidar import UniADTrackLidar
+
+
+@DETECTORS.register_module()
+class UniADMotionLidar(UniADTrackLidar):
+    """LiDAR-only stage-2 model for tracking plus motion prediction."""
+
+    def __init__(self,
+                 motion_head=None,
+                 task_loss_weight=None,
+                 **kwargs):
+        super().__init__(**kwargs)
+        self.motion_head = build_head(motion_head) if motion_head else None
+        self.task_loss_weight = task_loss_weight or dict(track=1.0, motion=1.0)
+
+    @property
+    def with_motion_head(self):
+        return hasattr(self, 'motion_head') and self.motion_head is not None
+
+    def loss_weighted_and_prefixed(self, loss_dict, prefix=''):
+        loss_factor = self.task_loss_weight.get(prefix, 1.0)
+        return {
+            f'{prefix}.{key}': value * loss_factor
+            for key, value in loss_dict.items()
+        }
+
+    @auto_fp16(apply_to=('points', ))
+    def forward_train(self,
+                      points=None,
+                      img_metas=None,
+                      gt_bboxes_3d=None,
+                      gt_labels_3d=None,
+                      gt_inds=None,
+                      gt_fut_traj=None,
+                      gt_fut_traj_mask=None,
+                      gt_past_traj=None,
+                      gt_past_traj_mask=None,
+                      l2g_t=None,
+                      l2g_r_mat=None,
+                      timestamp=None,
+                      **kwargs):
+        losses = dict()
+        losses_track, outs_track = self.forward_track_train(
+            points=points,
+            img_metas=img_metas,
+            gt_bboxes_3d=gt_bboxes_3d,
+            gt_labels_3d=gt_labels_3d,
+            gt_inds=gt_inds,
+            gt_past_traj=gt_past_traj,
+            gt_past_traj_mask=gt_past_traj_mask,
+            l2g_t=l2g_t,
+            l2g_r_mat=l2g_r_mat,
+            timestamp=timestamp,
+            **kwargs)
+        losses.update(
+            self.loss_weighted_and_prefixed(losses_track, prefix='track'))
+
+        if self.with_motion_head:
+            ret_dict_motion = self.motion_head.forward_train(
+                outs_track['bev_embed'],
+                gt_bboxes_3d,
+                gt_labels_3d,
+                gt_fut_traj=gt_fut_traj,
+                gt_fut_traj_mask=gt_fut_traj_mask,
+                outs_track=outs_track)
+            losses_motion = ret_dict_motion['losses']
+            losses.update(
+                self.loss_weighted_and_prefixed(
+                    losses_motion, prefix='motion'))
+
+        for key, value in losses.items():
+            losses[key] = torch.nan_to_num(value)
+        return losses

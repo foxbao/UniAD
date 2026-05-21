@@ -721,6 +721,12 @@ class KlTrackDataset(KlBEVFormerDataset):
             self._as_tensor(each['gt_past_traj_mask'], dtype=torch.float32)
             for each in queue
         ]
+        has_fut_traj = all('gt_fut_traj' in each for each in queue)
+        if has_fut_traj:
+            gt_fut_traj = self._as_tensor(
+                queue[-1]['gt_fut_traj'], dtype=torch.float32)
+            gt_fut_traj_mask = self._as_tensor(
+                queue[-1]['gt_fut_traj_mask'], dtype=torch.float32)
 
         l2g_r_mat_list = []
         l2g_t_list = []
@@ -766,6 +772,9 @@ class KlTrackDataset(KlBEVFormerDataset):
         sample['gt_inds'] = DC(gt_inds_list)
         sample['gt_past_traj'] = DC(gt_past_traj_list)
         sample['gt_past_traj_mask'] = DC(gt_past_traj_mask_list)
+        if has_fut_traj:
+            sample['gt_fut_traj'] = DC(gt_fut_traj)
+            sample['gt_fut_traj_mask'] = DC(gt_fut_traj_mask)
         sample['l2g_r_mat'] = DC(l2g_r_mat_list)
         sample['l2g_t'] = DC(l2g_t_list)
         sample['timestamp'] = DC(timestamp_list)

@@ -4,7 +4,7 @@ import torch
 from mmcv.runner import auto_fp16
 from mmdet.models import DETECTORS, build_loss
 from mmdet.models.utils.transformer import inverse_sigmoid
-from projects.mmdet3d_plugin.core.bbox.util import normalize_bbox
+from projects.mmdet3d_plugin.core.bbox.util import denormalize_bbox, normalize_bbox
 
 from ..dense_heads.track_head_plugin import (Instances, MemoryBank,
                                              QueryInteractionModule,
@@ -45,18 +45,13 @@ class UniADTrackLidar(BEVFormerLidar):
         super().__init__(**kwargs)
 
         self.gt_iou_threshold = gt_iou_threshold
+        self.freeze_lidar_backbone = freeze_lidar_backbone
         self.freeze_bev_encoder = freeze_bev_encoder
         self.queue_length = queue_length
         if freeze_lidar_backbone:
-            for module in [
-                    self.pts_voxel_encoder, self.pts_middle_encoder,
-                    self.pts_backbone, self.pts_neck
-            ]:
-                if module is None:
-                    continue
-                module.eval()
-                for param in module.parameters():
-                    param.requires_grad = False
+            self._freeze_modules(self._lidar_backbone_modules())
+        if freeze_bev_encoder:
+            self._freeze_modules(self._bev_encoder_modules())
 
         self.track_base = RuntimeTrackerBase(
             score_thresh=score_thresh,
@@ -82,6 +77,39 @@ class UniADTrackLidar(BEVFormerLidar):
         self.timestamp = None
         self.l2g_t = None
         self.l2g_r_mat = None
+
+    def _lidar_backbone_modules(self):
+        return [
+            getattr(self, 'pts_voxel_encoder', None),
+            getattr(self, 'pts_middle_encoder', None),
+            getattr(self, 'pts_backbone', None),
+            getattr(self, 'pts_neck', None),
+        ]
+
+    def _bev_encoder_modules(self):
+        return [
+            self.pts_bbox_head.lidar_input_proj,
+            self.pts_bbox_head.bev_embedding,
+            self.pts_bbox_head.positional_encoding,
+            self.pts_bbox_head.transformer.encoder,
+        ]
+
+    @staticmethod
+    def _freeze_modules(modules):
+        for module in modules:
+            if module is None:
+                continue
+            module.eval()
+            for param in module.parameters():
+                param.requires_grad = False
+
+    def train(self, mode=True):
+        super().train(mode)
+        if self.freeze_lidar_backbone:
+            self._freeze_modules(self._lidar_backbone_modules())
+        if self.freeze_bev_encoder:
+            self._freeze_modules(self._bev_encoder_modules())
+        return self
 
     @staticmethod
     def _first_batch_queue(value):
@@ -161,10 +189,108 @@ class UniADTrackLidar(BEVFormerLidar):
         track_instances.save_period = copy.deepcopy(tgt_instances.save_period)
         return track_instances.to(device)
 
+    @staticmethod
+    def _sanitize_logits(logits):
+        return torch.nan_to_num(
+            logits, nan=0.0, posinf=50.0, neginf=-50.0).clamp(
+                min=-50.0, max=50.0)
+
+    @staticmethod
+    def _sanitize_boxes(boxes):
+        boxes = torch.nan_to_num(boxes, nan=0.0, posinf=0.0, neginf=0.0)
+        if boxes.size(-1) < 6:
+            return boxes
+
+        parts = [
+            boxes[..., :2],
+            boxes[..., 2:4].clamp(min=-5.0, max=5.0),
+            boxes[..., 4:5],
+            boxes[..., 5:6].clamp(min=-5.0, max=5.0),
+        ]
+        if boxes.size(-1) >= 10:
+            parts.extend([
+                boxes[..., 6:8],
+                boxes[..., 8:10].clamp(min=-50.0, max=50.0),
+                boxes[..., 10:],
+            ])
+        else:
+            parts.append(boxes[..., 6:])
+        return torch.cat(parts, dim=-1)
+
+    def _sanitize_track_outputs(self, output_classes, output_coords,
+                                output_past_trajs):
+        output_classes = self._sanitize_logits(output_classes)
+        output_coords = self._sanitize_boxes(output_coords)
+        output_past_trajs = torch.nan_to_num(
+            output_past_trajs, nan=0.0, posinf=0.0, neginf=0.0)
+        return output_classes, output_coords, output_past_trajs
+
+    def _track_instances2results(self, track_instances, img_metas,
+                                 with_mask=True):
+        cls_scores = track_instances.pred_logits.sigmoid()
+        scores, labels = cls_scores.max(dim=-1)
+        max_num = min(self.pts_bbox_head.bbox_coder.max_num, scores.size(0))
+        scores, bbox_index = scores.topk(max_num)
+        labels = labels[bbox_index]
+        bboxes = denormalize_bbox(track_instances.pred_boxes[bbox_index],
+                                  self.point_cloud_range)
+        post_center_range = self.pts_bbox_head.bbox_coder.post_center_range
+        if post_center_range is not None:
+            post_center_range = bboxes.new_tensor(post_center_range)
+            mask = (bboxes[..., :3] >= post_center_range[:3]).all(1)
+            mask &= (bboxes[..., :3] <= post_center_range[3:]).all(1)
+        else:
+            mask = torch.ones_like(scores, dtype=torch.bool)
+        out_mask = mask if with_mask else torch.ones_like(mask)
+        if with_mask:
+            bboxes = bboxes[mask]
+            scores = scores[mask]
+            labels = labels[mask]
+
+        box_type_3d = img_metas[0]['box_type_3d']
+        boxes_3d = box_type_3d(
+            bboxes.detach().cpu(),
+            box_dim=bboxes.size(-1),
+            origin=(0.5, 0.5, 0.5))
+        return dict(
+            boxes_3d=boxes_3d,
+            scores_3d=scores.detach().cpu(),
+            labels_3d=labels.detach().cpu(),
+            bbox_index=bbox_index.detach().cpu(),
+            mask=out_mask.detach().cpu(),
+            track_bbox_results=[[
+                boxes_3d,
+                scores.detach().cpu(),
+                labels.detach().cpu(),
+                bbox_index.detach().cpu(),
+                out_mask.detach().cpu()
+            ]])
+
+    def select_active_track_query(self, track_instances, active_index,
+                                  img_metas, with_mask=True):
+        result_dict = self._track_instances2results(
+            track_instances[active_index], img_metas, with_mask=with_mask)
+        bbox_index = result_dict['bbox_index'].to(
+            track_instances.output_embedding.device)
+        mask = result_dict['mask'].to(track_instances.output_embedding.device)
+        bbox_index = bbox_index[mask]
+        result_dict['track_query_embeddings'] = (
+            track_instances.output_embedding[active_index][bbox_index])
+        result_dict['track_query_matched_idxes'] = (
+            track_instances.matched_gt_idxes[active_index][bbox_index])
+        return result_dict
+
     def velo_update(self, ref_pts, velocity, l2g_r1, l2g_t1, l2g_r2, l2g_t2,
                     time_delta):
-        time_delta = time_delta.type(torch.float)
+        time_delta = torch.nan_to_num(
+            time_delta.type(torch.float), nan=0.0, posinf=0.0,
+            neginf=0.0).clamp(min=0.0, max=2.0)
         num_query = ref_pts.size(0)
+        ref_pts = torch.nan_to_num(
+            ref_pts, nan=0.0, posinf=0.0, neginf=0.0)
+        velocity = torch.nan_to_num(
+            velocity, nan=0.0, posinf=0.0, neginf=0.0).clamp(
+                min=-50.0, max=50.0)
         velo_pad = torch.cat((velocity, velocity.new_zeros((num_query, 1))),
                              dim=-1)
 
@@ -188,6 +314,9 @@ class UniADTrackLidar(BEVFormerLidar):
             pc_range[4] - pc_range[1])
         ref_pts[..., 2:3] = (ref_pts[..., 2:3] - pc_range[2]) / (
             pc_range[5] - pc_range[2])
+        ref_pts = torch.nan_to_num(
+            ref_pts, nan=0.5, posinf=1.0, neginf=0.0).clamp(
+                min=1e-4, max=1.0 - 1e-4)
         return inverse_sigmoid(ref_pts)
 
     def _bev_pos(self, batch_size, device, dtype):
@@ -231,6 +360,11 @@ class UniADTrackLidar(BEVFormerLidar):
         output_past_trajs = det_output['all_past_traj_preds']
         last_ref_pts = det_output['last_ref_points']
         query_feats = det_output['query_feats']
+        output_classes, output_coords, output_past_trajs = \
+            self._sanitize_track_outputs(output_classes, output_coords,
+                                         output_past_trajs)
+        last_ref_pts = torch.nan_to_num(
+            last_ref_pts, nan=0.0, posinf=0.0, neginf=0.0)
 
         out = dict(
             pred_logits=output_classes[-1],
@@ -281,6 +415,9 @@ class UniADTrackLidar(BEVFormerLidar):
             track_instances.output_embedding[active_index])
         out['active_track_query_matched_idxes'] = (
             track_instances.matched_gt_idxes[active_index])
+        out.update(
+            self.select_active_track_query(track_instances, active_index,
+                                           img_metas))
 
         if self.memory_bank is not None:
             track_instances = self.memory_bank(track_instances)
@@ -292,18 +429,18 @@ class UniADTrackLidar(BEVFormerLidar):
         return out
 
     @auto_fp16(apply_to=('points', ))
-    def forward_train(self,
-                      points=None,
-                      img_metas=None,
-                      gt_bboxes_3d=None,
-                      gt_labels_3d=None,
-                      gt_inds=None,
-                      gt_past_traj=None,
-                      gt_past_traj_mask=None,
-                      l2g_t=None,
-                      l2g_r_mat=None,
-                      timestamp=None,
-                      **kwargs):
+    def forward_track_train(self,
+                            points=None,
+                            img_metas=None,
+                            gt_bboxes_3d=None,
+                            gt_labels_3d=None,
+                            gt_inds=None,
+                            gt_past_traj=None,
+                            gt_past_traj_mask=None,
+                            l2g_t=None,
+                            l2g_r_mat=None,
+                            timestamp=None,
+                            **kwargs):
         points_queue = self._first_batch_queue(points)
         img_metas = self._first_batch_metas(img_metas)
         num_frames = len(points_queue)
@@ -349,7 +486,42 @@ class UniADTrackLidar(BEVFormerLidar):
             track_instances = frame_res['track_instances']
             prev_bev = frame_res['bev_embed'].detach()
 
-        return self.criterion.losses_dict
+        get_keys = [
+            'bev_embed', 'bev_pos', 'track_query_embeddings',
+            'track_query_matched_idxes', 'track_bbox_results'
+        ]
+        outs_track = {k: frame_res[k] for k in get_keys}
+        return self.criterion.losses_dict, outs_track
+
+    @auto_fp16(apply_to=('points', ))
+    def forward_train(self,
+                      points=None,
+                      img_metas=None,
+                      gt_bboxes_3d=None,
+                      gt_labels_3d=None,
+                      gt_inds=None,
+                      gt_past_traj=None,
+                      gt_past_traj_mask=None,
+                      l2g_t=None,
+                      l2g_r_mat=None,
+                      timestamp=None,
+                      **kwargs):
+        losses, _ = self.forward_track_train(
+            points=points,
+            img_metas=img_metas,
+            gt_bboxes_3d=gt_bboxes_3d,
+            gt_labels_3d=gt_labels_3d,
+            gt_inds=gt_inds,
+            gt_past_traj=gt_past_traj,
+            gt_past_traj_mask=gt_past_traj_mask,
+            l2g_t=l2g_t,
+            l2g_r_mat=l2g_r_mat,
+            timestamp=timestamp,
+            **kwargs)
+        return {
+            key: torch.nan_to_num(value, nan=0.0, posinf=1e4, neginf=-1e4)
+            for key, value in losses.items()
+        }
 
     def simple_test(self, points, img_metas, img=None, history_points=None,
                     **kwargs):

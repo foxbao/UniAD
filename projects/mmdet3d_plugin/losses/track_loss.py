@@ -202,7 +202,9 @@ class ClipMatcher(nn.Module):
             filtered_idx.append((src_per_img[keep], tgt_per_img[keep]))
         indices = filtered_idx
         idx = self._get_src_permutation_idx(indices)
-        src_trajs = outputs["pred_past_trajs"][idx]
+        src_trajs = torch.nan_to_num(
+            outputs["pred_past_trajs"][idx], nan=0.0, posinf=0.0,
+            neginf=0.0)
         target_trajs = torch.cat(
             [
                 gt_per_img.past_traj[i]
@@ -210,6 +212,8 @@ class ClipMatcher(nn.Module):
             ],
             dim=0,
         )
+        target_trajs = torch.nan_to_num(
+            target_trajs, nan=0.0, posinf=0.0, neginf=0.0)
         target_trajs_mask = torch.cat(
             [
                 gt_per_img.past_traj_mask[i]
@@ -217,6 +221,8 @@ class ClipMatcher(nn.Module):
             ],
             dim=0,
         )
+        target_trajs_mask = torch.nan_to_num(
+            target_trajs_mask, nan=0.0, posinf=0.0, neginf=0.0)
 
         # for pad target, don't calculate regression loss, judged by whether obj_id=-1
         target_obj_ids = torch.cat(
@@ -251,7 +257,8 @@ class ClipMatcher(nn.Module):
             filtered_idx.append((src_per_img[keep], tgt_per_img[keep]))
         indices = filtered_idx
         idx = self._get_src_permutation_idx(indices)
-        src_boxes = outputs["pred_boxes"][idx]
+        src_boxes = torch.nan_to_num(
+            outputs["pred_boxes"][idx], nan=0.0, posinf=0.0, neginf=0.0)
         target_boxes = torch.cat(
             [
                 gt_per_img.boxes[i]
@@ -259,6 +266,8 @@ class ClipMatcher(nn.Module):
             ],
             dim=0,
         )
+        target_boxes = torch.nan_to_num(
+            target_boxes, nan=0.0, posinf=0.0, neginf=0.0)
 
         # for pad target, don't calculate regression loss, judged by whether obj_id=-1
         target_obj_ids = torch.cat(
@@ -283,7 +292,10 @@ class ClipMatcher(nn.Module):
         mask = target_obj_ids != -1
         bbox_weights = torch.ones_like(target_boxes) * self.code_weights
         avg_factor = src_boxes[mask].size(0)
+        if avg_factor == 0:
+            return {"loss_bbox": src_boxes.sum() * 0}
         avg_factor = reduce_mean(target_boxes.new_tensor([avg_factor]))
+        avg_factor = torch.clamp(avg_factor, min=1.0)
         loss_bbox = self.loss_bboxes(
             src_boxes[mask],
             target_boxes[mask],
@@ -307,7 +319,9 @@ class ClipMatcher(nn.Module):
         indices: [(src_idx, tgt_idx)]
         """
         # [bs=1, num_query, num_classes]
-        src_logits = outputs["pred_logits"]
+        src_logits = torch.nan_to_num(
+            outputs["pred_logits"], nan=0.0, posinf=50.0, neginf=-50.0)
+        src_logits = src_logits.clamp(min=-50.0, max=50.0)
         sdc_logits = outputs["pred_sdc_logits"]
         # batch_idx, src_idx
         idx = self._get_src_permutation_idx(indices)
@@ -342,6 +356,7 @@ class ClipMatcher(nn.Module):
             avg_factor += 1 # sdc
         
         avg_factor = reduce_mean(src_logits.new_tensor([avg_factor]))
+        avg_factor = torch.clamp(avg_factor, min=1.0)
         loss_ce = self.loss_cls(
             src_logits.flatten(0, 1),
             target_classes.flatten(0),
@@ -371,8 +386,13 @@ class ClipMatcher(nn.Module):
         gt_instances_i = self.gt_instances[
             self._current_frame_idx]  # gt instances of i-th image.
         track_instances: Instances = outputs_without_aux["track_instances"]
-        pred_logits_i = track_instances.pred_logits
-        pred_boxes_i = track_instances.pred_boxes
+        pred_logits_i = torch.nan_to_num(
+            track_instances.pred_logits, nan=0.0, posinf=50.0,
+            neginf=-50.0).clamp(min=-50.0, max=50.0)
+        pred_boxes_i = torch.nan_to_num(
+            track_instances.pred_boxes, nan=0.0, posinf=0.0, neginf=0.0)
+        track_instances.pred_logits = pred_logits_i
+        track_instances.pred_boxes = pred_boxes_i
         if self.with_sdc:
             # -2 means the sdc query in this code.
             sdc_idx = self.sdc_query_index
@@ -386,7 +406,10 @@ class ClipMatcher(nn.Module):
         else:
             pred_sdc_logits_i = None
             pred_sdc_boxes_i = None
-        pred_past_trajs_i = track_instances.pred_past_trajs  # predicted past trajs of i-th image.
+        pred_past_trajs_i = torch.nan_to_num(
+            track_instances.pred_past_trajs, nan=0.0, posinf=0.0,
+            neginf=0.0)  # predicted past trajs of i-th image.
+        track_instances.pred_past_trajs = pred_past_trajs_i
 
         obj_idxes = gt_instances_i.obj_ids
         obj_idxes_list = obj_idxes.detach().cpu().numpy().tolist()
@@ -466,7 +489,13 @@ class ClipMatcher(nn.Module):
                 gt_bboxes = torch.cat([v["boxes"] for v in targets])
 
             bbox_pred = bbox_preds[0]
-            cls_pred = cls_preds[0]
+            bbox_pred = torch.nan_to_num(
+                bbox_pred, nan=0.0, posinf=0.0, neginf=0.0)
+            cls_pred = torch.nan_to_num(
+                cls_preds[0], nan=0.0, posinf=50.0,
+                neginf=-50.0).clamp(min=-50.0, max=50.0)
+            gt_bboxes = torch.nan_to_num(
+                gt_bboxes, nan=0.0, posinf=0.0, neginf=0.0)
 
             src_idx, tgt_idx = matcher.assign(bbox_pred, cls_pred, gt_bboxes,
                                               gt_labels)
@@ -509,9 +538,15 @@ class ClipMatcher(nn.Module):
                     gt_boxes = gt_instances_i.boxes[
                         track_instances.matched_gt_idxes[active_idxes]]
                     iou_3ds = iou_3d(
-                        denormalize_bbox(gt_boxes, None)[..., :7],
-                        denormalize_bbox(active_track_boxes, None)[..., :7],
+                        torch.nan_to_num(
+                            denormalize_bbox(gt_boxes, None), nan=0.0,
+                            posinf=0.0, neginf=0.0)[..., :7],
+                        torch.nan_to_num(
+                            denormalize_bbox(active_track_boxes, None),
+                            nan=0.0, posinf=0.0, neginf=0.0)[..., :7],
                     )
+                    iou_3ds = torch.nan_to_num(
+                        iou_3ds, nan=0.0, posinf=0.0, neginf=0.0)
                     track_instances.iou[active_idxes] = torch.tensor([
                         iou_3ds[i, i] for i in range(gt_boxes.shape[0])
                     ]).to(gt_boxes.device)

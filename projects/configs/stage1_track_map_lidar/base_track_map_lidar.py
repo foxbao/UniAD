@@ -20,7 +20,7 @@ model = dict(
     return_query_feats=True,
     queue_length=queue_length,
     freeze_lidar_backbone=True,
-    freeze_bev_encoder=True,
+    freeze_bev_encoder=False,
     score_thresh=0.4,
     filter_score_thresh=0.35,
     gt_iou_threshold=train_gt_iou_threshold,
@@ -95,7 +95,10 @@ data = dict(
 
 total_epochs = 12
 runner = dict(type='EpochBasedRunner', max_epochs=total_epochs)
+optimizer = dict(type='AdamW', lr=1e-4, weight_decay=0.01)
+optimizer_config = dict(grad_clip=dict(max_norm=10, norm_type=2))
 
 load_from = './projects/work_dirs/bevformer_lidar/base_bevformer_lidar/latest.pth'
 resume_from = None
 work_dir = './projects/work_dirs/stage1_track_map_lidar/base_track_map_lidar'
+find_unused_parameters = True

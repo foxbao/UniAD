@@ -238,6 +238,8 @@ class MapInteraction(BaseModule):
         query_pos: mode pos embedding (B, A, P, D)
         '''
         B, A, P, D = query.shape
+        if key is None or key.size(1) == 0:
+            return torch.zeros_like(query)
         if query_pos is not None:
             query = query + query_pos
         if key_pos is not None:
