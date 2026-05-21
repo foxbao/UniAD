@@ -16,7 +16,7 @@ import mmcv as mmengine
 import cv2
 import torch
 
-from mmdet3d.core.bbox import LiDARInstance3DBoxes
+from mmdet3d.core.bbox import LiDARInstance3DBoxes, box_np_ops
 
 
 getcontext().prec = 30
@@ -471,8 +471,8 @@ def recompute_num_lidar_pts(
     计算每个 GT box 内的点云数量。
 
     根据 device 参数选择后端：
-    - 'cuda' / 'cpu': 使用 torch + LiDARInstance3DBoxes（批量化，适合 GPU 加速）
-    - 'numpy': 纯 NumPy 逐 box 计算（多进程安全，无 torch 依赖）
+    - 'cuda': 使用 torch + LiDARInstance3DBoxes（批量化，适合 GPU 加速）
+    - 'cpu' / 'numpy': 纯 NumPy 逐 box 计算（多进程安全，无 torch 依赖）
 
     Args:
         gt_boxes (np.ndarray): (M, 7) [x,y,z,dx,dy,dz,yaw]
@@ -495,23 +495,18 @@ def recompute_num_lidar_pts(
         return np.zeros((M,), dtype=np.int32)
     points_xyz = points[:, :3]
 
-    if device == 'numpy':
+    if device in {'cpu', 'numpy'}:
         # ---------- NumPy backend (multi-process safe, no torch) ----------
+        # Match LiDARInstance3DBoxes(points_in_boxes) semantics: if boxes
+        # overlap, each point is assigned to the first matching box.
+        point_box_mask = box_np_ops.points_in_rbbox(
+            points_xyz, gt_boxes[:, :7], origin=origin)
         num_lidar_pts = np.zeros((M,), dtype=np.int32)
-        for i in range(M):
-            cx, cy, cz, dx, dy, dz, yaw = gt_boxes[i]
-            local_pts = points_xyz - np.array([cx, cy, cz], dtype=np.float32)
-            c = np.cos(-yaw)
-            s = np.sin(-yaw)
-            rot = np.array([[c, -s], [s, c]], dtype=np.float32)
-            local_xy = local_pts[:, :2] @ rot.T
-            local_z = local_pts[:, 2]
-            mask = (
-                (np.abs(local_xy[:, 0]) <= dx / 2) &
-                (np.abs(local_xy[:, 1]) <= dy / 2) &
-                (np.abs(local_z) <= dz / 2)
-            )
-            num_lidar_pts[i] = int(mask.sum())
+        valid = point_box_mask.any(axis=1)
+        if valid.any():
+            first_box_ids = point_box_mask.argmax(axis=1)[valid]
+            box_ids, counts = np.unique(first_box_ids, return_counts=True)
+            num_lidar_pts[box_ids] = counts
         return num_lidar_pts
 
     # ---------- Torch backend ----------
@@ -673,8 +668,23 @@ def process_frame(frame_info):
     ego2global_translation = [0.0, 0.0, 0.0]
     ego2global_rotation    = [1.0, 0.0, 0.0, 0.0]  # w,x,y,z
     loc_dir = frame_info.get('localization_dir')
+    loc_path = frame_info.get('localization_path')
+    loc_ts = frame_info.get('localization_timestamp')
+    loc_valid = frame_info.get('localization_valid', False)
     loc_offset = get_sensor_time_offset(frame_info, 'localization')
-    if loc_dir is not None and Path(loc_dir).is_dir():
+    if loc_path is not None:
+        sync_info['localization'] = make_sync_entry(
+            loc_ts, frame_id, loc_offset, loc_path, valid=loc_valid,
+            reason='' if loc_valid else
+            'localization timestamp exceeds max diff')
+        if loc_valid:
+            with open(loc_path, 'r') as f:
+                loc = json.load(f)
+            pos = loc['position']
+            ori = loc['orientation']
+            ego2global_translation = [pos['x'], pos['y'], pos['z']]
+            ego2global_rotation    = [ori['w'], ori['x'], ori['y'], ori['z']]
+    elif loc_dir is not None and Path(loc_dir).is_dir():
         loc_files = list(Path(loc_dir).glob('*.json'))
         if loc_files:
             loc_ts = np.array([float(p.stem) for p in loc_files])
@@ -730,14 +740,16 @@ def process_frame(frame_info):
     info['lidar_path'] = str(merged_file)
 
     # =================== Camera ===================
-    scale = frame_info.get('img_scale', 1.0 / 3.0)
-    cams, camera_sync = process_cameras(frame_info, frame_id, scale=scale)
-    info['sync_info']['cameras'] = camera_sync
-    expected_cams = [c for c in frame_info['used_cameras'] if c in CAM_NAME_MAP]
-    if len(cams) != len(expected_cams):
-        return None
+    if frame_info.get('process_cameras', True):
+        scale = frame_info.get('img_scale', 1.0 / 3.0)
+        cams, camera_sync = process_cameras(frame_info, frame_id, scale=scale)
+        info['sync_info']['cameras'] = camera_sync
+        expected_cams = [
+            c for c in frame_info['used_cameras'] if c in CAM_NAME_MAP]
+        if len(cams) != len(expected_cams):
+            return None
 
-    info['cams'] = cams
+        info['cams'] = cams
 
     return info
 
@@ -862,7 +874,7 @@ def summarize_sync_infos(infos, out_path):
 # ------------------- 主函数 -------------------
 def generate_frame_bin_parallel(data_root, info_prefix, version,
                                 target_lidar_frame: str = 'FLU',
-                                max_diff=0.05, cfg=None):
+                                max_diff=0.05, cfg=None, workers=None):
     assert target_lidar_frame in ('RFU', 'FLU'), (
         f"target_lidar_frame must be 'RFU' or 'FLU', got {target_lidar_frame!r}")
     coord_transform = (target_lidar_frame == 'RFU')
@@ -878,6 +890,15 @@ def generate_frame_bin_parallel(data_root, info_prefix, version,
     img_scale = 1.0 / 3.0
     if cfg is not None and hasattr(cfg, 'img_scale'):
         img_scale = cfg.img_scale
+
+    camera_processing_cfg = {}
+    if cfg is not None and hasattr(cfg, 'camera_processing_cfg'):
+        camera_processing_cfg = dict(cfg.camera_processing_cfg)
+    process_cameras_enabled = bool(camera_processing_cfg.get('enable', True))
+
+    gt_processing_cfg = {}
+    if cfg is not None and hasattr(cfg, 'gt_processing_cfg'):
+        gt_processing_cfg = dict(cfg.gt_processing_cfg)
 
     legacy_sync_cfg = {}
     if cfg is not None and hasattr(cfg, 'sync_cfg'):
@@ -915,7 +936,7 @@ def generate_frame_bin_parallel(data_root, info_prefix, version,
     frame_info_list = []
     # lidar_dirs = [p.parent for p in sample_path.rglob("lidar") if p.is_dir()]
     lidar_dirs = find_lidar_parent_dirs(sample_path)
-    lidar_dirs = list(set(lidar_dirs))
+    lidar_dirs = sorted(set(lidar_dirs), key=lambda p: str(p))
     # for scene_path in lidar_dirs:
     total_label_count = 0
     skip_no_label = 0
@@ -942,8 +963,12 @@ def generate_frame_bin_parallel(data_root, info_prefix, version,
 
         # ---------- 读取标定 ----------
         extrinsics = load_json_if_exists(extrinsics_path)
-        camera_extrinsics = load_json_if_exists(camera_extrinsics_path)
-        camera_intrinsics = load_json_if_exists(intrinsics_path)
+        if process_cameras_enabled:
+            camera_extrinsics = load_json_if_exists(camera_extrinsics_path)
+            camera_intrinsics = load_json_if_exists(intrinsics_path)
+        else:
+            camera_extrinsics = {}
+            camera_intrinsics = {}
 
         # ---------- lidar 外参 ----------
         used_lidars = []
@@ -978,23 +1003,24 @@ def generate_frame_bin_parallel(data_root, info_prefix, version,
         camera_extrinsics_dict = {}
         camera_intrinsics_dict = {}
 
-        camera_prefix = 'Tx_baselink_camera_'
+        if process_cameras_enabled:
+            camera_prefix = 'Tx_baselink_camera_'
 
-        for sensor_name, quat in camera_extrinsics.items():
-            if camera_prefix not in sensor_name:
-                continue
-            cam_name = sensor_name.split(camera_prefix)[-1]
-            used_cameras.append(cam_name)
-            camera_extrinsics_dict[cam_name] = quat
-
-        camera_intrinsic_prefix='camera_'
-        for sensor_name, intr in camera_intrinsics.items():
-            if camera_intrinsic_prefix not in sensor_name:
-                continue
-            cam_name = sensor_name.split(camera_intrinsic_prefix)[-1]
-            camera_intrinsics_dict[cam_name] = intr
-            if cam_name not in used_cameras:
+            for sensor_name, quat in camera_extrinsics.items():
+                if camera_prefix not in sensor_name:
+                    continue
+                cam_name = sensor_name.split(camera_prefix)[-1]
                 used_cameras.append(cam_name)
+                camera_extrinsics_dict[cam_name] = quat
+
+            camera_intrinsic_prefix='camera_'
+            for sensor_name, intr in camera_intrinsics.items():
+                if camera_intrinsic_prefix not in sensor_name:
+                    continue
+                cam_name = sensor_name.split(camera_intrinsic_prefix)[-1]
+                camera_intrinsics_dict[cam_name] = intr
+                if cam_name not in used_cameras:
+                    used_cameras.append(cam_name)
 
 
         # ==========================================================
@@ -1004,7 +1030,8 @@ def generate_frame_bin_parallel(data_root, info_prefix, version,
         if cfg is not None and hasattr(cfg, 'camera_selection'):
             camera_selection = cfg.camera_selection
 
-        if camera_selection and camera_selection.get('enable', False):
+        if (process_cameras_enabled and camera_selection
+                and camera_selection.get('enable', False)):
             selected = set(camera_selection.get('use_cameras', []))
 
             # 只保留 selection 中的 camera
@@ -1052,22 +1079,24 @@ def generate_frame_bin_parallel(data_root, info_prefix, version,
 
         camera_root = scene_path / 'camera'
 
-        for cam_name in used_cameras:
-            cam_dir = camera_root / f'{cam_name}_image'
-            if not cam_dir.exists():
-                continue
+        if process_cameras_enabled:
+            for cam_name in used_cameras:
+                cam_dir = camera_root / f'{cam_name}_image'
+                if not cam_dir.exists():
+                    continue
 
-            img_files = list(cam_dir.glob('*.jpg')) + list(cam_dir.glob('*.png'))
-            if len(img_files) == 0:
-                continue
+                img_files = (
+                    list(cam_dir.glob('*.jpg')) + list(cam_dir.glob('*.png')))
+                if len(img_files) == 0:
+                    continue
 
-            ts_list = np.array([float(p.stem) for p in img_files])
-            idx_sort = np.argsort(ts_list)
+                ts_list = np.array([float(p.stem) for p in img_files])
+                idx_sort = np.argsort(ts_list)
 
-            camera_file_index[cam_name] = dict(
-                zip(ts_list[idx_sort], [img_files[i] for i in idx_sort])
-            )
-            camera_sorted_ts[cam_name] = ts_list[idx_sort]
+                camera_file_index[cam_name] = dict(
+                    zip(ts_list[idx_sort], [img_files[i] for i in idx_sort])
+                )
+                camera_sorted_ts[cam_name] = ts_list[idx_sort]
 
         # ---------- label 文件 ----------
         label_files = sorted(
@@ -1085,8 +1114,33 @@ def generate_frame_bin_parallel(data_root, info_prefix, version,
 
         # ---------- frame info ----------
         localization_dir = scene_path / 'localization'
+        localization_sorted_ts = np.array([], dtype=np.float64)
+        localization_sorted_files = []
+        if localization_dir.is_dir():
+            loc_files = list(localization_dir.glob('*.json'))
+            if loc_files:
+                loc_ts_list = np.array(
+                    [float(p.stem) for p in loc_files], dtype=np.float64)
+                idx_sort = np.argsort(loc_ts_list)
+                localization_sorted_ts = loc_ts_list[idx_sort]
+                localization_sorted_files = [loc_files[i] for i in idx_sort]
+        localization_offset = get_sensor_time_offset(
+            {'sensor_time_offsets': sensor_time_offsets}, 'localization')
         scene_token = f"{scene_path.parent.name}/{scene_path.name}"
         for label_file in label_files:
+            frame_id = float(label_file.stem)
+            loc_path = None
+            loc_ts = None
+            loc_valid = False
+            if len(localization_sorted_ts) > 0:
+                nearest_idx, loc_ts, _, corrected_dt = (
+                    match_nearest_timestamp(
+                        localization_sorted_ts,
+                        frame_id,
+                        localization_offset))
+                loc_path = localization_sorted_files[nearest_idx]
+                loc_valid = abs(corrected_dt) < localization_max_diff
+
             frame_info_list.append({
                 'frame_stem': label_file.stem,
                 'used_lidars': used_lidars,
@@ -1116,6 +1170,10 @@ def generate_frame_bin_parallel(data_root, info_prefix, version,
                 'gt_annotation_filter': gt_annotation_filter,
                 'img_scale': img_scale,
                 'localization_dir': localization_dir,
+                'localization_path': loc_path,
+                'localization_timestamp': loc_ts,
+                'localization_valid': loc_valid,
+                'process_cameras': process_cameras_enabled,
                 'scene_token': scene_token,
             })
 
@@ -1125,7 +1183,11 @@ def generate_frame_bin_parallel(data_root, info_prefix, version,
           f'lidar_dirs={len(lidar_dirs)}, '
           f'skip_no_label={skip_no_label}, skip_no_extrinsics={skip_no_extrinsics}')
 
-    num_workers = min(32, os.cpu_count())
+    if workers is None or int(workers) <= 0:
+        num_workers = min(32, os.cpu_count() or 1)
+    else:
+        num_workers = max(1, int(workers))
+    print(f'[Stage 1] using {num_workers} worker processes')
     # all_infos = []
     with ProcessPoolExecutor(max_workers=num_workers) as executor:
         # chunksize 设置为 10-20 比较合适
@@ -1134,10 +1196,20 @@ def generate_frame_bin_parallel(data_root, info_prefix, version,
                             desc="Processing frames"))
 
     base_infos = [res for res in results if res]
-    print(f"[Stage 1] cam+lidar process, valid frames: {len(base_infos)}")
+    print(f"[Stage 1] sensor process, valid frames: {len(base_infos)}")
 
     # =================== GT ===================
-    gt_device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    gt_device = str(gt_processing_cfg.get('device', 'auto')).lower()
+    if gt_device == 'auto':
+        gt_device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    elif gt_device == 'cuda' and not torch.cuda.is_available():
+        print('[Stage 2] CUDA requested for GT, but unavailable; using CPU')
+        gt_device = 'cpu'
+    elif gt_device not in {'cuda', 'cpu', 'numpy'}:
+        raise ValueError(
+            "gt_processing_cfg.device must be one of "
+            "'auto', 'cuda', 'cpu', or 'numpy'")
+    print(f'[Stage 2] using {gt_device} for GT point counting')
     all_infos = process_gt_for_infos(base_infos, device=gt_device)
     print(f"[Stage 2] gt process, final frames: {len(all_infos)}")
     summarize_sync_infos(
@@ -1225,8 +1297,10 @@ def generate_frame_bin_parallel(data_root, info_prefix, version,
     return train_results, val_results
 
 
-def create_kl_infos(data_root, info_prefix, version='v1.0-trainval', cfg=None):
-    generate_frame_bin_parallel(data_root, info_prefix, version, cfg=cfg)
+def create_kl_infos(data_root, info_prefix, version='v1.0-trainval', cfg=None,
+                    workers=None):
+    generate_frame_bin_parallel(
+        data_root, info_prefix, version, cfg=cfg, workers=workers)
 
 
 # ------------------- 脚本入口 -------------------
@@ -1236,5 +1310,7 @@ if __name__ == "__main__":
     parser.add_argument('--data-root', default='/media/cx/bak/data/kl',
                         help='Path to KL dataset root (contains v1.0-trainval/)')
     parser.add_argument('--version', default='v1.0-trainval')
+    parser.add_argument('--workers', type=int, default=None)
     args = parser.parse_args()
-    generate_frame_bin_parallel(args.data_root, 'kl', args.version)
+    generate_frame_bin_parallel(
+        args.data_root, 'kl', args.version, workers=args.workers)

@@ -49,13 +49,14 @@ def kl_data_prep(root_path,
                  info_prefix,
                  version,
                  out_dir,
-                 cfg=None):
+                 cfg=None,
+                 workers=None):
     """Prepare KL info files for LiDAR-only BEVFormer experiments."""
     from data_converter import kl_converter
     from data_converter.kl_update_infos import update_kl_infos
 
     kl_converter.create_kl_infos(
-        root_path, info_prefix, version=version, cfg=cfg)
+        root_path, info_prefix, version=version, cfg=cfg, workers=workers)
 
     info_train_path = osp.join(out_dir, f'{info_prefix}_infos_train.pkl')
     info_val_path = osp.join(out_dir, f'{info_prefix}_infos_val.pkl')
@@ -162,7 +163,8 @@ if __name__ == '__main__':
             info_prefix=args.extra_tag,
             version=args.version,
             out_dir=args.out_dir,
-            cfg=cfg)
+            cfg=cfg,
+            workers=args.workers)
     elif args.dataset == 'nuscenes' and args.version == 'v1.0-mini':
         train_version = f'{args.version}'
         nuscenes_data_prep(

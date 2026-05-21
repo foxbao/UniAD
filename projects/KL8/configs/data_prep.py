@@ -38,6 +38,12 @@ camera_selection = dict(
         'right_rear',
     ])
 
+camera_processing_cfg = dict(
+    # Current KL LiDAR configs only consume point clouds.  Keep camera
+    # selection above for future image/multimodal prep, but skip expensive
+    # undistort/resize work for the default LiDAR-only conversion.
+    enable=False)
+
 sensor_sync_cfg = dict(
     lidar_max_diff=0.05,
     camera_max_diff=0.05,
@@ -59,6 +65,12 @@ velocity_cfg = dict(
     min_dt=1e-3,
     max_time_diff=1.5,
     max_speed=60.0)
+
+gt_processing_cfg = dict(
+    # Use GPU by default because KL point counting is materially faster, and
+    # GPU 0 is usually reserved for data prep / quick tests on this machine.
+    # Switch to 'cpu' when all GPUs are occupied by training.
+    device='cuda')
 
 sync_cfg = dict(sensor_sync_cfg)
 if temporal_chain_cfg.get('enable', True):
