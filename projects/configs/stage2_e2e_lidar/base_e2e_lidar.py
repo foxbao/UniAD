@@ -3,8 +3,12 @@ _base_ = ['../stage1_track_map_lidar/base_track_map_lidar.py']
 class_names = [
     'Pedestrian', 'Car', 'IGV-Full', 'Truck', 'Trailer-Empty',
     'Trailer-Full', 'IGV-Empty', 'Crane', 'OtherVehicle', 'Cone',
-    'ContainerForklift', 'Forklift', 'Lorry', 'ConstructionVehicle',
-    'WheelCrane',
+    'ContainerForklift', 'Forklift', 'WheelCrane',
+]
+label_mapping = [
+    0, 1, 2, 3, 4,
+    5, 6, 7, 8, 9,
+    10, 11, 8, 8, 12,
 ]
 point_cloud_range = [-80.0, -48.0, -2.0, 80.0, 48.0, 6.0]
 file_client_args = dict(backend='disk')
@@ -16,7 +20,7 @@ bev_w_ = 200
 predict_steps = 6
 predict_modes = 6
 use_nonlinear_optimizer = False
-vehicle_id_list = [1, 2, 3, 4, 5, 6, 7, 8, 10, 11, 12, 14]
+vehicle_id_list = [1, 2, 3, 4, 5, 6, 7, 8, 10, 11, 12]
 group_id_list = [vehicle_id_list]
 
 model = dict(
@@ -97,7 +101,7 @@ train_pipeline = [
 
 data = dict(
     samples_per_gpu=1,
-    train=dict(pipeline=train_pipeline))
+    train=dict(pipeline=train_pipeline, label_mapping=label_mapping))
 
 load_from = './projects/work_dirs/stage1_track_map_lidar/base_track_map_lidar/latest.pth'
 resume_from = None

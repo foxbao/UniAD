@@ -14,8 +14,26 @@ file_client_args = dict(backend='disk')
 class_names = [
     'Pedestrian', 'Car', 'IGV-Full', 'Truck', 'Trailer-Empty',
     'Trailer-Full', 'IGV-Empty', 'Crane', 'OtherVehicle', 'Cone',
-    'ContainerForklift', 'Forklift', 'Lorry', 'ConstructionVehicle',
-    'WheelCrane',
+    'ContainerForklift', 'Forklift', 'WheelCrane',
+]
+# Original KL labels are 15-way.  Collapse Lorry and ConstructionVehicle
+# into OtherVehicle without rewriting the annotation pkl files.
+label_mapping = [
+    0,   # Pedestrian
+    1,   # Car
+    2,   # IGV-Full
+    3,   # Truck
+    4,   # Trailer-Empty
+    5,   # Trailer-Full
+    6,   # IGV-Empty
+    7,   # Crane
+    8,   # OtherVehicle
+    9,   # Cone
+    10,  # ContainerForklift
+    11,  # Forklift
+    8,   # Lorry -> OtherVehicle
+    8,   # ConstructionVehicle -> OtherVehicle
+    12,  # WheelCrane
 ]
 num_classes = len(class_names)
 input_modality = dict(use_lidar=True, use_camera=False)
@@ -140,7 +158,7 @@ model = dict(
         loss_iou=dict(type='GIoULoss', loss_weight=0.0)),
     train_cfg=dict(
         pts=dict(
-            pi_symmetric_class_indices=[2, 6, 14],
+            pi_symmetric_class_indices=[2, 6, 12],
             assigner=dict(
                 type='HungarianAssigner3D',
                 cls_cost=dict(type='FocalLossCost', weight=2.0),
@@ -197,6 +215,7 @@ data = dict(
         ann_file='kl_infos_train.pkl',
         pipeline=train_pipeline,
         classes=class_names,
+        label_mapping=label_mapping,
         modality=input_modality,
         test_mode=False,
         data_prefix=data_prefix,
@@ -209,6 +228,7 @@ data = dict(
         ann_file='kl_infos_val.pkl',
         pipeline=test_pipeline,
         classes=class_names,
+        label_mapping=label_mapping,
         modality=input_modality,
         test_mode=True,
         data_prefix=data_prefix,
@@ -220,6 +240,7 @@ data = dict(
         ann_file='kl_infos_val.pkl',
         pipeline=test_pipeline,
         classes=class_names,
+        label_mapping=label_mapping,
         modality=input_modality,
         test_mode=True,
         data_prefix=data_prefix,

@@ -3,8 +3,12 @@ _base_ = ['../bevformer_lidar/base_bevformer_lidar.py']
 class_names = [
     'Pedestrian', 'Car', 'IGV-Full', 'Truck', 'Trailer-Empty',
     'Trailer-Full', 'IGV-Empty', 'Crane', 'OtherVehicle', 'Cone',
-    'ContainerForklift', 'Forklift', 'Lorry', 'ConstructionVehicle',
-    'WheelCrane',
+    'ContainerForklift', 'Forklift', 'WheelCrane',
+]
+label_mapping = [
+    0, 1, 2, 3, 4,
+    5, 6, 7, 8, 9,
+    10, 11, 8, 8, 12,
 ]
 num_classes = len(class_names)
 point_cloud_range = [-80.0, -48.0, -2.0, 80.0, 48.0, 6.0]
@@ -89,9 +93,10 @@ data = dict(
     train=dict(
         type=dataset_type,
         pipeline=train_pipeline,
-        queue_length=queue_length),
-    val=dict(queue_length=queue_length),
-    test=dict(queue_length=queue_length))
+        queue_length=queue_length,
+        label_mapping=label_mapping),
+    val=dict(queue_length=queue_length, label_mapping=label_mapping),
+    test=dict(queue_length=queue_length, label_mapping=label_mapping))
 
 total_epochs = 12
 runner = dict(type='EpochBasedRunner', max_epochs=total_epochs)

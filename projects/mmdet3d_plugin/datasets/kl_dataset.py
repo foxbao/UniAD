@@ -38,6 +38,7 @@ class KlDataset(Custom3DDataset):
                  test_mode=False,
                  with_velocity=True,
                  use_valid_flag=False,
+                 label_mapping=None,
                  pi_symmetric_classes=('IGV-Full', 'IGV-Empty',
                                        'WheelCrane'),
                  **kwargs):
@@ -46,6 +47,12 @@ class KlDataset(Custom3DDataset):
         self.data_prefix = data_prefix or {}
         self.with_velocity = with_velocity
         self.use_valid_flag = use_valid_flag
+        self.label_mapping = None
+        if label_mapping is not None:
+            self.label_mapping = {
+                int(old_label): int(new_label)
+                for old_label, new_label in enumerate(label_mapping)
+            }
         self.pi_symmetric_classes = set(pi_symmetric_classes or [])
         super().__init__(
             data_root=data_root,
@@ -69,6 +76,14 @@ class KlDataset(Custom3DDataset):
             self.metainfo = data.get('metadata', {})
             return data['infos']
         return data
+
+    def _map_label(self, label):
+        label = int(label)
+        if self.label_mapping is not None:
+            label = self.label_mapping.get(label, -1)
+        if label < 0 or label >= len(self.CLASSES):
+            return -1
+        return label
 
     def _resolve_path(self, key, filename):
         if filename is None:
@@ -118,6 +133,9 @@ class KlDataset(Custom3DDataset):
             label = inst.get('bbox_label_3d', inst.get('bbox_label', -1))
             if label is None or int(label) < 0:
                 continue
+            label = self._map_label(label)
+            if label < 0:
+                continue
             if self.use_valid_flag:
                 valid = bool(inst.get('bbox_3d_isvalid', True))
             else:
@@ -129,8 +147,8 @@ class KlDataset(Custom3DDataset):
             if self.with_velocity and len(bbox) == 7:
                 bbox.extend(inst.get('velocity', [0.0, 0.0]))
             gt_bboxes.append(bbox)
-            gt_labels.append(int(label))
-            gt_names.append(self.CLASSES[int(label)])
+            gt_labels.append(label)
+            gt_names.append(self.CLASSES[label])
             gt_inds.append(int(inst.get('track_id', -1)))
             forecasting_locs.append(
                 np.asarray(
