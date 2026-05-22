@@ -85,16 +85,9 @@ def read_pcd_with_intensity(pcd_path):
     # ... 前面读取 data 的代码不变 ...validate_img_box
     data = np.fromfile(pcd_path, dtype=dtype, offset=data_offset)
 
-    # 定义我们想要的字段
+    # Keep generated samples compact: x, y, z, intensity.
     required_fields = ['x', 'y', 'z', 'intensity']
     arrs = [data[f].astype(np.float32) for f in required_fields]
-
-    # 检查 timestamp_2us 是否存在
-    if 'timestamp_2us' in data.dtype.names:
-        arrs.append(data['timestamp_2us'].astype(np.float32))
-    else:
-        # 如果不存在，手动创建一个全 0 列，长度与 data 一致
-        arrs.append(np.zeros(data.shape[0], dtype=np.float32))
 
     all_data = np.vstack(arrs).T
     valid_mask = ~np.isnan(all_data).any(axis=1)
@@ -108,7 +101,12 @@ def read_pc(pc_file):
         dtype = np.dtype([('x',np.float32),('y',np.float32),('z',np.float32),
                           ('intensity',np.float32),('ring',np.float32),('timestamp_2us',np.float32)])
         data = np.fromfile(pc_file,dtype=dtype)
-        points = np.vstack([data['x'],data['y'],data['z'],data['intensity']]).T
+        points = np.vstack([
+            data['x'],
+            data['y'],
+            data['z'],
+            data['intensity'],
+        ]).T
     elif pc_file.suffix=='.pcd':
         points = read_pcd_with_intensity(pc_file)
     else:
@@ -117,6 +115,13 @@ def read_pc(pc_file):
     points = points[valid_mask]
     points = points[np.max(np.abs(points[:,:3]),axis=1)<1e3]
     return points
+
+def is_valid_merged_lidar_bin(lidar_path, num_features=4):
+    lidar_path = Path(lidar_path)
+    if not lidar_path.exists():
+        return False
+    size = lidar_path.stat().st_size
+    return size > 0 and size % (np.dtype(np.float32).itemsize * num_features) == 0
 
 # ------------------- 坐标变换 -------------------
 def get_transform_matrix(quat_list):
@@ -240,7 +245,7 @@ def merge_lidar_points(frame_info, frame_id, merged_file):
         (True, sync_info)  -> 成功（或者文件已存在）
         (False, sync_info) -> 失败（时间对不上 / 文件缺失）
     """
-    should_write = not merged_file.exists()
+    should_write = not is_valid_merged_lidar_bin(merged_file, num_features=4)
     merged_points = []
     lidar_sync = {}
 
@@ -476,7 +481,7 @@ def recompute_num_lidar_pts(
 
     Args:
         gt_boxes (np.ndarray): (M, 7) [x,y,z,dx,dy,dz,yaw]
-        lidar_path (str or Path): merged lidar bin (5-dim float32)
+        lidar_path (str or Path): merged lidar bin (4-dim float32)
         device (str): 'cuda', 'cpu', or 'numpy'
         origin (tuple): box origin for LiDARInstance3DBoxes (torch backend only)
     Returns:
@@ -487,11 +492,11 @@ def recompute_num_lidar_pts(
         return np.zeros((0,), dtype=np.int32)
 
     # ---------- load points ----------
-    # merged bin is 5-dim (x,y,z,intensity,timestamp_2us) from read_pcd_with_intensity()
+    # merged bin is 4-dim (x,y,z,intensity) from read_pcd_with_intensity()
     try:
-        points = np.fromfile(lidar_path, dtype=np.float32).reshape(-1, 5)
+        points = np.fromfile(lidar_path, dtype=np.float32).reshape(-1, 4)
     except ValueError:
-        print(f'[WARNING] cannot reshape lidar file (size not divisible by 5): {lidar_path}')
+        print(f'[WARNING] cannot reshape lidar file (size not divisible by 4): {lidar_path}')
         return np.zeros((M,), dtype=np.int32)
     points_xyz = points[:, :3]
 
@@ -714,8 +719,8 @@ def process_frame(frame_info):
     # =================== 基础 info ===================
     info = {
         'lidar_path': None,   # 先占位，后面补
-        # Merged KL bins are saved as x, y, z, intensity, timestamp_2us.
-        'num_features': 5,
+        # Merged KL bins are saved as x, y, z, intensity.
+        'num_features': 4,
         'token': generate_token(),
         'sweeps': [],
         'cams': {},
@@ -1183,8 +1188,12 @@ def generate_frame_bin_parallel(data_root, info_prefix, version,
           f'lidar_dirs={len(lidar_dirs)}, '
           f'skip_no_label={skip_no_label}, skip_no_extrinsics={skip_no_extrinsics}')
 
+    worker_cfg = {}
+    if cfg is not None and hasattr(cfg, 'worker_cfg'):
+        worker_cfg = dict(cfg.worker_cfg)
     if workers is None or int(workers) <= 0:
-        num_workers = min(32, os.cpu_count() or 1)
+        num_workers = int(
+            worker_cfg.get('num_workers', min(32, os.cpu_count() or 1)))
     else:
         num_workers = max(1, int(workers))
     print(f'[Stage 1] using {num_workers} worker processes')

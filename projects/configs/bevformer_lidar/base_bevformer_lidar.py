@@ -52,7 +52,7 @@ bev_w_ = 200
 model = dict(
     type='BEVFormerLidar',
     point_cloud_range=point_cloud_range,
-    num_query=900,
+    num_query=600,
     embed_dims=_dim_,
     video_test_mode=True,
     return_query_feats=False,
@@ -93,7 +93,7 @@ model = dict(
         type='BEVFormerLidarHead',
         in_channels=_dim_,
         num_classes=num_classes,
-        num_query=900,
+        num_query=600,
         embed_dims=_dim_,
         code_size=10,
         with_box_refine=True,
@@ -175,7 +175,7 @@ train_pipeline = [
     dict(
         type='LoadPointsFromFile',
         coord_type='LIDAR',
-        load_dim=5,
+        load_dim=4,
         use_dim=4,
         file_client_args=file_client_args),
     dict(
@@ -195,7 +195,7 @@ test_pipeline = [
     dict(
         type='LoadPointsFromFile',
         coord_type='LIDAR',
-        load_dim=5,
+        load_dim=4,
         use_dim=4,
         file_client_args=file_client_args),
     dict(type='PointsRangeFilter', point_cloud_range=point_cloud_range),
@@ -207,7 +207,7 @@ test_pipeline = [
 ]
 
 data = dict(
-    samples_per_gpu=3,
+    samples_per_gpu=4,
     workers_per_gpu=4,
     train=dict(
         type=dataset_type,
@@ -257,7 +257,7 @@ lr_config = dict(
     warmup_iters=500,
     warmup_ratio=1.0 / 3,
     min_lr_ratio=1e-3)
-total_epochs = 12
+total_epochs = 6
 runner = dict(type='EpochBasedRunner', max_epochs=total_epochs)
 checkpoint_config = dict(interval=1)
 evaluation = dict(interval=1, pipeline=test_pipeline)

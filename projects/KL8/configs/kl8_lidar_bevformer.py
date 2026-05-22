@@ -18,6 +18,7 @@ gt_annotation_filter = dict(
         'WheelCrane': 200,
     })
 
+
 lidar_selection = dict(
     enable=False,
     use_lidars=[
@@ -26,6 +27,7 @@ lidar_selection = dict(
         'helios_front_left', 'helios_rear_right',
         'm1_front', 'm1_rear',
     ])
+
 
 camera_selection = dict(
     enable=True,
@@ -38,11 +40,20 @@ camera_selection = dict(
         'right_rear',
     ])
 
+
+# Current KL LiDAR configs only consume point clouds. Keep camera selection
+# above for future image/multimodal prep, but skip expensive undistort/resize
+# work for the default LiDAR-only conversion.
 camera_processing_cfg = dict(
-    # Current KL LiDAR configs only consume point clouds.  Keep camera
-    # selection above for future image/multimodal prep, but skip expensive
-    # undistort/resize work for the default LiDAR-only conversion.
-    enable=False)
+    enable=False,
+    img_scale=1.0 / 3.0)
+
+
+# Only used by tools/data_converter/kl_converter.py when create_data.py does
+# not pass --workers. The CLI --workers value takes precedence.
+worker_cfg = dict(
+    num_workers=8)
+
 
 sensor_sync_cfg = dict(
     lidar_max_diff=0.05,
@@ -51,14 +62,17 @@ sensor_sync_cfg = dict(
     require_valid_localization=True,
     sensor_time_offsets={})
 
+
 temporal_chain_cfg = dict(
     enable=True,
     min_adj_time_diff=0.35,
     max_adj_time_diff=0.75)
 
+
 forecast_cfg = dict(
     enable=False,
     forecast_steps=6)
+
 
 velocity_cfg = dict(
     enable=True,
@@ -66,11 +80,13 @@ velocity_cfg = dict(
     max_time_diff=1.5,
     max_speed=60.0)
 
+
 gt_processing_cfg = dict(
     # Use GPU by default because KL point counting is materially faster, and
     # GPU 0 is usually reserved for data prep / quick tests on this machine.
     # Switch to 'cpu' when all GPUs are occupied by training.
     device='cuda')
+
 
 sync_cfg = dict(sensor_sync_cfg)
 if temporal_chain_cfg.get('enable', True):

@@ -171,7 +171,7 @@ def update_kl_infos(pkl_path, out_dir):
             data_info['sync_info'] = ori_info['sync_info']
 
         data_info['lidar_points']['num_pts_feats'] = ori_info.get(
-            'num_features', 5)
+            'num_features', 4)
         data_info['lidar_points']['lidar_path'] = Path(
             ori_info['lidar_path']).name
         data_info['lidar_points']['lidar2ego'] = convert_quaternion_to_matrix(
