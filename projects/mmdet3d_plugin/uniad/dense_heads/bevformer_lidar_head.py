@@ -150,8 +150,7 @@ class BEVFormerLidarHead(BaseModule):
                              f'{len(code_weights)} vs {code_size}.')
         self.register_buffer(
             'code_weights',
-            torch.tensor(code_weights, dtype=torch.float32),
-            persistent=False)
+            torch.tensor(code_weights, dtype=torch.float32))
 
         # ---- BEV encoder boundary (matches UniAD BEVFormerTrackHead) -------
         transformer = dict(transformer)
