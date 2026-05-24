@@ -100,8 +100,8 @@ data = dict(
 
 total_epochs = 12
 runner = dict(type='EpochBasedRunner', max_epochs=total_epochs)
-optimizer = dict(type='AdamW', lr=1e-4, weight_decay=0.01)
-optimizer_config = dict(grad_clip=dict(max_norm=10, norm_type=2))
+optimizer = dict(type='AdamW', lr=2e-4, weight_decay=0.01)
+optimizer_config = dict(grad_clip=dict(max_norm=35, norm_type=2))
 
 load_from = './projects/work_dirs/bevformer_lidar/base_bevformer_lidar/latest.pth'
 resume_from = None
