@@ -354,7 +354,7 @@ class UniADTrackLidar(BEVFormerLidar):
             (pc_range[5] - pc_range[2]) + pc_range[2])
         reference_points = reference_points + velo_pad * time_delta
         ref_pts = reference_points @ l2g_r1 + l2g_t1 - l2g_t2
-        ref_pts = ref_pts @ l2g_r2.mT.type(torch.float)
+        ref_pts = ref_pts @ l2g_r2.T.type(torch.float)
         ref_pts[..., 0:1] = (ref_pts[..., 0:1] - pc_range[0]) / (
             pc_range[3] - pc_range[0])
         ref_pts[..., 1:2] = (ref_pts[..., 1:2] - pc_range[1]) / (
