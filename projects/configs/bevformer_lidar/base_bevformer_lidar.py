@@ -257,7 +257,7 @@ lr_config = dict(
     warmup_iters=500,
     warmup_ratio=1.0 / 3,
     min_lr_ratio=1e-3)
-total_epochs = 6
+total_epochs = 12
 runner = dict(type='EpochBasedRunner', max_epochs=total_epochs)
 checkpoint_config = dict(interval=1)
 evaluation = dict(interval=1, pipeline=test_pipeline)

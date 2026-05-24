@@ -194,6 +194,12 @@ class ClipMatcher(nn.Module):
 
     def loss_past_trajs(self, outputs, gt_instances: List[Instances],
                    indices: List[tuple]):
+        if self.loss_past_traj_weight <= 0:
+            pred_trajs = torch.nan_to_num(
+                outputs["pred_past_trajs"], nan=0.0, posinf=0.0,
+                neginf=0.0)
+            return {"loss_past_trajs": pred_trajs.sum() * 0.0}
+
         # We ignore the regression loss of the track-disappear slots.
         # TODO: Make this filter process more elegant.
         filtered_idx = []
@@ -292,10 +298,10 @@ class ClipMatcher(nn.Module):
         mask = target_obj_ids != -1
         bbox_weights = torch.ones_like(target_boxes) * self.code_weights
         avg_factor = src_boxes[mask].size(0)
-        if avg_factor == 0:
-            return {"loss_bbox": src_boxes.sum() * 0}
         avg_factor = reduce_mean(target_boxes.new_tensor([avg_factor]))
         avg_factor = torch.clamp(avg_factor, min=1.0)
+        if mask.sum() == 0:
+            return {"loss_bbox": src_boxes.sum() * 0}
         loss_bbox = self.loss_bboxes(
             src_boxes[mask],
             target_boxes[mask],
@@ -585,8 +591,11 @@ class ClipMatcher(nn.Module):
                 }
                 new_matched_indices_layer = match_for_single_decoder_layer(
                     unmatched_outputs_layer, self.matcher)
-                matched_indices_layer = torch.cat(
-                    [new_matched_indices_layer, prev_matched_indices], dim=0)
+                if new_matched_indices_layer is not None:
+                    matched_indices_layer = torch.cat(
+                        [new_matched_indices_layer, prev_matched_indices], dim=0)
+                else:
+                    matched_indices_layer = prev_matched_indices
                 for loss in self.losses:
                     if loss == "masks":
                         # Intermediate masks losses are too costly to compute, we ignore them.

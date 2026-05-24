@@ -505,6 +505,362 @@ class KlDataset(Custom3DDataset):
         print_log('\n' + AsciiTable(table_data).table, logger=logger)
         return ret_dict
 
+    def _get_raw_info(self, index):
+        if hasattr(self, '_to_raw_index'):
+            index = self._to_raw_index(index)
+        return self.data_infos[index]
+
+    @staticmethod
+    def _to_numpy(value):
+        if value is None:
+            return None
+        if isinstance(value, torch.Tensor):
+            return value.detach().cpu().numpy()
+        return np.asarray(value)
+
+    @staticmethod
+    def _tracking_track_key(scene_token, track_id):
+        return f'{scene_token}:{int(track_id)}'
+
+    def _collect_tracking_records(self, results, gt_ann_infos):
+        records = []
+        for sample_idx, (result, ann_info) in enumerate(
+                zip(results, gt_ann_infos)):
+            info = self._get_raw_info(sample_idx)
+            scene_token = str(
+                info.get('scene_token',
+                         info.get('scene_id', info.get('log_id', ''))))
+            if not scene_token:
+                scene_token = 'default_scene'
+            timestamp = float(info.get('timestamp', sample_idx))
+
+            gt_records = []
+            gt_boxes = ann_info['gt_bboxes_3d'].tensor.detach().cpu().numpy()
+            gt_labels = np.asarray(ann_info['gt_labels_3d'])
+            gt_track_ids = np.asarray(ann_info.get('gt_inds', []))
+            for box, label, track_id in zip(gt_boxes, gt_labels,
+                                            gt_track_ids):
+                if int(track_id) < 0:
+                    continue
+                gt_records.append(
+                    dict(
+                        box=box,
+                        label=int(label),
+                        track_id=self._tracking_track_key(
+                            scene_token, track_id)))
+
+            pred_records = []
+            boxes = result.get('track_boxes_3d', result.get('boxes_3d', None))
+            scores = result.get('track_scores', result.get('scores_3d', None))
+            labels = result.get('track_labels_3d',
+                                result.get('labels_3d', None))
+            track_ids = result.get('track_ids', None)
+            if boxes is not None and track_ids is not None:
+                box_tensor = boxes.tensor.detach().cpu().numpy()
+                scores = self._to_numpy(scores)
+                labels = self._to_numpy(labels)
+                track_ids = self._to_numpy(track_ids)
+                num_preds = min(
+                    len(box_tensor),
+                    0 if scores is None else len(scores),
+                    0 if labels is None else len(labels),
+                    0 if track_ids is None else len(track_ids))
+                for pred_idx in range(num_preds):
+                    track_id = int(track_ids[pred_idx])
+                    if track_id < 0:
+                        continue
+                    label = int(labels[pred_idx])
+                    if label < 0 or label >= len(self.CLASSES):
+                        continue
+                    pred_records.append(
+                        dict(
+                            box=box_tensor[pred_idx],
+                            label=label,
+                            score=float(scores[pred_idx]),
+                            track_id=self._tracking_track_key(
+                                scene_token, track_id)))
+
+            records.append(
+                dict(
+                    sample_idx=sample_idx,
+                    scene_token=scene_token,
+                    timestamp=timestamp,
+                    gts=gt_records,
+                    preds=pred_records))
+
+        records.sort(
+            key=lambda item: (item['scene_token'], item['timestamp'],
+                              item['sample_idx']))
+        return records
+
+    @staticmethod
+    def _match_tracking_frame(gts, preds, dist_th):
+        candidates = []
+        for gt_idx, gt in enumerate(gts):
+            for pred_idx, pred in enumerate(preds):
+                distance = float(np.linalg.norm(gt['box'][:2] -
+                                                pred['box'][:2]))
+                if distance < dist_th:
+                    candidates.append((distance, gt_idx, pred_idx))
+        candidates.sort(key=lambda item: item[0])
+
+        matches = []
+        used_gts = set()
+        used_preds = set()
+        for distance, gt_idx, pred_idx in candidates:
+            if gt_idx in used_gts or pred_idx in used_preds:
+                continue
+            used_gts.add(gt_idx)
+            used_preds.add(pred_idx)
+            matches.append((gt_idx, pred_idx, distance))
+        return matches
+
+    def _accumulate_tracking_class(self, records, label, score_thr, dist_th):
+        total_gt = 0
+        tp = 0
+        fp = 0
+        fn = 0
+        ids = 0
+        frag = 0
+        dist_sum = 0.0
+        track_total = {}
+        track_matched = {}
+        last_pred_by_gt = {}
+        was_tracked = {}
+        ever_tracked = {}
+        current_scene = None
+
+        for frame in records:
+            scene_token = frame['scene_token']
+            if scene_token != current_scene:
+                current_scene = scene_token
+                last_pred_by_gt = {}
+                was_tracked = {}
+                ever_tracked = {}
+
+            gts = [gt for gt in frame['gts'] if gt['label'] == label]
+            preds = [
+                pred for pred in frame['preds']
+                if pred['label'] == label and pred['score'] >= score_thr
+            ]
+
+            total_gt += len(gts)
+            for gt in gts:
+                track_total[gt['track_id']] = (
+                    track_total.get(gt['track_id'], 0) + 1)
+
+            matches = self._match_tracking_frame(gts, preds, dist_th)
+            matched_gt_indices = {match[0] for match in matches}
+            matched_pred_indices = {match[1] for match in matches}
+
+            tp += len(matches)
+            fp += len(preds) - len(matched_pred_indices)
+            fn += len(gts) - len(matched_gt_indices)
+
+            for gt_idx, pred_idx, distance in matches:
+                gt_id = gts[gt_idx]['track_id']
+                pred_id = preds[pred_idx]['track_id']
+                if gt_id in last_pred_by_gt and last_pred_by_gt[
+                        gt_id] != pred_id:
+                    ids += 1
+                if ever_tracked.get(gt_id, False) and not was_tracked.get(
+                        gt_id, False):
+                    frag += 1
+                last_pred_by_gt[gt_id] = pred_id
+                was_tracked[gt_id] = True
+                ever_tracked[gt_id] = True
+                track_matched[gt_id] = track_matched.get(gt_id, 0) + 1
+                dist_sum += distance
+
+            for gt_idx, gt in enumerate(gts):
+                if gt_idx not in matched_gt_indices:
+                    was_tracked[gt['track_id']] = False
+
+        if total_gt == 0:
+            return None
+
+        recall = tp / max(total_gt, 1)
+        mota = 1.0 - (fn + fp + ids) / max(total_gt, 1)
+        motp = dist_sum / tp if tp > 0 else np.nan
+        motar = max(0.0, 1.0 - (fp + ids) / max(tp, 1)) if tp > 0 else 0.0
+        mt = 0
+        ml = 0
+        for track_id, count in track_total.items():
+            ratio = track_matched.get(track_id, 0) / max(count, 1)
+            if ratio >= 0.8:
+                mt += 1
+            if ratio <= 0.2:
+                ml += 1
+
+        return dict(
+            recall=float(recall),
+            motar=float(motar),
+            mota=float(mota),
+            motp=float(motp),
+            gt=int(total_gt),
+            tp=int(tp),
+            fp=int(fp),
+            fn=int(fn),
+            ids=int(ids),
+            frag=int(frag),
+            mt=int(mt),
+            ml=int(ml),
+            faf=float(fp / max(len(records), 1)))
+
+    def _evaluate_tracking(self,
+                           results,
+                           gt_ann_infos,
+                           logger=None,
+                           dist_th=2.0,
+                           score_thresholds=None):
+        records = self._collect_tracking_records(results, gt_ann_infos)
+        if score_thresholds is None:
+            score_thresholds = np.linspace(0.0, 1.0, 41)
+        else:
+            score_thresholds = np.asarray(score_thresholds, dtype=np.float32)
+
+        label2cat = {i: cat for i, cat in enumerate(self.CLASSES)}
+        table_data = [[
+            'classes', 'AMOTA', 'AMOTP', 'MOTA', 'MOTP', 'Recall', 'IDS',
+            'FP', 'FN'
+        ]]
+        ret_dict = {}
+        class_metrics = []
+        count_keys = ('gt', 'tp', 'fp', 'fn', 'ids', 'frag', 'mt', 'ml')
+        count_sums = {key: 0 for key in count_keys}
+
+        for label, class_name in label2cat.items():
+            class_score_thresholds = score_thresholds
+            per_threshold = []
+            for score_thr in class_score_thresholds:
+                metric_data = self._accumulate_tracking_class(
+                    records, label, float(score_thr), dist_th)
+                if metric_data is not None:
+                    per_threshold.append(metric_data)
+
+            if len(per_threshold) == 0:
+                class_metric = dict(
+                    amota=np.nan,
+                    amotp=np.nan,
+                    recall=np.nan,
+                    motar=np.nan,
+                    mota=np.nan,
+                    motp=np.nan,
+                    gt=0,
+                    tp=0,
+                    fp=0,
+                    fn=0,
+                    ids=0,
+                    frag=0,
+                    mt=0,
+                    ml=0,
+                    faf=np.nan)
+            else:
+                amota_values = []
+                amotp_values = []
+                for min_recall in np.linspace(0.1, 1.0, 40):
+                    candidates = [
+                        item for item in per_threshold
+                        if item['recall'] >= min_recall
+                    ]
+                    if len(candidates) == 0:
+                        amota_values.append(0.0)
+                        continue
+                    selected = max(
+                        candidates,
+                        key=lambda item: (item['motar'], item['mota'],
+                                          item['recall']))
+                    amota_values.append(selected['motar'])
+                    if np.isfinite(selected['motp']):
+                        amotp_values.append(selected['motp'])
+                best = max(
+                    per_threshold,
+                    key=lambda item: (item['mota'], item['recall'],
+                                      item['motar']))
+                class_metric = dict(best)
+                class_metric['amota'] = float(np.mean(amota_values))
+                class_metric['amotp'] = (
+                    float(np.mean(amotp_values)) if amotp_values else np.nan)
+                class_metrics.append(class_metric)
+                for key in count_keys:
+                    count_sums[key] += int(best[key])
+
+            for metric_name, value in (
+                    ('amota', class_metric['amota']),
+                    ('amotp', class_metric['amotp']),
+                    ('mota', class_metric['mota']),
+                    ('motp', class_metric['motp']),
+                    ('recall', class_metric['recall']),
+                    ('motar', class_metric['motar']),
+                    ('faf', class_metric['faf'])):
+                ret_dict[f'{class_name}_{metric_name}'] = value
+            for metric_name in count_keys:
+                ret_dict[f'{class_name}_{metric_name}'] = class_metric[
+                    metric_name]
+
+            table_data.append([
+                class_name,
+                'nan' if not np.isfinite(class_metric['amota']) else
+                f'{class_metric["amota"]:.4f}',
+                'nan' if not np.isfinite(class_metric['amotp']) else
+                f'{class_metric["amotp"]:.4f}',
+                'nan' if not np.isfinite(class_metric['mota']) else
+                f'{class_metric["mota"]:.4f}',
+                'nan' if not np.isfinite(class_metric['motp']) else
+                f'{class_metric["motp"]:.4f}',
+                'nan' if not np.isfinite(class_metric['recall']) else
+                f'{class_metric["recall"]:.4f}',
+                str(class_metric['ids']),
+                str(class_metric['fp']),
+                str(class_metric['fn']),
+            ])
+
+        mean_keys = ('amota', 'amotp', 'recall', 'motar', 'mota', 'motp',
+                     'faf')
+        overall = {}
+        for key in mean_keys:
+            values = [
+                item[key] for item in class_metrics
+                if np.isfinite(item[key])
+            ]
+            overall[key] = float(np.mean(values)) if values else np.nan
+            ret_dict[key] = overall[key]
+
+        for key in count_keys:
+            ret_dict[key] = count_sums[key]
+
+        ret_dict.update(
+            AMOTA=overall['amota'],
+            AMOTP=overall['amotp'],
+            MOTA=overall['mota'],
+            MOTP=overall['motp'],
+            MOTAR=overall['motar'],
+            Recall=overall['recall'],
+            IDS=count_sums['ids'],
+            FRAG=count_sums['frag'],
+            FP=count_sums['fp'],
+            FN=count_sums['fn'],
+            TP=count_sums['tp'])
+
+        table_data.append([
+            'Overall',
+            'nan' if not np.isfinite(overall['amota']) else
+            f'{overall["amota"]:.4f}',
+            'nan' if not np.isfinite(overall['amotp']) else
+            f'{overall["amotp"]:.4f}',
+            'nan' if not np.isfinite(overall['mota']) else
+            f'{overall["mota"]:.4f}',
+            'nan' if not np.isfinite(overall['motp']) else
+            f'{overall["motp"]:.4f}',
+            'nan' if not np.isfinite(overall['recall']) else
+            f'{overall["recall"]:.4f}',
+            str(count_sums['ids']),
+            str(count_sums['fp']),
+            str(count_sums['fn']),
+        ])
+        print_log('\n' + AsciiTable(table_data).table, logger=logger)
+        return ret_dict
+
     def evaluate(self,
                  results,
                  metric='bbox',
@@ -515,6 +871,7 @@ class KlDataset(Custom3DDataset):
                  show=False,
                  out_dir=None,
                  pipeline=None,
+                 tracking_dist_th=2.0,
                  **kwargs):
         if isinstance(results, dict):
             if 'bbox_results' not in results:
@@ -533,12 +890,22 @@ class KlDataset(Custom3DDataset):
             elif 'img_bbox' in result:
                 result = result['img_bbox']
             result = dict(result)
-            if 'boxes_3d' in result and hasattr(result['boxes_3d'], 'to'):
-                result['boxes_3d'] = result['boxes_3d'].to('cpu')
-            if 'scores_3d' in result and isinstance(result['scores_3d'], torch.Tensor):
-                result['scores_3d'] = result['scores_3d'].detach().cpu()
-            if 'labels_3d' in result and isinstance(result['labels_3d'], torch.Tensor):
-                result['labels_3d'] = result['labels_3d'].detach().cpu()
+            if ('track_ids' in result and 'boxes_3d' in result
+                    and 'track_boxes_3d' not in result):
+                result['track_boxes_3d'] = result['boxes_3d']
+                result['track_labels_3d'] = result.get('labels_3d', None)
+            if 'boxes_3d_det' in result:
+                result['boxes_3d'] = result['boxes_3d_det']
+                result['scores_3d'] = result['scores_3d_det']
+                result['labels_3d'] = result['labels_3d_det']
+            for box_key in ('boxes_3d', 'track_boxes_3d'):
+                if box_key in result and hasattr(result[box_key], 'to'):
+                    result[box_key] = result[box_key].to('cpu')
+            for tensor_key in ('scores_3d', 'labels_3d', 'track_scores',
+                               'track_ids', 'track_labels_3d'):
+                if (tensor_key in result
+                        and isinstance(result[tensor_key], torch.Tensor)):
+                    result[tensor_key] = result[tensor_key].detach().cpu()
             norm_results.append(result)
 
         gt_ann_infos = []
@@ -548,6 +915,18 @@ class KlDataset(Custom3DDataset):
 
         ret_dict = self._evaluate_nusc_style(
             norm_results, gt_ann_infos, logger=logger)
+        has_tracking = any(
+            'track_ids' in result and 'track_boxes_3d' in result
+            for result in norm_results)
+        if has_tracking:
+            ret_dict.update(
+                self._evaluate_tracking(
+                    norm_results,
+                    gt_ann_infos,
+                    logger=logger,
+                    dist_th=tracking_dist_th,
+                    score_thresholds=kwargs.get(
+                        'tracking_score_thresholds', None)))
 
         if show:
             self.show(norm_results, out_dir, pipeline=pipeline)
@@ -598,7 +977,15 @@ class KlBEVFormerDataset(KlDataset):
         return super().get_ann_info(self._to_raw_index(index))
 
     def prepare_train_data(self, index):
-        return self._prepare_queue_data(self._to_raw_index(index))
+        data = self._prepare_queue_data(self._to_raw_index(index))
+        if data is not None:
+            return data
+        for _ in range(10):
+            raw_index = np.random.randint(0, len(self.data_infos))
+            data = self._prepare_queue_data(raw_index)
+            if data is not None:
+                return data
+        return None
 
     def prepare_test_data(self, index):
         return self._prepare_queue_data(self._to_raw_index(index))

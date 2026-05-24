@@ -167,6 +167,11 @@ class MotionHead(BaseMotionHead):
         """Test function"""
         track_query = outs_track['track_query_embeddings'][None, None, ...]
         track_boxes = outs_track['track_bbox_results']
+
+        if track_query.shape[2] == 0:
+            device = bev_embed.device
+            return [{'traj': torch.zeros((0, self.predict_steps, 5), device=device),
+                     'traj_scores': torch.zeros((0,), device=device)}], {}
         
         track_query = torch.cat([track_query, outs_track['sdc_embedding'][None, None, None, :]], dim=2)
         sdc_track_boxes = outs_track['sdc_track_bbox_results']
