@@ -560,11 +560,13 @@ class KlDataset(Custom3DDataset):
                 scores = self._to_numpy(scores)
                 labels = self._to_numpy(labels)
                 track_ids = self._to_numpy(track_ids)
-                num_preds = min(
-                    len(box_tensor),
-                    0 if scores is None else len(scores),
-                    0 if labels is None else len(labels),
-                    0 if track_ids is None else len(track_ids))
+                num_preds = len(box_tensor)
+                if scores is not None:
+                    num_preds = min(num_preds, len(scores))
+                if labels is not None:
+                    num_preds = min(num_preds, len(labels))
+                if track_ids is not None:
+                    num_preds = min(num_preds, len(track_ids))
                 for pred_idx in range(num_preds):
                     track_id = int(track_ids[pred_idx])
                     if track_id < 0:
@@ -1065,7 +1067,7 @@ class KlBEVFormerDataset(KlDataset):
         prev_ego2global = None
         prev_timestamp = None
         for idx, meta in enumerate(raw_meta):
-            entry = copy.deepcopy(meta)
+            entry = dict(meta)
             ego2global = meta['ego2global']
             timestamp = meta['timestamp']
             if idx == 0:
@@ -1115,15 +1117,16 @@ class KlTrackDataset(KlBEVFormerDataset):
             self._dc_data(each['gt_bboxes_3d']) for each in queue
         ]
         gt_inds_list = [
-            self._as_tensor(each['gt_inds'], dtype=torch.long)
+            self._as_tensor(each.get('gt_inds', []), dtype=torch.long)
             for each in queue
         ]
         gt_past_traj_list = [
-            self._as_tensor(each['gt_past_traj'], dtype=torch.float32)
+            self._as_tensor(each.get('gt_past_traj', []), dtype=torch.float32)
             for each in queue
         ]
         gt_past_traj_mask_list = [
-            self._as_tensor(each['gt_past_traj_mask'], dtype=torch.float32)
+            self._as_tensor(each.get('gt_past_traj_mask', []),
+                            dtype=torch.float32)
             for each in queue
         ]
         has_fut_traj = all('gt_fut_traj' in each for each in queue)

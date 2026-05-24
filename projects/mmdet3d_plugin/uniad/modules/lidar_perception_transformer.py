@@ -43,7 +43,6 @@ class LidarPerceptionTransformer(BaseModule):
         encoder.setdefault('embed_dims', embed_dims)
         encoder.setdefault('bev_h', bev_h)
         encoder.setdefault('bev_w', bev_w)
-        encoder = dict(encoder)
         encoder.pop('type', None)
         self.encoder = LidarBEVFormerEncoder(**encoder)
         self.decoder = (
@@ -82,7 +81,11 @@ class LidarPerceptionTransformer(BaseModule):
             if self.rotate_prev_bev:
                 shifts.append(-delta[:2, 3].to(dtype=dtype) / extent)
             else:
-                prev_from_curr = torch.inverse(delta)
+                det = torch.det(delta[:3, :3])
+                if det.abs() < 1e-6:
+                    shifts.append(torch.zeros(2, device=device, dtype=dtype))
+                    continue
+                prev_from_curr = torch.linalg.inv(delta)
                 shifts.append(prev_from_curr[:2, 3].to(dtype=dtype) / extent)
         return torch.stack(shifts, dim=0)
 
@@ -117,7 +120,13 @@ class LidarPerceptionTransformer(BaseModule):
             if delta.shape != (4, 4):
                 raise ValueError('ego_motion_delta must have shape (4, 4), '
                                  f'got {tuple(delta.shape)}.')
-            prev_from_curr = torch.inverse(delta)
+            det = torch.det(delta[:3, :3])
+            if det.abs() < 1e-6:
+                rotations.append(
+                    torch.eye(
+                        2, device=prev_bev.device, dtype=prev_bev.dtype))
+                continue
+            prev_from_curr = torch.linalg.inv(delta)
             rotations.append(prev_from_curr[:2, :2].to(dtype=prev_bev.dtype))
         rotations = torch.stack(rotations, dim=0)
 

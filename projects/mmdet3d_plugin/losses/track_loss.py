@@ -247,7 +247,9 @@ class ClipMatcher(nn.Module):
     
     def compute_past_traj_loss(self, src, tgt, tgt_mask):
         loss = torch.abs(src - tgt) * tgt_mask
-        return torch.sum(loss)/ (torch.sum(tgt_mask>0) + 1e-5)
+        avg_factor = torch.sum(tgt_mask > 0).float().clamp(min=1.0)
+        avg_factor = reduce_mean(avg_factor)
+        return torch.sum(loss) / avg_factor.clamp(min=1.0)
 
     def loss_boxes(self, outputs, gt_instances: List[Instances],
                    indices: List[tuple]):
@@ -675,6 +677,6 @@ class ClipMatcher(nn.Module):
                 self.losses_dict["pred_loss_{}".format(i)] = pred_loss_i
             else:
                 self.losses_dict["pred_loss_{}".format(i)] = torch.tensor(
-                    [0.0]).cuda()
+                    [0.0], device=pred_boxes_i.device)
 
             decay_ratio = decay_ratio * 0.5
