@@ -83,6 +83,7 @@ class UniADTrackLidar(BEVFormerLidar):
         return [
             getattr(self, 'pts_voxel_encoder', None),
             getattr(self, 'pts_middle_encoder', None),
+            getattr(self, 'pts_backbone', None),
         ]
 
     def _bev_encoder_modules(self):
