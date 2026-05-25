@@ -129,6 +129,15 @@ class UniADTrackLidar(BEVFormerLidar):
                             f'{type(img_metas)}.')
         return img_metas
 
+    @staticmethod
+    def _detach_track_instances(track_instances):
+        """Detach and clone all tensors in track_instances to break view refs."""
+        for field in track_instances._fields:
+            val = getattr(track_instances, field)
+            if isinstance(val, torch.Tensor):
+                setattr(track_instances, field, val.detach().clone())
+        return track_instances
+
     def _generate_empty_tracks(self):
         track_instances = Instances((1, 1))
         num_queries, dim = self.query_embedding.weight.shape
@@ -450,6 +459,31 @@ class UniADTrackLidar(BEVFormerLidar):
         return self.pts_bbox_head.positional_encoding(
             batch_size, device, dtype)
 
+    def extract_lidar_bev_from_points(self, points, img_metas):
+        from torch import Tensor
+        if isinstance(points, Tensor):
+            points = [points]
+        voxels, num_points, coors = self.voxelize(points)
+        try:
+            voxel_features = self.pts_voxel_encoder(
+                voxels, num_points, coors, None, img_metas)
+        except TypeError:
+            voxel_features = self.pts_voxel_encoder(
+                voxels, num_points, coors)
+        middle_dtype = next(self.pts_middle_encoder.parameters()).dtype
+        voxel_features = voxel_features.to(dtype=middle_dtype)
+        batch_size = int(coors[-1, 0].item()) + 1
+        if self.freeze_lidar_backbone:
+            with torch.no_grad():
+                x = self.pts_middle_encoder(voxel_features, coors, batch_size)
+                x = self.pts_backbone(x)
+            x = tuple(t.detach() for t in x) if isinstance(x, tuple) else x.detach()
+        else:
+            x = self.pts_middle_encoder(voxel_features, coors, batch_size)
+            x = self.pts_backbone(x)
+        pts_feats = self.pts_neck(x) if self.with_pts_neck else x
+        return self._unwrap_single_bev(pts_feats)
+
     def get_bevs(self, points, img_metas, prev_bev=None):
         lidar_bev = self.extract_lidar_bev_from_points(points, img_metas)
         prev_bev = self.valid_prev_bev(prev_bev, img_metas)
@@ -705,6 +739,7 @@ class UniADTrackLidar(BEVFormerLidar):
             l2g_r1, l2g_t1, time_delta = None, None, None
             if not has_queue_meta:
                 prev_bev = None
+            torch.cuda.empty_cache()
         else:
             track_instances = self.test_track_instances
             l2g_r1 = self.l2g_r_mat
@@ -722,18 +757,21 @@ class UniADTrackLidar(BEVFormerLidar):
             l2g_t2=l2g_t2,
             time_delta=time_delta)
 
-        self.test_track_instances = frame_res['track_instances']
-        self._test_prev_bev = frame_res['bev_embed'].detach()
+        self.test_track_instances = self._detach_track_instances(
+            frame_res['track_instances'])
+        self._test_prev_bev = frame_res['bev_embed'].detach().clone()
         self.scene_token = scene_token
         self.timestamp = timestamp
         self.l2g_r_mat = l2g_r2
         self.l2g_t = l2g_t2
 
         get_keys = [
-            'bev_embed', 'bev_pos', 'track_query_embeddings',
+            'track_query_embeddings',
             'track_query_matched_idxes', 'track_bbox_results', 'boxes_3d',
             'scores_3d', 'labels_3d', 'track_scores', 'track_ids'
         ]
+        if getattr(self, 'with_motion_head', False):
+            get_keys = ['bev_embed', 'bev_pos'] + get_keys
         result = {k: frame_res[k] for k in get_keys if k in frame_res}
         det_results = self.pts_bbox_head.predict_by_feat(
             dict(

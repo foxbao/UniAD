@@ -98,10 +98,11 @@ data = dict(
     val=dict(queue_length=queue_length, label_mapping=label_mapping),
     test=dict(queue_length=queue_length, label_mapping=label_mapping))
 
-total_epochs = 12
-runner = dict(type='EpochBasedRunner', max_epochs=total_epochs)
+total_epochs = 6
+runner = dict(type='EpochBasedRunner', max_epochs=1)
 optimizer = dict(type='AdamW', lr=1e-4, weight_decay=0.01)
 optimizer_config = dict(grad_clip=dict(max_norm=35, norm_type=2))
+evaluation = dict(interval=total_epochs)
 
 load_from = './projects/work_dirs/bevformer_lidar/base_bevformer_lidar/latest.pth'
 resume_from = None
