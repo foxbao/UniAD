@@ -26,6 +26,8 @@ group_id_list = [vehicle_id_list]
 model = dict(
     type='UniADMotionLidar',
     task_loss_weight=dict(track=1.0, motion=1.0),
+    freeze_lidar_backbone=True,
+    freeze_bev_encoder=True,
     motion_head=dict(
         type='MotionHeadLidar',
         bev_h=bev_h_,
