@@ -65,17 +65,19 @@ def custom_train_detector(model,
     # put model on gpus
     if distributed:
         find_unused_parameters = cfg.get('find_unused_parameters', False)
+        device_id = torch.cuda.current_device()
+        torch.cuda.set_device(device_id)
         # Sets the `find_unused_parameters` parameter in
         # torch.nn.parallel.DistributedDataParallel
         model = MMDistributedDataParallel(
-            model.cuda(),
-            device_ids=[torch.cuda.current_device()],
+            model.cuda(device_id),
+            device_ids=[device_id],
             broadcast_buffers=False,
             find_unused_parameters=find_unused_parameters)
         if eval_model is not None:
             eval_model = MMDistributedDataParallel(
-                eval_model.cuda(),
-                device_ids=[torch.cuda.current_device()],
+                eval_model.cuda(device_id),
+                device_ids=[device_id],
                 broadcast_buffers=False,
                 find_unused_parameters=find_unused_parameters)
     else:
@@ -192,4 +194,3 @@ def custom_train_detector(model,
     elif cfg.load_from:
         runner.load_checkpoint(cfg.load_from)
     runner.run(data_loaders, cfg.workflow)
-

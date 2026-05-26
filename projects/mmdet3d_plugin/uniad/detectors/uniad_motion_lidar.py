@@ -21,6 +21,15 @@ class UniADMotionLidar(UniADTrackLidar):
     def with_motion_head(self):
         return hasattr(self, 'motion_head') and self.motion_head is not None
 
+    @staticmethod
+    def _bev_for_motion_head(bev_embed):
+        if bev_embed.dim() == 4:
+            return bev_embed.flatten(2).permute(2, 0, 1).contiguous()
+        if bev_embed.dim() == 3:
+            return bev_embed
+        raise ValueError('MotionHead expects BEV shape [HW, B, C] or '
+                         f'[B, C, H, W], got {tuple(bev_embed.shape)}.')
+
     def loss_weighted_and_prefixed(self, loss_dict, prefix=''):
         loss_factor = self.task_loss_weight.get(prefix, 1.0)
         return {
@@ -60,8 +69,9 @@ class UniADMotionLidar(UniADTrackLidar):
             self.loss_weighted_and_prefixed(losses_track, prefix='track'))
 
         if self.with_motion_head:
+            bev_embed = self._bev_for_motion_head(outs_track['bev_embed'])
             ret_dict_motion = self.motion_head.forward_train(
-                outs_track['bev_embed'],
+                bev_embed,
                 gt_bboxes_3d,
                 gt_labels_3d,
                 gt_fut_traj=gt_fut_traj,
@@ -75,3 +85,26 @@ class UniADMotionLidar(UniADTrackLidar):
         for key, value in losses.items():
             losses[key] = torch.nan_to_num(value)
         return losses
+
+    def simple_test(self, points, img_metas, img=None, history_points=None,
+                    **kwargs):
+        results = super().simple_test(
+            points,
+            img_metas,
+            img=img,
+            history_points=history_points,
+            **kwargs)
+
+        if not self.with_motion_head:
+            return results
+
+        result = results[0]['pts_bbox']
+        bev_embed = self._bev_for_motion_head(result['bev_embed'])
+        result_motion, _ = self.motion_head.forward_test(
+            bev_embed, outs_track=result)
+        result.update(result_motion[0])
+
+        for key in ('bev_embed', 'bev_pos', 'track_query_embeddings',
+                    'track_query_matched_idxes', 'track_bbox_results'):
+            result.pop(key, None)
+        return results

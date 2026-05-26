@@ -90,6 +90,29 @@ def kl_data_prep(root_path,
             max_time_diff=float(velocity_cfg.get('max_time_diff', 1.5)),
             max_speed=float(velocity_cfg.get('max_speed', 60.0)))
 
+    sdc_cfg = {}
+    if cfg is not None and hasattr(cfg, 'sdc_cfg'):
+        sdc_cfg = dict(cfg.sdc_cfg)
+    if bool(sdc_cfg.get('enable', False)):
+        from data_converter.add_sdc import add_sdc_to_pkl
+        sdc_kwargs = dict(
+            future_steps=int(sdc_cfg.get('future_steps', 6)),
+            sdc_label_name=sdc_cfg.get('sdc_label_name', 'Car'),
+            sdc_label_id=sdc_cfg.get('sdc_label_id', None),
+            sdc_size=tuple(sdc_cfg.get('sdc_size', (4.08, 1.73, 1.56))),
+            sdc_z=float(sdc_cfg.get('sdc_z', 0.0)),
+            sdc_yaw=float(sdc_cfg.get('sdc_yaw', 0.0)),
+            min_dt=float(sdc_cfg.get('min_dt', 1e-3)),
+            max_time_diff=float(sdc_cfg.get('max_time_diff', 1.5)),
+            max_step_time_diff=float(
+                sdc_cfg.get('max_step_time_diff', 1.5)),
+            max_speed=float(sdc_cfg.get('max_speed', 60.0)),
+            max_displacement=float(sdc_cfg.get('max_displacement', 100.0)),
+            require_valid_localization=bool(
+                sdc_cfg.get('require_valid_localization', True)))
+        add_sdc_to_pkl(info_train_path, in_place=True, **sdc_kwargs)
+        add_sdc_to_pkl(info_val_path, in_place=True, **sdc_kwargs)
+
 
 parser = argparse.ArgumentParser(description='Data converter arg parser')
 parser.add_argument('dataset', metavar='dataset', help='name of the dataset')

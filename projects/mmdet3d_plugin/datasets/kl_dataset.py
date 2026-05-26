@@ -863,6 +863,203 @@ class KlDataset(Custom3DDataset):
         print_log('\n' + AsciiTable(table_data).table, logger=logger)
         return ret_dict
 
+    @staticmethod
+    def _motion_valid_mask(mask):
+        mask = np.asarray(mask)
+        if mask.ndim == 2:
+            mask = np.all(mask > 0, axis=-1)
+        else:
+            mask = mask > 0
+        return mask.astype(np.bool_)
+
+    @staticmethod
+    def _motion_errors(pred_traj,
+                       gt_traj,
+                       gt_mask,
+                       miss_threshold=2.0):
+        pred_traj = np.asarray(pred_traj, dtype=np.float64)[..., :2]
+        gt_traj = np.asarray(gt_traj, dtype=np.float64)[..., :2]
+        gt_mask = KlDataset._motion_valid_mask(gt_mask)
+        if pred_traj.ndim == 2:
+            pred_traj = pred_traj[None]
+        if pred_traj.ndim != 3 or gt_traj.ndim != 2:
+            return None
+
+        steps = min(pred_traj.shape[1], gt_traj.shape[0], gt_mask.shape[0])
+        if steps <= 0:
+            return None
+        pred_traj = np.nan_to_num(pred_traj[:, :steps], nan=0.0,
+                                  posinf=0.0, neginf=0.0)
+        gt_traj = np.nan_to_num(gt_traj[:steps], nan=0.0,
+                                posinf=0.0, neginf=0.0)
+        valid = gt_mask[:steps]
+        if not np.any(valid):
+            return None
+
+        dists = np.linalg.norm(pred_traj[:, valid] - gt_traj[None, valid],
+                               axis=-1)
+        ade = dists.mean(axis=-1)
+        final_step = np.where(valid)[0][-1]
+        fde = np.linalg.norm(pred_traj[:, final_step] - gt_traj[final_step],
+                             axis=-1)
+        min_ade = float(np.min(ade))
+        min_fde = float(np.min(fde))
+        return min_ade, min_fde, float(min_fde > miss_threshold)
+
+    def _evaluate_motion(self,
+                         results,
+                         gt_ann_infos,
+                         logger=None,
+                         dist_th=2.0,
+                         miss_threshold=2.0,
+                         score_thr=0.0):
+        label2cat = {i: cat for i, cat in enumerate(self.CLASSES)}
+        class_stats = {
+            label: dict(ade=[], fde=[], mr=[], gt=0, matched=0)
+            for label in label2cat
+        }
+
+        for result, ann_info in zip(results, gt_ann_infos):
+            gt_boxes = ann_info['gt_bboxes_3d'].tensor.detach().cpu().numpy()
+            gt_labels = np.asarray(ann_info['gt_labels_3d'])
+            gt_trajs = np.asarray(
+                ann_info.get('gt_fut_traj', np.zeros((0, 0, 2))),
+                dtype=np.float32)
+            gt_masks = np.asarray(
+                ann_info.get('gt_fut_traj_mask', np.zeros((0, 0, 2))),
+                dtype=np.float32)
+            valid_gt = np.array(
+                [self._motion_valid_mask(mask).any() for mask in gt_masks],
+                dtype=np.bool_)
+
+            for label in gt_labels[valid_gt]:
+                class_stats[int(label)]['gt'] += 1
+
+            if 'traj' not in result:
+                continue
+            boxes = result.get('track_boxes_3d', result.get('boxes_3d', None))
+            labels = result.get('track_labels_3d', result.get('labels_3d', None))
+            scores = result.get('track_scores', result.get('scores_3d', None))
+            if boxes is None or labels is None:
+                continue
+
+            pred_boxes = boxes.tensor.detach().cpu().numpy()
+            pred_labels = self._to_numpy(labels)
+            pred_scores = self._to_numpy(scores)
+            pred_trajs = self._to_numpy(result['traj'])
+            if pred_trajs is None:
+                continue
+
+            num_preds = min(len(pred_boxes), len(pred_labels),
+                            len(pred_trajs))
+            if pred_scores is not None:
+                num_preds = min(num_preds, len(pred_scores))
+            candidates = []
+            for gt_idx, (gt_box, gt_label) in enumerate(zip(gt_boxes,
+                                                            gt_labels)):
+                if not valid_gt[gt_idx]:
+                    continue
+                for pred_idx in range(num_preds):
+                    if int(pred_labels[pred_idx]) != int(gt_label):
+                        continue
+                    if (pred_scores is not None
+                            and float(pred_scores[pred_idx]) < score_thr):
+                        continue
+                    distance = self._center_distance(gt_box,
+                                                     pred_boxes[pred_idx])
+                    if distance < dist_th:
+                        candidates.append((distance, gt_idx, pred_idx))
+            candidates.sort(key=lambda item: item[0])
+
+            used_gts = set()
+            used_preds = set()
+            for _, gt_idx, pred_idx in candidates:
+                if gt_idx in used_gts or pred_idx in used_preds:
+                    continue
+                errors = self._motion_errors(
+                    pred_trajs[pred_idx],
+                    gt_trajs[gt_idx],
+                    gt_masks[gt_idx],
+                    miss_threshold=miss_threshold)
+                if errors is None:
+                    continue
+                used_gts.add(gt_idx)
+                used_preds.add(pred_idx)
+                label = int(gt_labels[gt_idx])
+                min_ade, min_fde, mr = errors
+                class_stats[label]['ade'].append(min_ade)
+                class_stats[label]['fde'].append(min_fde)
+                class_stats[label]['mr'].append(mr)
+                class_stats[label]['matched'] += 1
+
+        table_data = [[
+            'classes', 'minADE', 'minFDE', 'MR', 'Recall', 'GT', 'Match'
+        ]]
+        ret_dict = {}
+        all_ade = []
+        all_fde = []
+        all_mr = []
+        total_gt = 0
+        total_matched = 0
+        for label, class_name in label2cat.items():
+            stats = class_stats[label]
+            total_gt += stats['gt']
+            total_matched += stats['matched']
+            if stats['ade']:
+                min_ade = float(np.mean(stats['ade']))
+                min_fde = float(np.mean(stats['fde']))
+                mr = float(np.mean(stats['mr']))
+                all_ade.extend(stats['ade'])
+                all_fde.extend(stats['fde'])
+                all_mr.extend(stats['mr'])
+            else:
+                min_ade = np.nan
+                min_fde = np.nan
+                mr = np.nan
+            recall = (
+                float(stats['matched'] / stats['gt'])
+                if stats['gt'] > 0 else np.nan)
+            ret_dict[f'{class_name}_motion_min_ade'] = min_ade
+            ret_dict[f'{class_name}_motion_min_fde'] = min_fde
+            ret_dict[f'{class_name}_motion_mr'] = mr
+            ret_dict[f'{class_name}_motion_recall'] = recall
+            ret_dict[f'{class_name}_motion_gt'] = stats['gt']
+            ret_dict[f'{class_name}_motion_matched'] = stats['matched']
+            table_data.append([
+                class_name,
+                'nan' if not np.isfinite(min_ade) else f'{min_ade:.4f}',
+                'nan' if not np.isfinite(min_fde) else f'{min_fde:.4f}',
+                'nan' if not np.isfinite(mr) else f'{mr:.4f}',
+                'nan' if not np.isfinite(recall) else f'{recall:.4f}',
+                str(stats['gt']),
+                str(stats['matched']),
+            ])
+
+        overall_ade = float(np.mean(all_ade)) if all_ade else np.nan
+        overall_fde = float(np.mean(all_fde)) if all_fde else np.nan
+        overall_mr = float(np.mean(all_mr)) if all_mr else np.nan
+        overall_recall = (
+            float(total_matched / total_gt) if total_gt > 0 else np.nan)
+        ret_dict.update(
+            motion_min_ade=overall_ade,
+            motion_min_fde=overall_fde,
+            motion_mr=overall_mr,
+            motion_recall=overall_recall,
+            motion_gt=total_gt,
+            motion_matched=total_matched)
+        table_data.append([
+            'Overall',
+            'nan' if not np.isfinite(overall_ade) else f'{overall_ade:.4f}',
+            'nan' if not np.isfinite(overall_fde) else f'{overall_fde:.4f}',
+            'nan' if not np.isfinite(overall_mr) else f'{overall_mr:.4f}',
+            'nan' if not np.isfinite(overall_recall) else
+            f'{overall_recall:.4f}',
+            str(total_gt),
+            str(total_matched),
+        ])
+        print_log('\n' + AsciiTable(table_data).table, logger=logger)
+        return ret_dict
+
     def evaluate(self,
                  results,
                  metric='bbox',
@@ -908,6 +1105,10 @@ class KlDataset(Custom3DDataset):
                 if (tensor_key in result
                         and isinstance(result[tensor_key], torch.Tensor)):
                     result[tensor_key] = result[tensor_key].detach().cpu()
+            for tensor_key, value in list(result.items()):
+                if tensor_key.startswith('traj') and isinstance(
+                        value, torch.Tensor):
+                    result[tensor_key] = value.detach().cpu()
             norm_results.append(result)
 
         gt_ann_infos = []
@@ -929,6 +1130,16 @@ class KlDataset(Custom3DDataset):
                     dist_th=tracking_dist_th,
                     score_thresholds=kwargs.get(
                         'tracking_score_thresholds', None)))
+        has_motion = any('traj' in result for result in norm_results)
+        if has_motion:
+            ret_dict.update(
+                self._evaluate_motion(
+                    norm_results,
+                    gt_ann_infos,
+                    logger=logger,
+                    dist_th=kwargs.get('motion_dist_th', tracking_dist_th),
+                    miss_threshold=kwargs.get('motion_miss_threshold', 2.0),
+                    score_thr=kwargs.get('motion_score_thr', 0.0)))
 
         if show:
             self.show(norm_results, out_dir, pipeline=pipeline)

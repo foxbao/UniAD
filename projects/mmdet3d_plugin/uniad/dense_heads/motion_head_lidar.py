@@ -104,3 +104,33 @@ class MotionHeadLidar(MotionHead):
             losses=losses,
             outs_motion=outs_motion,
             track_boxes=track_boxes)
+
+    def forward_test(self, bev_embed, outs_track=None, outs_seg=None):
+        """LiDAR-only motion prediction for online tracking results."""
+        outs_track = outs_track or {}
+        track_query = outs_track['track_query_embeddings'][None, None, ...]
+        track_boxes = outs_track['track_bbox_results']
+
+        if track_query.size(2) == 0:
+            empty_traj = track_query.new_zeros(
+                (0, self.num_anchor, self.predict_steps, 5))
+            empty_scores = track_query.new_zeros((0, self.num_anchor))
+            outs_motion = dict(
+                track_query=track_query.new_zeros((1, 0, self.embed_dims)),
+                track_query_pos=track_query.new_zeros((1, 0, self.embed_dims)),
+                traj_query=track_query.new_zeros(
+                    (self.motionformer.num_layers, 1, 0, self.num_anchor,
+                     self.embed_dims)))
+            return [dict(traj=empty_traj.cpu(),
+                         traj_scores=empty_scores.cpu())], outs_motion
+
+        lane_query = track_query.new_zeros((1, 0, self.embed_dims))
+        lane_query_pos = track_query.new_zeros((1, 0, self.embed_dims))
+        outs_motion = self(
+            bev_embed,
+            track_query,
+            lane_query,
+            lane_query_pos,
+            track_boxes)
+        traj_results = self.get_trajs(outs_motion, track_boxes)
+        return traj_results, outs_motion

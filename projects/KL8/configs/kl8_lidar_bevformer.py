@@ -81,6 +81,21 @@ velocity_cfg = dict(
     max_speed=60.0)
 
 
+sdc_cfg = dict(
+    enable=True,
+    future_steps=6,
+    sdc_label_name='Car',
+    sdc_size=(4.08, 1.73, 1.56),
+    sdc_z=0.0,
+    sdc_yaw=0.0,
+    min_dt=1e-3,
+    max_time_diff=1.5,
+    max_step_time_diff=1.5,
+    max_speed=60.0,
+    max_displacement=100.0,
+    require_valid_localization=True)
+
+
 gt_processing_cfg = dict(
     # Use GPU by default because KL point counting is materially faster, and
     # GPU 0 is usually reserved for data prep / quick tests on this machine.

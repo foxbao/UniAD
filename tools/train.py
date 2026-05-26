@@ -76,7 +76,7 @@ def parse_args():
         choices=['none', 'pytorch', 'slurm', 'mpi'],
         default='none',
         help='job launcher')
-    parser.add_argument('--local_rank', type=int, default=0)
+    parser.add_argument('--local_rank', '--local-rank', type=int, default=0)
     parser.add_argument(
         '--autoscale-lr',
         action='store_true',
@@ -84,6 +84,7 @@ def parse_args():
     args = parser.parse_args()
     if 'LOCAL_RANK' not in os.environ:
         os.environ['LOCAL_RANK'] = str(args.local_rank)
+    args.local_rank = int(os.environ['LOCAL_RANK'])
 
     if args.options and args.cfg_options:
         raise ValueError(
@@ -98,6 +99,9 @@ def parse_args():
 
 def main():
     args = parse_args()
+
+    if args.launcher == 'pytorch' and torch.cuda.is_available():
+        torch.cuda.set_device(args.local_rank)
 
     cfg = Config.fromfile(args.config)
     if args.cfg_options is not None:
@@ -163,6 +167,8 @@ def main():
     else:
         distributed = True
         init_dist(args.launcher, **cfg.dist_params)
+        if args.launcher == 'pytorch' and torch.cuda.is_available():
+            torch.cuda.set_device(args.local_rank)
         # re-set gpu_ids with distributed training mode
         _, world_size = get_dist_info()
         cfg.gpu_ids = range(world_size)
