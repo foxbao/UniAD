@@ -105,6 +105,9 @@ data = dict(
     samples_per_gpu=1,
     train=dict(pipeline=train_pipeline, label_mapping=label_mapping))
 
+optimizer = dict(type='AdamW', lr=2e-4, weight_decay=0.01)
+optimizer_config = dict(grad_clip=dict(max_norm=35, norm_type=2))
+
 load_from = './projects/work_dirs/stage1_track_map_lidar/base_track_map_lidar/latest.pth'
 resume_from = None
 work_dir = './projects/work_dirs/stage2_e2e_lidar/base_e2e_lidar'
