@@ -10,4 +10,4 @@ model = dict(
             num_points_per_lane=20,
         )))
 
-work_dir = './projects/work_dirs/stage2_e2e_lidar/base_e2e_lidar_map/'
+work_dir = './projects/work_dirs/stage2_e2e_lidar/base_e2e_lidar_HDMap/'
