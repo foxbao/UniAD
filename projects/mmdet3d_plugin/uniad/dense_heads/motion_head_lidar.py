@@ -2,6 +2,7 @@ import torch
 from mmdet.models import HEADS
 
 from .motion_head import MotionHead
+from .motion_head_plugin.map_lane_encoder import MapLaneEncoder
 
 
 @HEADS.register_module()
@@ -12,6 +13,27 @@ class MotionHeadLidar(MotionHead):
     object track queries.  SDC and map lane queries are intentionally omitted
     for the first LiDAR motion stage.
     """
+
+    def __init__(self, *args, map_lane_encoder=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        if map_lane_encoder is not None:
+            self.map_lane_encoder = MapLaneEncoder(
+                pc_range=self.pc_range,
+                embed_dims=self.embed_dims,
+                **map_lane_encoder)
+        else:
+            self.map_lane_encoder = None
+
+    def _build_lane_query(self, track_query, outs_track):
+        if self.map_lane_encoder is None:
+            return (track_query.new_zeros((1, 0, self.embed_dims)),
+                    track_query.new_zeros((1, 0, self.embed_dims)))
+        ego2global = outs_track.get('ego2global')
+        if ego2global is None:
+            return (track_query.new_zeros((1, 0, self.embed_dims)),
+                    track_query.new_zeros((1, 0, self.embed_dims)))
+        return self.map_lane_encoder(
+            ego2global, device=track_query.device, dtype=track_query.dtype)
 
     def _load_anchors(self, anchor_info_path):
         super()._load_anchors(anchor_info_path)
@@ -63,8 +85,8 @@ class MotionHeadLidar(MotionHead):
                 outs_motion=outs_motion,
                 track_boxes=track_boxes)
 
-        lane_query = track_query.new_zeros((1, 0, self.embed_dims))
-        lane_query_pos = track_query.new_zeros((1, 0, self.embed_dims))
+        lane_query, lane_query_pos = self._build_lane_query(
+            track_query, outs_track)
 
         outs_motion = self(
             bev_embed,
@@ -124,8 +146,8 @@ class MotionHeadLidar(MotionHead):
             return [dict(traj=empty_traj.cpu(),
                          traj_scores=empty_scores.cpu())], outs_motion
 
-        lane_query = track_query.new_zeros((1, 0, self.embed_dims))
-        lane_query_pos = track_query.new_zeros((1, 0, self.embed_dims))
+        lane_query, lane_query_pos = self._build_lane_query(
+            track_query, outs_track)
         outs_motion = self(
             bev_embed,
             track_query,

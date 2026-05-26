@@ -52,6 +52,11 @@ model = dict(
         num_anchor=6,
         use_nonlinear_optimizer=use_nonlinear_optimizer,
         anchor_info_path='data/others/motion_anchor_infos_kl.pkl',
+        map_lane_encoder=dict(
+            map_path='data/kl_8/map/base_map.txt',
+            num_lanes=64,
+            num_points_per_lane=20,
+        ),
         transformerlayers=dict(
             type='MotionTransformerDecoder',
             pc_range=point_cloud_range,

@@ -37,6 +37,26 @@ class UniADMotionLidar(UniADTrackLidar):
             for key, value in loss_dict.items()
         }
 
+    def _current_frame_ego2global(self, img_metas):
+        """Extract ego2global from img_metas for the current frame."""
+        if img_metas is None:
+            return None
+        if isinstance(img_metas, (list, tuple)):
+            meta = img_metas[-1] if img_metas else None
+        else:
+            meta = img_metas
+        if meta is None:
+            return None
+        if isinstance(meta, dict) and 'ego2global' in meta:
+            return meta['ego2global']
+        if isinstance(meta, dict) and 'queue_metas' in meta:
+            qm = meta['queue_metas']
+            if isinstance(qm, (list, tuple)) and qm:
+                last = qm[-1]
+                if isinstance(last, dict):
+                    return last.get('ego2global')
+        return None
+
     @auto_fp16(apply_to=('points', ))
     def forward_train(self,
                       points=None,
@@ -70,6 +90,12 @@ class UniADMotionLidar(UniADTrackLidar):
 
         if self.with_motion_head:
             bev_embed = self._bev_for_motion_head(outs_track['bev_embed'])
+            # Pass ego2global so motion head can encode HD map lanes
+            if img_metas is not None:
+                e2g = self._current_frame_ego2global(img_metas)
+                if e2g is not None:
+                    outs_track['ego2global'] = torch.as_tensor(
+                        e2g, device=bev_embed.device, dtype=torch.float32)
             ret_dict_motion = self.motion_head.forward_train(
                 bev_embed,
                 gt_bboxes_3d,
@@ -100,6 +126,11 @@ class UniADMotionLidar(UniADTrackLidar):
 
         result = results[0]['pts_bbox']
         bev_embed = self._bev_for_motion_head(result['bev_embed'])
+        # Pass ego2global for HD map encoding
+        e2g = self._current_frame_ego2global(img_metas)
+        if e2g is not None:
+            result['ego2global'] = torch.as_tensor(
+                e2g, device=bev_embed.device, dtype=torch.float32)
         result_motion, _ = self.motion_head.forward_test(
             bev_embed, outs_track=result)
         result.update(result_motion[0])
