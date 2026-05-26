@@ -37,6 +37,26 @@ def custom_encode_mask_results(mask_results):
                         dtype='uint8'))[0])  # encoded with RLE
     return [encoded_mask_results]
 
+
+def _get_occ_eval_slices(key, occ_tensor):
+    height, width = occ_tensor.shape[-2:]
+    if key == '100x100':
+        return slice(0, height), slice(0, width)
+
+    if height == 200 and width == 200:
+        # Original UniAD nuScenes occ grid: 0.5m resolution, 30m center crop.
+        return slice(70, 130), slice(70, 130)
+    if height == 120 and width == 200:
+        # KL LiDAR occ grid: 0.8m resolution, approximately 30.4m center crop.
+        return slice(41, 79), slice(81, 119)
+
+    crop_h = min(height, 60)
+    crop_w = min(width, 60)
+    y0 = max((height - crop_h) // 2, 0)
+    x0 = max((width - crop_w) // 2, 0)
+    return slice(y0, y0 + crop_h), slice(x0, x0 + crop_w)
+
+
 def custom_multi_gpu_test(model, data_loader, tmpdir=None, gpu_collect=False):
     """Test model with multiple gpus.
     This method tests model with multiple gpus and collects the results
@@ -56,18 +76,17 @@ def custom_multi_gpu_test(model, data_loader, tmpdir=None, gpu_collect=False):
     model.eval()
 
     # Occ eval init
-    eval_occ = hasattr(model.module, 'with_occ_head') \
-                and model.module.with_occ_head
+    model_to_eval = model.module if hasattr(model, 'module') else model
+    eval_occ = hasattr(model_to_eval, 'with_occ_head') \
+                and model_to_eval.with_occ_head
     if eval_occ:
-        # 30mx30m, 100mx100m at 50cm resolution
-        EVALUATION_RANGES = {'30x30': (70, 130),
-                            '100x100': (0, 200)}
+        EVALUATION_RANGE_NAMES = ('30x30', '100x100')
         n_classes = 2
         iou_metrics = {}
-        for key in EVALUATION_RANGES.keys():
+        for key in EVALUATION_RANGE_NAMES:
             iou_metrics[key] = IntersectionOverUnion(n_classes).cuda()
         panoptic_metrics = {}
-        for key in EVALUATION_RANGES.keys():
+        for key in EVALUATION_RANGE_NAMES:
             panoptic_metrics[key] = PanopticMetric(n_classes=n_classes, temporally_consistent=True).cuda()
     
     # Plan eval init
@@ -105,23 +124,35 @@ def custom_multi_gpu_test(model, data_loader, tmpdir=None, gpu_collect=False):
             if eval_occ:
                 occ_has_invalid_frame = data['gt_occ_has_invalid_frame'][0]
                 occ_to_eval = not occ_has_invalid_frame.item()
-                if occ_to_eval and 'occ' in result[0].keys():
+                if occ_to_eval and 'occ' in result[0]:
+                    occ_result = result[0]['occ']
                     num_occ += 1
-                    for key, grid in EVALUATION_RANGES.items():
-                        limits = slice(grid[0], grid[1])
-                        iou_metrics[key](result[0]['occ']['seg_out'][..., limits, limits].contiguous(),
-                                        result[0]['occ']['seg_gt'][..., limits, limits].contiguous())
-                        panoptic_metrics[key](result[0]['occ']['ins_seg_out'][..., limits, limits].contiguous().detach(),
-                                                result[0]['occ']['ins_seg_gt'][..., limits, limits].contiguous())
+                    for key in EVALUATION_RANGE_NAMES:
+                        y_limits, x_limits = _get_occ_eval_slices(
+                            key, occ_result['seg_out'])
+                        iou_metrics[key](
+                            occ_result['seg_out'][..., y_limits,
+                                                  x_limits].contiguous(),
+                            occ_result['seg_gt'][..., y_limits,
+                                                 x_limits].contiguous())
+                        panoptic_metrics[key](
+                            occ_result['ins_seg_out'][..., y_limits,
+                                                      x_limits].contiguous(
+                                                      ).detach(),
+                            occ_result['ins_seg_gt'][..., y_limits,
+                                                     x_limits].contiguous())
 
             # Pop out unnecessary occ results, avoid appending it to cpu when collect_results_cpu
             if os.environ.get('ENABLE_PLOT_MODE', None) is None:
                 result[0].pop('occ', None)
                 result[0].pop('planning', None)
             else:
-                for k in ['seg_gt', 'ins_seg_gt', 'pred_ins_sigmoid', 'seg_out', 'ins_seg_out']:
-                    if k in result[0]['occ']:
-                        result[0]['occ'][k] = result[0]['occ'][k].detach().cpu()
+                if 'occ' in result[0]:
+                    occ_result = result[0]['occ']
+                    for k in ['seg_gt', 'ins_seg_gt', 'pred_ins_sigmoid',
+                              'seg_out', 'ins_seg_out']:
+                        if k in occ_result:
+                            occ_result[k] = occ_result[k].detach().cpu()
                 for k in ['bbox', 'segm', 'labels', 'panoptic', 'drivable', 'score_list', 'lane', 'lane_score', 'stuff_score_list']:
                     if k in result[0]['pts_bbox'] and isinstance(result[0]['pts_bbox'][k], torch.Tensor):
                         result[0]['pts_bbox'][k] = result[0]['pts_bbox'][k].detach().cpu()
@@ -167,7 +198,7 @@ def custom_multi_gpu_test(model, data_loader, tmpdir=None, gpu_collect=False):
     ret_results['bbox_results'] = bbox_results
     if eval_occ:
         occ_results = {}
-        for key, grid in EVALUATION_RANGES.items():
+        for key in EVALUATION_RANGE_NAMES:
             panoptic_scores = panoptic_metrics[key].compute()
             for panoptic_key, value in panoptic_scores.items():
                 occ_results[f'{panoptic_key}'] = occ_results.get(f'{panoptic_key}', []) + [100 * value[1].item()]

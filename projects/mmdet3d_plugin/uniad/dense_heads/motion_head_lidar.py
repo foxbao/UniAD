@@ -155,4 +155,18 @@ class MotionHeadLidar(MotionHead):
             lane_query_pos,
             track_boxes)
         traj_results = self.get_trajs(outs_motion, track_boxes)
+        _, scores, labels, _, _ = track_boxes[0]
+        outs_motion['track_scores'] = scores[None, :]
+        if labels.numel() > 0:
+            vehicle_mask = torch.zeros_like(labels, dtype=torch.bool)
+            for veh_id in self.vehicle_id_list:
+                vehicle_mask |= labels == veh_id
+            outs_motion['traj_query'] = outs_motion['traj_query'][:, :,
+                                                                  vehicle_mask]
+            outs_motion['track_query'] = outs_motion['track_query'][:,
+                                                                    vehicle_mask]
+            outs_motion['track_query_pos'] = outs_motion['track_query_pos'][:,
+                                                                            vehicle_mask]
+            outs_motion['track_scores'] = outs_motion['track_scores'][:,
+                                                                      vehicle_mask]
         return traj_results, outs_motion

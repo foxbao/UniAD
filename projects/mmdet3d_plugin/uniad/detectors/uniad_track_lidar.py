@@ -236,6 +236,9 @@ class UniADTrackLidar(BEVFormerLidar):
 
     def _track_instances2results(self, track_instances, img_metas,
                                  with_mask=True):
+        if isinstance(img_metas, (list, tuple)) and len(img_metas) == 1 and \
+                isinstance(img_metas[0], dict) and 0 in img_metas[0]:
+            img_metas = [img_metas[0][max(img_metas[0].keys())]]
         box_type_3d = img_metas[0]['box_type_3d']
         if len(track_instances) == 0:
             empty_boxes = track_instances.pred_boxes.new_zeros((0, 9))
@@ -700,11 +703,17 @@ class UniADTrackLidar(BEVFormerLidar):
             points_queue = points[0]
         if isinstance(points_queue, (list, tuple)):
             points = points_queue[-1]
+        while isinstance(img_metas, (list, tuple)) and len(img_metas) == 1 and \
+                isinstance(img_metas[0], (list, tuple)):
+            img_metas = img_metas[0]
         if isinstance(img_metas, (list, tuple)) and len(img_metas) == 1 and \
                 isinstance(img_metas[0], dict) and 0 in img_metas[0]:
             img_metas = [img_metas[0][max(img_metas[0].keys())]]
         elif isinstance(img_metas, dict):
-            img_metas = [img_metas]
+            if 0 in img_metas:
+                img_metas = [img_metas[max(img_metas.keys())]]
+            else:
+                img_metas = [img_metas]
 
         has_queue_meta = img_metas and isinstance(img_metas[0], dict) and \
             'queue_metas' in img_metas[0]

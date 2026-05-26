@@ -1060,6 +1060,45 @@ class KlDataset(Custom3DDataset):
         print_log('\n' + AsciiTable(table_data).table, logger=logger)
         return ret_dict
 
+    def _evaluate_occ_results(self, occ_results_computed, logger=None):
+        occ_metrics = [
+            key for key in ('iou', 'pq', 'sq', 'rq')
+            if key in occ_results_computed
+        ]
+        if not occ_metrics:
+            return {}
+
+        max_ranges = max(len(occ_results_computed[key]) for key in occ_metrics)
+        if max_ranges == 2:
+            range_names = ['center30m', 'full']
+        else:
+            range_names = [f'range_{idx}' for idx in range(max_ranges)]
+
+        table_data = [['metric'] + range_names]
+        ret_dict = {}
+        for metric in occ_metrics:
+            values = [float(v) for v in occ_results_computed[metric]]
+            table_data.append([
+                metric.upper(),
+                *[f'{value:.4f}' for value in values],
+            ])
+            for range_name, value in zip(range_names, values):
+                ret_dict[f'occ_{range_name}_{metric}'] = value
+
+        print_log('\nOcc-flow Val Results:', logger=logger)
+        print_log('\n' + AsciiTable(table_data).table, logger=logger)
+
+        if 'num_occ' in occ_results_computed:
+            ret_dict['occ_num_occ'] = int(occ_results_computed['num_occ'])
+        if 'ratio_occ' in occ_results_computed:
+            ret_dict['occ_ratio_occ'] = float(occ_results_computed['ratio_occ'])
+        if 'occ_num_occ' in ret_dict and 'occ_ratio_occ' in ret_dict:
+            print_log(
+                f"num occ evaluated: {ret_dict['occ_num_occ']}, "
+                f"ratio: {ret_dict['occ_ratio_occ'] * 100:.1f}%",
+                logger=logger)
+        return ret_dict
+
     def evaluate(self,
                  results,
                  metric='bbox',
@@ -1072,7 +1111,9 @@ class KlDataset(Custom3DDataset):
                  pipeline=None,
                  tracking_dist_th=2.0,
                  **kwargs):
+        occ_results_computed = None
         if isinstance(results, dict):
+            occ_results_computed = results.get('occ_results_computed', None)
             if 'bbox_results' not in results:
                 raise KeyError('results dict must contain "bbox_results"')
             results = results['bbox_results']
@@ -1140,6 +1181,10 @@ class KlDataset(Custom3DDataset):
                     dist_th=kwargs.get('motion_dist_th', tracking_dist_th),
                     miss_threshold=kwargs.get('motion_miss_threshold', 2.0),
                     score_thr=kwargs.get('motion_score_thr', 0.0)))
+        if occ_results_computed is not None:
+            ret_dict.update(
+                self._evaluate_occ_results(
+                    occ_results_computed, logger=logger))
 
         if show:
             self.show(norm_results, out_dir, pipeline=pipeline)
@@ -1304,6 +1349,22 @@ class KlBEVFormerDataset(KlDataset):
 class KlTrackDataset(KlBEVFormerDataset):
     """KL temporal dataset that returns a full queue for tracking training."""
 
+    def __init__(self,
+                 *args,
+                 occ_receptive_field=None,
+                 occ_n_future=None,
+                 occ_filter_invalid_sample=False,
+                 **kwargs):
+        self.occ_receptive_field = occ_receptive_field
+        self.occ_n_future = occ_n_future
+        self.occ_filter_invalid_sample = occ_filter_invalid_sample
+        super().__init__(*args, **kwargs)
+
+    @property
+    def with_occ_labels(self):
+        return (self.occ_receptive_field is not None
+                and self.occ_n_future is not None)
+
     @staticmethod
     def _as_tensor(value, dtype=None):
         tensor = torch.as_tensor(value)
@@ -1315,6 +1376,114 @@ class KlTrackDataset(KlBEVFormerDataset):
     def _ego_pose_parts(meta):
         ego2global = np.asarray(meta['ego2global'], dtype=np.float32)
         return ego2global[:3, :3], ego2global[:3, 3]
+
+    def _prepare_queue_data(self, raw_index):
+        indices = self._collect_queue_indices(raw_index)
+        if indices is None:
+            return None
+
+        queue = []
+        raw_meta = []
+        for queue_idx, idx in enumerate(indices):
+            input_dict = KlDataset.get_data_info(self, idx)
+            if input_dict is None:
+                return None
+            if self.with_occ_labels:
+                if 'ann_info' not in input_dict:
+                    input_dict['ann_info'] = KlDataset.get_ann_info(self, idx)
+                occ_inputs = self._build_occ_inputs(idx)
+                if occ_inputs is None:
+                    return None
+                input_dict.update(occ_inputs)
+            raw_meta.append(self._extract_raw_meta(idx))
+            input_dict['_kl_is_current_frame'] = (
+                queue_idx == len(indices) - 1)
+            self.pre_pipeline(input_dict)
+            example = self.pipeline(input_dict)
+            if example is None:
+                return None
+            queue.append(example)
+        return self._union2one(queue, raw_meta)
+
+    def _collect_occ_prev_indices(self, raw_index):
+        scene_token = self.data_infos[raw_index].get('scene_token')
+        out = []
+        prev_token = self.data_infos[raw_index].get('prev', '')
+        for _ in range(self.occ_receptive_field - 1):
+            prev_idx = self.token2index.get(prev_token, -1) if prev_token else -1
+            if (prev_idx < 0
+                    or self.data_infos[prev_idx].get('scene_token') != scene_token):
+                out.append(-1)
+                prev_token = ''
+                continue
+            out.append(prev_idx)
+            prev_token = self.data_infos[prev_idx].get('prev', '')
+        out.reverse()
+        return out
+
+    def _collect_occ_future_indices(self, raw_index):
+        scene_token = self.data_infos[raw_index].get('scene_token')
+        out = []
+        next_token = self.data_infos[raw_index].get('next', '')
+        for _ in range(self.occ_n_future):
+            next_idx = self.token2index.get(next_token, -1) if next_token else -1
+            if (next_idx < 0
+                    or self.data_infos[next_idx].get('scene_token') != scene_token):
+                out.append(-1)
+                next_token = ''
+                continue
+            out.append(next_idx)
+            next_token = self.data_infos[next_idx].get('next', '')
+        return out
+
+    @staticmethod
+    def _occ_pose_parts(info):
+        ego2global = np.asarray(info.get('ego2global', np.eye(4)),
+                                dtype=np.float32)
+        l2e_r = np.eye(3, dtype=np.float32)
+        l2e_t = np.zeros(3, dtype=np.float32)
+        return l2e_r, l2e_t, ego2global[:3, :3], ego2global[:3, 3]
+
+    def _build_occ_inputs(self, raw_index):
+        prev_indices = self._collect_occ_prev_indices(raw_index)
+        future_indices = self._collect_occ_future_indices(raw_index)
+        all_validity_frames = prev_indices + [raw_index] + future_indices
+        if self.occ_filter_invalid_sample and -1 in all_validity_frames:
+            return None
+
+        future_frames = [raw_index] + future_indices
+        future_ann_infos = []
+        l2e_r_mats = []
+        l2e_t_vecs = []
+        e2g_r_mats = []
+        e2g_t_vecs = []
+        for frame_idx in future_frames:
+            if frame_idx < 0:
+                future_ann_infos.append(None)
+                l2e_r_mats.append(None)
+                l2e_t_vecs.append(None)
+                e2g_r_mats.append(None)
+                e2g_t_vecs.append(None)
+                continue
+            ann_info = copy.deepcopy(KlDataset.get_ann_info(self, frame_idx))
+            ann_info['gt_vis_tokens'] = None
+            future_ann_infos.append(ann_info)
+            l2e_r, l2e_t, e2g_r, e2g_t = self._occ_pose_parts(
+                self.data_infos[frame_idx])
+            l2e_r_mats.append(torch.from_numpy(l2e_r))
+            l2e_t_vecs.append(torch.from_numpy(l2e_t))
+            e2g_r_mats.append(torch.from_numpy(e2g_r))
+            e2g_t_vecs.append(torch.from_numpy(e2g_t))
+
+        return dict(
+            occ_future_ann_infos=future_ann_infos,
+            occ_l2e_r_mats=l2e_r_mats,
+            occ_l2e_t_vecs=l2e_t_vecs,
+            occ_e2g_r_mats=e2g_r_mats,
+            occ_e2g_t_vecs=e2g_t_vecs,
+            occ_has_invalid_frame=-1 in all_validity_frames,
+            occ_img_is_valid=np.asarray(
+                [idx >= 0 for idx in all_validity_frames], dtype=np.bool_))
 
     def _union2one(self, queue, raw_meta):
         assert len(queue) == len(raw_meta) == self.queue_length

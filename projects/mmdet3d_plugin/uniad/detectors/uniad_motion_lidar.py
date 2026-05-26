@@ -11,15 +11,22 @@ class UniADMotionLidar(UniADTrackLidar):
 
     def __init__(self,
                  motion_head=None,
+                 occ_head=None,
                  task_loss_weight=None,
                  **kwargs):
         super().__init__(**kwargs)
         self.motion_head = build_head(motion_head) if motion_head else None
-        self.task_loss_weight = task_loss_weight or dict(track=1.0, motion=1.0)
+        self.occ_head = build_head(occ_head) if occ_head else None
+        self.task_loss_weight = task_loss_weight or dict(
+            track=1.0, motion=1.0, occ=1.0)
 
     @property
     def with_motion_head(self):
         return hasattr(self, 'motion_head') and self.motion_head is not None
+
+    @property
+    def with_occ_head(self):
+        return hasattr(self, 'occ_head') and self.occ_head is not None
 
     @staticmethod
     def _bev_for_motion_head(bev_embed):
@@ -57,6 +64,31 @@ class UniADMotionLidar(UniADTrackLidar):
                     return last.get('ego2global')
         return None
 
+    def _fill_empty_occ_query(self, outs_motion, bev_embed):
+        if outs_motion['track_query'].shape[1] != 0:
+            return outs_motion
+        embed_dims = self.motion_head.embed_dims
+        num_layers = self.motion_head.motionformer.num_layers
+        num_anchor = self.motion_head.num_anchor
+        outs_motion['track_query'] = torch.zeros(
+            (1, 1, embed_dims), device=bev_embed.device, dtype=bev_embed.dtype)
+        outs_motion['track_query_pos'] = torch.zeros_like(
+            outs_motion['track_query'])
+        outs_motion['traj_query'] = torch.zeros(
+            (num_layers, 1, 1, num_anchor, embed_dims),
+            device=bev_embed.device,
+            dtype=bev_embed.dtype)
+        outs_motion['all_matched_idxes'] = [
+            torch.full((1,), -1, device=bev_embed.device, dtype=torch.long)
+        ]
+        return outs_motion
+
+    @staticmethod
+    def _wrap_occ_eval_tensor(tensor, target_dim):
+        while isinstance(tensor, torch.Tensor) and tensor.dim() < target_dim:
+            tensor = tensor.unsqueeze(0)
+        return tensor
+
     @auto_fp16(apply_to=('points', ))
     def forward_train(self,
                       points=None,
@@ -71,6 +103,9 @@ class UniADMotionLidar(UniADTrackLidar):
                       l2g_t=None,
                       l2g_r_mat=None,
                       timestamp=None,
+                      gt_segmentation=None,
+                      gt_instance=None,
+                      gt_occ_img_is_valid=None,
                       **kwargs):
         losses = dict()
         losses_track, outs_track = self.forward_track_train(
@@ -88,6 +123,8 @@ class UniADMotionLidar(UniADTrackLidar):
         losses.update(
             self.loss_weighted_and_prefixed(losses_track, prefix='track'))
 
+        bev_embed = None
+        outs_motion = dict()
         if self.with_motion_head:
             bev_embed = self._bev_for_motion_head(outs_track['bev_embed'])
             # Pass ego2global so motion head can encode HD map lanes
@@ -103,10 +140,27 @@ class UniADMotionLidar(UniADTrackLidar):
                 gt_fut_traj=gt_fut_traj,
                 gt_fut_traj_mask=gt_fut_traj_mask,
                 outs_track=outs_track)
-            losses_motion = ret_dict_motion['losses']
+            outs_motion = ret_dict_motion['outs_motion']
+            outs_motion['bev_pos'] = outs_track.get('bev_pos')
             losses.update(
                 self.loss_weighted_and_prefixed(
-                    losses_motion, prefix='motion'))
+                    ret_dict_motion['losses'], prefix='motion'))
+
+        if self.with_occ_head:
+            if not self.with_motion_head:
+                raise RuntimeError('OccHead requires MotionHead outputs.')
+            if bev_embed is None:
+                bev_embed = self._bev_for_motion_head(outs_track['bev_embed'])
+            outs_motion = self._fill_empty_occ_query(outs_motion, bev_embed)
+            losses_occ = self.occ_head.forward_train(
+                bev_embed,
+                outs_motion,
+                gt_inds_list=gt_inds,
+                gt_segmentation=gt_segmentation,
+                gt_instance=gt_instance,
+                gt_img_is_valid=gt_occ_img_is_valid)
+            losses.update(
+                self.loss_weighted_and_prefixed(losses_occ, prefix='occ'))
 
         for key, value in losses.items():
             losses[key] = torch.nan_to_num(value)
@@ -131,9 +185,29 @@ class UniADMotionLidar(UniADTrackLidar):
         if e2g is not None:
             result['ego2global'] = torch.as_tensor(
                 e2g, device=bev_embed.device, dtype=torch.float32)
-        result_motion, _ = self.motion_head.forward_test(
+        result_motion, outs_motion = self.motion_head.forward_test(
             bev_embed, outs_track=result)
         result.update(result_motion[0])
+
+        if self.with_occ_head and kwargs.get('gt_segmentation') is not None:
+            outs_motion['bev_pos'] = result.get('bev_pos')
+            occ_no_query = outs_motion['track_query'].shape[1] == 0
+            gt_segmentation = self._wrap_occ_eval_tensor(
+                kwargs.get('gt_segmentation'), 5)
+            gt_instance = self._wrap_occ_eval_tensor(
+                kwargs.get('gt_instance'), 5)
+            gt_occ_img_is_valid = self._wrap_occ_eval_tensor(
+                kwargs.get('gt_occ_img_is_valid'), 3)
+            outs_occ = self.occ_head.forward_test(
+                bev_embed,
+                outs_motion,
+                no_query=occ_no_query,
+                gt_segmentation=gt_segmentation,
+                gt_instance=gt_instance,
+                gt_img_is_valid=gt_occ_img_is_valid)
+            for key in ('pred_ins_logits', 'pred_ins_sigmoid'):
+                outs_occ.pop(key, None)
+            results[0]['occ'] = outs_occ
 
         for key in ('bev_embed', 'bev_pos', 'track_query_embeddings',
                     'track_query_matched_idxes', 'track_bbox_results'):

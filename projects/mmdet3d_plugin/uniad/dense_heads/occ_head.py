@@ -30,6 +30,7 @@ class OccHead(BaseModule):
 
                  # BEV
                  grid_conf = None,
+                 bev_grid_conf=None,
 
                  bev_size=(200, 200),
                  bev_emb_dim=256,
@@ -69,7 +70,7 @@ class OccHead(BaseModule):
         self.spatial_extent = spatial_extent
         self.ignore_index  = ignore_index
 
-        bevformer_bev_conf = {
+        bevformer_bev_conf = bev_grid_conf or {
             'xbound': [-51.2, 51.2, 0.512],
             'ybound': [-51.2, 51.2, 0.512],
             'zbound': [-10.0, 10.0, 20.0],
