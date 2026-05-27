@@ -200,6 +200,13 @@ class KlDataset(Custom3DDataset):
                 info['gt_sdc_fut_traj'], dtype=np.float32)
             ann_info['gt_sdc_fut_traj_mask'] = np.asarray(
                 info['gt_sdc_fut_traj_mask'], dtype=np.float32)
+        if 'sdc_planning' in info:
+            ann_info['sdc_planning'] = np.asarray(
+                info['sdc_planning'], dtype=np.float32)
+            ann_info['sdc_planning_mask'] = np.asarray(
+                info['sdc_planning_mask'], dtype=np.float32)
+            ann_info['command'] = np.asarray(
+                info['command'], dtype=np.int64)
         return ann_info
 
     @staticmethod
@@ -1598,14 +1605,41 @@ class KlTrackDataset(KlBEVFormerDataset):
                 self._as_tensor(each['gt_sdc_label'], dtype=torch.long)
                 for each in queue
             ]
-            gt_sdc_fut_traj_list = [
-                self._as_tensor(each['gt_sdc_fut_traj'], dtype=torch.float32)
-                for each in queue
-            ]
-            gt_sdc_fut_traj_mask_list = [
-                self._as_tensor(each['gt_sdc_fut_traj_mask'],
-                                dtype=torch.float32)
-                for each in queue
+            # SDC future trajectory only supervises the current frame's
+            # motion head, so collapse to a single tensor (mirrors how
+            # gt_fut_traj is collected above).
+            gt_sdc_fut_traj = self._as_tensor(
+                queue[-1]['gt_sdc_fut_traj'], dtype=torch.float32)
+            gt_sdc_fut_traj_mask = self._as_tensor(
+                queue[-1]['gt_sdc_fut_traj_mask'], dtype=torch.float32)
+
+        # Planning supervision is keyed off sdc_planning being present in
+        # the current frame; the field is dormant until the loader op is
+        # configured to propagate it.
+        has_planning = 'sdc_planning' in queue[-1]
+        if has_planning:
+            sdc_planning = self._as_tensor(
+                queue[-1]['sdc_planning'], dtype=torch.float32)
+            sdc_planning_mask = self._as_tensor(
+                queue[-1]['sdc_planning_mask'], dtype=torch.float32)
+            # PlanningHead's navi_embed indexing expects command to be a
+            # scalar per sample (tensor shape [B] after collation, not
+            # [B, 1]). Strip the leading dim from the [1] pkl payload.
+            command_raw = self._as_tensor(
+                queue[-1]['command'], dtype=torch.long)
+            command = command_raw.reshape(()) if command_raw.numel() == 1 \
+                else command_raw.squeeze(0)
+
+        # gt_future_boxes / gt_future_labels are produced by
+        # GenerateOccFlowLabels at the current frame and consumed by
+        # PlanningHead's collision loss. They reference the current +
+        # occ_n_future frames in the *current* lidar frame.
+        has_future_boxes = 'gt_future_boxes' in queue[-1]
+        if has_future_boxes:
+            gt_future_boxes_list = queue[-1]['gt_future_boxes']
+            gt_future_labels_list = [
+                self._as_tensor(each, dtype=torch.long)
+                for each in queue[-1]['gt_future_labels']
             ]
 
         l2g_r_mat_list = []
@@ -1658,8 +1692,21 @@ class KlTrackDataset(KlBEVFormerDataset):
         if has_sdc:
             sample['gt_sdc_bbox'] = DC(gt_sdc_bbox_list, cpu_only=True)
             sample['gt_sdc_label'] = DC(gt_sdc_label_list)
-            sample['gt_sdc_fut_traj'] = DC(gt_sdc_fut_traj_list)
-            sample['gt_sdc_fut_traj_mask'] = DC(gt_sdc_fut_traj_mask_list)
+            sample['gt_sdc_fut_traj'] = DC(gt_sdc_fut_traj)
+            sample['gt_sdc_fut_traj_mask'] = DC(gt_sdc_fut_traj_mask)
+        if has_planning:
+            # stack=True so DataLoader concatenates along a new batch dim
+            # (mirrors how camera nuScenes_e2e returns these as plain
+            # numpy that default_collate stacks). pad_dims=None because
+            # command is 1-D and the DC default pad_dims=2 would assert.
+            sample['sdc_planning'] = DC(
+                sdc_planning, stack=True, pad_dims=None)
+            sample['sdc_planning_mask'] = DC(
+                sdc_planning_mask, stack=True, pad_dims=None)
+            sample['command'] = DC(command, stack=True, pad_dims=None)
+        if has_future_boxes:
+            sample['gt_future_boxes'] = DC(gt_future_boxes_list, cpu_only=True)
+            sample['gt_future_labels'] = DC(gt_future_labels_list)
         sample['l2g_r_mat'] = DC(l2g_r_mat_list)
         sample['l2g_t'] = DC(l2g_t_list)
         sample['timestamp'] = DC(timestamp_list)

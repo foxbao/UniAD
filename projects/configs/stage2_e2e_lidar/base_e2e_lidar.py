@@ -98,7 +98,9 @@ train_pipeline = [
         keys=[
             'points', 'gt_bboxes_3d', 'gt_labels_3d', 'gt_inds',
             'gt_past_traj', 'gt_past_traj_mask', 'gt_fut_traj',
-            'gt_fut_traj_mask'
+            'gt_fut_traj_mask',
+            'gt_sdc_bbox', 'gt_sdc_label',
+            'gt_sdc_fut_traj', 'gt_sdc_fut_traj_mask'
         ]),
 ]
 
@@ -109,7 +111,7 @@ data = dict(
 optimizer = dict(type='AdamW', lr=2e-4, weight_decay=0.01)
 optimizer_config = dict(grad_clip=dict(max_norm=35, norm_type=2))
 
-load_from = './projects/work_dirs/stage1_track_map_lidar/base_track_map_lidar/latest.pth'
+load_from = './projects/work_dirs/stage1_track_map_lidar/base_track_lidar/latest.pth'
 resume_from = None
 work_dir = './projects/work_dirs/stage2_e2e_lidar/base_e2e_lidar'
 find_unused_parameters = True

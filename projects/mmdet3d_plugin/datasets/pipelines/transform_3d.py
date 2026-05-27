@@ -367,6 +367,10 @@ class ObjectRangeFilterTrack(object):
             input_dict['gt_sdc_label'] = input_dict['ann_info']['gt_sdc_label']
             input_dict['gt_sdc_fut_traj'] = input_dict['ann_info']['gt_sdc_fut_traj']
             input_dict['gt_sdc_fut_traj_mask'] = input_dict['ann_info']['gt_sdc_fut_traj_mask']
+        if 'sdc_planning' in input_dict['ann_info'].keys():
+            input_dict['sdc_planning'] = input_dict['ann_info']['sdc_planning']
+            input_dict['sdc_planning_mask'] = input_dict['ann_info']['sdc_planning_mask']
+            input_dict['command'] = input_dict['ann_info']['command']
 
         gt_bboxes_3d = input_dict['gt_bboxes_3d']
         gt_labels_3d = input_dict['gt_labels_3d']
