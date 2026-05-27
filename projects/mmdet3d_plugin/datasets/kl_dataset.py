@@ -186,6 +186,20 @@ class KlDataset(Custom3DDataset):
             gt_past_traj_mask=gt_fut_traj_mask.copy(),
             gt_forecasting_locs=gt_fut_traj,
             gt_forecasting_mask=gt_fut_traj_mask[..., 0].astype(np.bool_))
+
+        if 'gt_sdc_bbox' in info:
+            sdc_bbox = np.asarray(info['gt_sdc_bbox'], dtype=np.float32)
+            sdc_bbox_3d = LiDARInstance3DBoxes(
+                sdc_bbox,
+                box_dim=sdc_bbox.shape[-1],
+                origin=(0.5, 0.5, 0.5)).convert_to(self.box_mode_3d)
+            ann_info['gt_sdc_bbox'] = sdc_bbox_3d
+            ann_info['gt_sdc_label'] = np.asarray(
+                info['gt_sdc_label'], dtype=np.int64)
+            ann_info['gt_sdc_fut_traj'] = np.asarray(
+                info['gt_sdc_fut_traj'], dtype=np.float32)
+            ann_info['gt_sdc_fut_traj_mask'] = np.asarray(
+                info['gt_sdc_fut_traj_mask'], dtype=np.float32)
         return ann_info
 
     @staticmethod
@@ -1099,6 +1113,61 @@ class KlDataset(Custom3DDataset):
                 logger=logger)
         return ret_dict
 
+    @staticmethod
+    def _map_scalar(value):
+        if isinstance(value, torch.Tensor):
+            value = value.detach().cpu().reshape(-1)
+            return float(value[0]) if value.numel() > 0 else 0.0
+        if isinstance(value, np.ndarray):
+            value = value.reshape(-1)
+            return float(value[0]) if value.size > 0 else 0.0
+        return float(value)
+
+    def _evaluate_map_results(self, results, logger=None):
+        pairs = [
+            ('drivable', 'drivable_intersection', 'drivable_union'),
+            ('lanes', 'lanes_intersection', 'lanes_union'),
+            ('divider', 'divider_intersection', 'divider_union'),
+            ('crossing', 'crossing_intersection', 'crossing_union'),
+            ('contour', 'contour_intersection', 'contour_union'),
+        ]
+        totals = {
+            name: dict(intersection=0.0, union=0.0)
+            for name, _, _ in pairs
+        }
+        count = 0
+        for result in results:
+            ret_iou = result.get('ret_iou')
+            if not ret_iou:
+                continue
+            count += 1
+            for name, inter_key, union_key in pairs:
+                totals[name]['intersection'] += self._map_scalar(
+                    ret_iou.get(inter_key, 0.0))
+                totals[name]['union'] += self._map_scalar(
+                    ret_iou.get(union_key, 0.0))
+
+        if count == 0:
+            return {}
+
+        table_data = [['class', 'IoU', 'intersection', 'union']]
+        ret_dict = {}
+        for name, _, _ in pairs:
+            intersection = totals[name]['intersection']
+            union = totals[name]['union']
+            iou = intersection / union if union > 0 else 0.0
+            ret_dict[f'map_{name}_iou'] = float(iou)
+            table_data.append([
+                name,
+                f'{iou:.4f}',
+                f'{intersection:.0f}',
+                f'{union:.0f}',
+            ])
+
+        print_log('\nMap Segmentation Val Results:', logger=logger)
+        print_log('\n' + AsciiTable(table_data).table, logger=logger)
+        return ret_dict
+
     def evaluate(self,
                  results,
                  metric='bbox',
@@ -1185,6 +1254,10 @@ class KlDataset(Custom3DDataset):
             ret_dict.update(
                 self._evaluate_occ_results(
                     occ_results_computed, logger=logger))
+        has_map = any('ret_iou' in result for result in norm_results)
+        if has_map:
+            ret_dict.update(
+                self._evaluate_map_results(norm_results, logger=logger))
 
         if show:
             self.show(norm_results, out_dir, pipeline=pipeline)
@@ -1516,6 +1589,25 @@ class KlTrackDataset(KlBEVFormerDataset):
             gt_fut_traj_mask = self._as_tensor(
                 queue[-1]['gt_fut_traj_mask'], dtype=torch.float32)
 
+        has_sdc = all('gt_sdc_bbox' in each for each in queue)
+        if has_sdc:
+            gt_sdc_bbox_list = [
+                self._dc_data(each['gt_sdc_bbox']) for each in queue
+            ]
+            gt_sdc_label_list = [
+                self._as_tensor(each['gt_sdc_label'], dtype=torch.long)
+                for each in queue
+            ]
+            gt_sdc_fut_traj_list = [
+                self._as_tensor(each['gt_sdc_fut_traj'], dtype=torch.float32)
+                for each in queue
+            ]
+            gt_sdc_fut_traj_mask_list = [
+                self._as_tensor(each['gt_sdc_fut_traj_mask'],
+                                dtype=torch.float32)
+                for each in queue
+            ]
+
         l2g_r_mat_list = []
         l2g_t_list = []
         timestamp_list = []
@@ -1563,6 +1655,11 @@ class KlTrackDataset(KlBEVFormerDataset):
         if has_fut_traj:
             sample['gt_fut_traj'] = DC(gt_fut_traj)
             sample['gt_fut_traj_mask'] = DC(gt_fut_traj_mask)
+        if has_sdc:
+            sample['gt_sdc_bbox'] = DC(gt_sdc_bbox_list, cpu_only=True)
+            sample['gt_sdc_label'] = DC(gt_sdc_label_list)
+            sample['gt_sdc_fut_traj'] = DC(gt_sdc_fut_traj_list)
+            sample['gt_sdc_fut_traj_mask'] = DC(gt_sdc_fut_traj_mask_list)
         sample['l2g_r_mat'] = DC(l2g_r_mat_list)
         sample['l2g_t'] = DC(l2g_t_list)
         sample['timestamp'] = DC(timestamp_list)

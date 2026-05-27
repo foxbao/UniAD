@@ -2,8 +2,9 @@ import copy
 import os
 
 import torch
+import torch.nn as nn
 from mmcv.runner import auto_fp16
-from mmdet.models import DETECTORS, build_loss
+from mmdet.models import DETECTORS, build_head, build_loss
 from mmdet.models.utils.transformer import inverse_sigmoid
 from projects.mmdet3d_plugin.core.bbox.util import denormalize_bbox, normalize_bbox
 
@@ -40,7 +41,10 @@ class UniADTrackLidar(BEVFormerLidar):
                  gt_iou_threshold=0.0,
                  freeze_lidar_backbone=False,
                  freeze_bev_encoder=False,
+                 seg_head=None,
+                 task_loss_weight=None,
                  queue_length=4,
+                 with_sdc=False,
                  **kwargs):
         kwargs['return_query_feats'] = True
         super().__init__(**kwargs)
@@ -49,6 +53,20 @@ class UniADTrackLidar(BEVFormerLidar):
         self.freeze_lidar_backbone = freeze_lidar_backbone
         self.freeze_bev_encoder = freeze_bev_encoder
         self.queue_length = queue_length
+        self.with_sdc = with_sdc
+        if with_sdc:
+            # Re-create query embedding with one extra slot for the ego query.
+            num_query, embed_dim = self.query_embedding.weight.shape
+            self.num_detection_queries = num_query
+            new_emb = nn.Embedding(num_query + 1, embed_dim)
+            with torch.no_grad():
+                new_emb.weight[:num_query] = self.query_embedding.weight
+                nn.init.normal_(new_emb.weight[num_query], std=0.02)
+            self.query_embedding = new_emb
+            self.sdc_query_index = num_query
+        else:
+            self.num_detection_queries = self.query_embedding.num_embeddings
+            self.sdc_query_index = None
         if freeze_lidar_backbone:
             self._freeze_modules(self._lidar_backbone_modules())
         if freeze_bev_encoder:
@@ -73,6 +91,10 @@ class UniADTrackLidar(BEVFormerLidar):
         if loss_cfg is None:
             raise ValueError('UniADTrackLidar requires loss_cfg.')
         self.criterion = build_loss(loss_cfg)
+        self.seg_head = build_head(seg_head) if seg_head is not None else None
+        self.task_loss_weight = dict(track=1.0, map=1.0)
+        if task_loss_weight is not None:
+            self.task_loss_weight.update(task_loss_weight)
         self.test_track_instances = None
         self.scene_token = None
         self.timestamp = None
@@ -111,6 +133,17 @@ class UniADTrackLidar(BEVFormerLidar):
             self._freeze_modules(self._bev_encoder_modules())
         return self
 
+    @property
+    def with_seg_head(self):
+        return getattr(self, 'seg_head', None) is not None
+
+    def loss_weighted_and_prefixed(self, loss_dict, prefix=''):
+        loss_factor = self.task_loss_weight.get(prefix, 1.0)
+        return {
+            f'{prefix}.{key}': value * loss_factor
+            for key, value in loss_dict.items()
+        }
+
     @staticmethod
     def _first_batch_queue(value):
         if isinstance(value, (list, tuple)) and len(value) == 1 and isinstance(
@@ -128,6 +161,64 @@ class UniADTrackLidar(BEVFormerLidar):
             raise TypeError(f'Expected queued img_metas dict, got '
                             f'{type(img_metas)}.')
         return img_metas
+
+    @classmethod
+    def _current_img_metas(cls, img_metas):
+        img_metas = cls._first_batch_metas(img_metas)
+        if not img_metas:
+            return []
+        return [copy.deepcopy(img_metas[max(img_metas.keys())])]
+
+    @staticmethod
+    def _seg_batch_list(value, item_ndim):
+        if value is None:
+            return None
+        while (isinstance(value, (list, tuple)) and len(value) == 1 and
+               isinstance(value[0], (list, tuple))):
+            value = value[0]
+        if isinstance(value, (list, tuple)):
+            if len(value) == 1 and isinstance(value[0], torch.Tensor):
+                return UniADTrackLidar._seg_batch_list(value[0], item_ndim)
+            return list(value)
+        if isinstance(value, torch.Tensor):
+            if value.dim() == item_ndim:
+                return [value]
+            if value.dim() == item_ndim + 1:
+                return [value[i] for i in range(value.size(0))]
+        return value
+
+    @staticmethod
+    def _seg_test_list(value, item_ndim):
+        if value is None:
+            return None
+        while (isinstance(value, (list, tuple)) and len(value) == 1 and
+               isinstance(value[0], (list, tuple))):
+            value = value[0]
+        if isinstance(value, torch.Tensor):
+            if value.dim() == item_ndim:
+                return [value.unsqueeze(0)]
+            if value.dim() == item_ndim + 1:
+                return [value]
+        if isinstance(value, (list, tuple)):
+            if len(value) == 1 and isinstance(value[0], torch.Tensor):
+                if value[0].dim() == item_ndim:
+                    return [value[0].unsqueeze(0)]
+                if value[0].dim() == item_ndim + 1:
+                    return list(value)
+            return list(value)
+        return value
+
+    @staticmethod
+    def _bev_for_seg_head(bev_embed):
+        if bev_embed.dim() == 4:
+            return bev_embed.flatten(2).permute(2, 0, 1).contiguous()
+        if bev_embed.dim() == 3:
+            if bev_embed.shape[0] < bev_embed.shape[1]:
+                return bev_embed.permute(1, 0, 2).contiguous()
+            return bev_embed
+        raise ValueError('PansegformerHead expects BEV shape [HW, B, C], '
+                         '[B, HW, C], or [B, C, H, W], got '
+                         f'{tuple(bev_embed.shape)}.')
 
     @staticmethod
     def _detach_track_instances(track_instances):
@@ -326,6 +417,23 @@ class UniADTrackLidar(BEVFormerLidar):
             track_instances.matched_gt_idxes[active_index][bbox_index])
         return result_dict
 
+    def select_sdc_track_query(self, sdc_instance, img_metas):
+        """Pull the SDC slot's outputs for downstream stage-2 consumers.
+
+        Mirrors UniAD camera ``select_sdc_track_query``.  ``sdc_instance``
+        must be a single-row Instances; we keep ``with_mask=False`` so the
+        output is preserved regardless of bbox post-center-range filtering.
+        """
+        out = {}
+        result_dict = self._track_instances2results(
+            sdc_instance, img_metas, with_mask=False)
+        out['sdc_boxes_3d'] = result_dict['boxes_3d']
+        out['sdc_scores_3d'] = result_dict['scores_3d']
+        out['sdc_track_scores'] = result_dict['track_scores']
+        out['sdc_track_bbox_results'] = result_dict['track_bbox_results']
+        out['sdc_embedding'] = sdc_instance.output_embedding[0]
+        return out
+
     @staticmethod
     def _meta_pose(meta, device):
         ego2global = torch.as_tensor(
@@ -438,6 +546,10 @@ class UniADTrackLidar(BEVFormerLidar):
         track_instances.pred_past_trajs = output_past_trajs[-1, 0]
         track_instances.output_embedding = query_feats[-1][0]
         track_instances.ref_pts = last_ref_pts[0]
+        if self.with_sdc and self.sdc_query_index is not None:
+            # Reserve the last query as SDC; obj_id=-2 keeps it out of the
+            # detection track set used for AMOTA evaluation.
+            track_instances.obj_idxes[self.sdc_query_index] = -2
         self.track_base.update(track_instances, None)
 
         active_index = (
@@ -446,6 +558,11 @@ class UniADTrackLidar(BEVFormerLidar):
         out.update(
             self.select_active_track_query(track_instances, active_index,
                                            img_metas))
+        if self.with_sdc and self.sdc_query_index is not None:
+            out.update(
+                self.select_sdc_track_query(
+                    track_instances[track_instances.obj_idxes == -2],
+                    img_metas))
         out['track_instances_fordet'] = track_instances
 
         if self.memory_bank is not None:
@@ -577,6 +694,13 @@ class UniADTrackLidar(BEVFormerLidar):
         out.update(
             self.select_active_track_query(track_instances, active_index,
                                            img_metas))
+        if self.with_sdc and self.sdc_query_index is not None:
+            # The criterion sets obj_idxes[sdc_query_index] = -2 during
+            # match_for_single_frame; index by position instead of mask to
+            # ensure exactly one row even before that side-effect runs.
+            sdc_slice = track_instances[
+                self.sdc_query_index:self.sdc_query_index + 1]
+            out.update(self.select_sdc_track_query(sdc_slice, img_metas))
 
         if self.memory_bank is not None:
             track_instances = self.memory_bank(track_instances)
@@ -596,6 +720,8 @@ class UniADTrackLidar(BEVFormerLidar):
                             gt_inds=None,
                             gt_past_traj=None,
                             gt_past_traj_mask=None,
+                            gt_sdc_bbox=None,
+                            gt_sdc_label=None,
                             l2g_t=None,
                             l2g_r_mat=None,
                             timestamp=None,
@@ -628,6 +754,22 @@ class UniADTrackLidar(BEVFormerLidar):
             gt_instances.past_traj = gt_past_traj[0][frame_idx].to(device)
             gt_instances.past_traj_mask = gt_past_traj_mask[0][frame_idx].to(
                 device)
+            if self.with_sdc and gt_sdc_bbox is not None:
+                num_obj = boxes.shape[0]
+                if num_obj > 0:
+                    sd_box = gt_sdc_bbox[0][frame_idx].tensor.to(device)
+                    sd_box = normalize_bbox(sd_box, self.point_cloud_range)
+                    sd_label = gt_sdc_label[0][frame_idx].to(device)
+                    # Instances enforces all fields share length.  The loss
+                    # only reads sdc_boxes[:1] / sdc_labels[0:1], so rows past
+                    # the first are never used; expanding satisfies the length
+                    # check without copying memory.
+                    gt_instances.sdc_boxes = (
+                        sd_box[:1].expand(num_obj, -1).contiguous())
+                    gt_instances.sdc_labels = (
+                        sd_label[:1].expand(num_obj).contiguous())
+                # When num_obj == 0 we skip SDC GT for this frame; the matcher
+                # has nothing to match anyway.
             gt_instances_list.append(gt_instances)
         self.criterion.initialize_for_single_clip(gt_instances_list)
 
@@ -662,7 +804,12 @@ class UniADTrackLidar(BEVFormerLidar):
             'bev_embed', 'bev_pos', 'track_query_embeddings',
             'track_query_matched_idxes', 'track_bbox_results'
         ]
-        outs_track = {k: frame_res[k] for k in get_keys}
+        if self.with_sdc:
+            get_keys += [
+                'sdc_boxes_3d', 'sdc_scores_3d', 'sdc_track_scores',
+                'sdc_track_bbox_results', 'sdc_embedding'
+            ]
+        outs_track = {k: frame_res[k] for k in get_keys if k in frame_res}
         return self.criterion.losses_dict, outs_track
 
     @auto_fp16(apply_to=('points', ))
@@ -674,11 +821,16 @@ class UniADTrackLidar(BEVFormerLidar):
                       gt_inds=None,
                       gt_past_traj=None,
                       gt_past_traj_mask=None,
+                      gt_sdc_bbox=None,
+                      gt_sdc_label=None,
+                      gt_lane_labels=None,
+                      gt_lane_bboxes=None,
+                      gt_lane_masks=None,
                       l2g_t=None,
                       l2g_r_mat=None,
                       timestamp=None,
                       **kwargs):
-        losses, _ = self.forward_track_train(
+        losses, outs_track = self.forward_track_train(
             points=points,
             img_metas=img_metas,
             gt_bboxes_3d=gt_bboxes_3d,
@@ -686,10 +838,29 @@ class UniADTrackLidar(BEVFormerLidar):
             gt_inds=gt_inds,
             gt_past_traj=gt_past_traj,
             gt_past_traj_mask=gt_past_traj_mask,
+            gt_sdc_bbox=gt_sdc_bbox,
+            gt_sdc_label=gt_sdc_label,
             l2g_t=l2g_t,
             l2g_r_mat=l2g_r_mat,
             timestamp=timestamp,
             **kwargs)
+        losses = self.loss_weighted_and_prefixed(losses, prefix='track')
+
+        if self.with_seg_head and gt_lane_labels is not None:
+            current_metas = self._current_img_metas(img_metas)
+            gt_lane_labels = self._seg_batch_list(gt_lane_labels, 1)
+            gt_lane_bboxes = self._seg_batch_list(gt_lane_bboxes, 2)
+            gt_lane_masks = self._seg_batch_list(gt_lane_masks, 3)
+            bev_embed = self._bev_for_seg_head(outs_track['bev_embed'])
+            losses_seg, _ = self.seg_head.forward_train(
+                bev_embed,
+                current_metas,
+                gt_lane_labels,
+                gt_lane_bboxes,
+                gt_lane_masks)
+            losses.update(
+                self.loss_weighted_and_prefixed(losses_seg, prefix='map'))
+
         return {
             key: torch.nan_to_num(value, nan=0.0, posinf=1e4, neginf=-1e4)
             for key, value in sorted(losses.items())
@@ -779,9 +950,35 @@ class UniADTrackLidar(BEVFormerLidar):
             'track_query_matched_idxes', 'track_bbox_results', 'boxes_3d',
             'scores_3d', 'labels_3d', 'track_scores', 'track_ids'
         ]
-        if getattr(self, 'with_motion_head', False):
+        if getattr(self, 'with_motion_head', False) or self.with_seg_head:
             get_keys = ['bev_embed', 'bev_pos'] + get_keys
+        if self.with_sdc and (
+                getattr(self, 'with_motion_head', False)
+                or getattr(self, 'with_planning_head', False)):
+            # Stage-1 evaluation does not consume SDC outputs; only export
+            # them when a downstream stage-2 head is attached.
+            get_keys += [
+                'sdc_boxes_3d', 'sdc_scores_3d', 'sdc_track_scores',
+                'sdc_track_bbox_results', 'sdc_embedding'
+            ]
         result = {k: frame_res[k] for k in get_keys if k in frame_res}
+        if (self.with_seg_head and kwargs.get('gt_lane_labels') is not None and
+                kwargs.get('gt_lane_masks') is not None):
+            gt_lane_labels = self._seg_test_list(
+                kwargs.get('gt_lane_labels'), 1)
+            gt_lane_masks = self._seg_test_list(
+                kwargs.get('gt_lane_masks'), 3)
+            bev_embed = self._bev_for_seg_head(frame_res['bev_embed'])
+            result_seg = self.seg_head.forward_test(
+                bev_embed,
+                gt_lane_labels,
+                gt_lane_masks,
+                current_meta,
+                rescale=False)
+            if result_seg:
+                result['map'] = result_seg[0].get('pts_bbox', {})
+                if 'ret_iou' in result_seg[0]:
+                    result['ret_iou'] = result_seg[0]['ret_iou']
         det_results = self.pts_bbox_head.predict_by_feat(
             dict(
                 all_cls_scores=frame_res['pred_logits'],

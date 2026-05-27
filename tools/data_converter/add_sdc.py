@@ -4,13 +4,16 @@
 The generated fields are dormant until a config explicitly collects them:
 
   - gt_sdc_bbox: [[x, y, z, l, w, h, yaw, vx, vy]]
-  - gt_sdc_label: [label_id]
+  - gt_sdc_label: [label_id]  (post label_mapping if --sdc-label-mapping given)
   - gt_sdc_fut_traj: [[[x, y], ...]]
   - gt_sdc_fut_traj_mask: [[[1, 1], ...]]
 
 The future trajectory is the ego vehicle origin in future frames, transformed
 into the current LiDAR frame.  This matches the local-coordinate convention
 used by UniAD's SDC trajectory labels.
+
+Defaults are tuned for the KL dataset (large IGV ego vehicle, ~14.6 x 3.0 x
+2.16 m, LiDAR mounted near ground level so box center sits at z=0.98).
 """
 
 import argparse
@@ -47,25 +50,32 @@ def _lidar2ego_from_frame(frame: str) -> np.ndarray:
     return mat
 
 
-def _label_from_name(metainfo, label_name, label_id):
+def _label_from_name(metainfo, label_name, label_id, label_mapping=None):
+    """Resolve dataset class id, then optionally remap through label_mapping.
+
+    KL configs collapse 15 raw classes to 13 trained classes via label_mapping.
+    The dataset applies that mapping when emitting GT labels, so the SDC label
+    we store must be the *post-mapping* id to stay consistent.
+    """
     if label_id is not None:
-        return int(label_id)
+        raw_id = int(label_id)
+    elif isinstance(metainfo.get('categories'), dict) and label_name in metainfo['categories']:
+        raw_id = int(metainfo['categories'][label_name])
+    else:
+        classes = metainfo.get('classes', None)
+        if isinstance(classes, (list, tuple)) and label_name in classes:
+            raw_id = int(classes.index(label_name))
+        elif label_name == 'IGV-Empty':
+            raw_id = 6
+        elif label_name == 'Car':
+            raw_id = 1
+        else:
+            raise ValueError(
+                f'Could not infer label id for {label_name!r}; pass --sdc-label-id.')
 
-    if isinstance(metainfo.get('categories'), dict):
-        categories = metainfo['categories']
-        if label_name in categories:
-            return int(categories[label_name])
-
-    classes = metainfo.get('classes', None)
-    if isinstance(classes, (list, tuple)) and label_name in classes:
-        return int(classes.index(label_name))
-
-    # KL configs use Car as class id 1.  Keep this fallback explicit so older
-    # pkl files without metainfo can still be processed.
-    if label_name == 'Car':
-        return 1
-    raise ValueError(
-        f'Could not infer label id for {label_name!r}; pass --sdc-label-id.')
+    if label_mapping is not None and raw_id < len(label_mapping):
+        return int(label_mapping[raw_id])
+    return raw_id
 
 
 def _localization_valid(info):
@@ -206,10 +216,11 @@ def add_sdc_to_pkl(pkl_path,
                    out_path=None,
                    in_place=False,
                    future_steps=6,
-                   sdc_label_name='Car',
+                   sdc_label_name='IGV-Empty',
                    sdc_label_id=None,
-                   sdc_size=(4.08, 1.73, 1.56),
-                   sdc_z=0.0,
+                   sdc_label_mapping=None,
+                   sdc_size=(14.6, 3.0, 2.16),
+                   sdc_z=0.98,
                    sdc_yaw=0.0,
                    min_dt=1e-3,
                    max_time_diff=1.5,
@@ -235,12 +246,16 @@ def add_sdc_to_pkl(pkl_path,
     metainfo = _get_metainfo(data)
     frame = metainfo.get('lidar_coord_frame', 'FLU')
     lidar2ego = _lidar2ego_from_frame(frame)
-    sdc_label = _label_from_name(metainfo, sdc_label_name, sdc_label_id)
+    sdc_label = _label_from_name(metainfo, sdc_label_name, sdc_label_id,
+                                 label_mapping=sdc_label_mapping)
     token_to_info = {info['token']: info for info in infos}
 
     print(f'Total frames: {len(infos)}  lidar_coord_frame: {frame}')
-    print(f'SDC label: {sdc_label_name} -> {sdc_label}')
-    print(f'SDC size lwh: {sdc_size}')
+    if sdc_label_mapping is not None:
+        print(f'SDC label: {sdc_label_name} -> {sdc_label} (mapped)')
+    else:
+        print(f'SDC label: {sdc_label_name} -> {sdc_label}')
+    print(f'SDC size lwh: {sdc_size}, z: {sdc_z}')
 
     reason_counts = {}
     velocity_counts = {}
@@ -316,16 +331,19 @@ def main():
         '--future-steps', type=int, default=6,
         help='Number of future SDC steps to store.')
     parser.add_argument(
-        '--sdc-label-name', default='Car',
+        '--sdc-label-name', default='IGV-Empty',
         help='Class name used as SDC label when --sdc-label-id is not set.')
     parser.add_argument(
         '--sdc-label-id', type=int, default=None,
-        help='Explicit SDC class id.')
+        help='Explicit SDC class id (raw, before label_mapping).')
     parser.add_argument(
-        '--sdc-size', type=float, nargs=3, default=(4.08, 1.73, 1.56),
+        '--sdc-label-mapping', type=int, nargs='+', default=None,
+        help='Optional label_mapping list to remap raw class id to trained id.')
+    parser.add_argument(
+        '--sdc-size', type=float, nargs=3, default=(14.6, 3.0, 2.16),
         metavar=('L', 'W', 'H'),
         help='SDC box size in metres as length width height.')
-    parser.add_argument('--sdc-z', type=float, default=0.0)
+    parser.add_argument('--sdc-z', type=float, default=0.98)
     parser.add_argument('--sdc-yaw', type=float, default=0.0)
     parser.add_argument('--min-dt', type=float, default=1e-3)
     parser.add_argument('--max-time-diff', type=float, default=1.5)
@@ -348,6 +366,7 @@ def main():
             future_steps=args.future_steps,
             sdc_label_name=args.sdc_label_name,
             sdc_label_id=args.sdc_label_id,
+            sdc_label_mapping=args.sdc_label_mapping,
             sdc_size=tuple(args.sdc_size),
             sdc_z=args.sdc_z,
             sdc_yaw=args.sdc_yaw,
