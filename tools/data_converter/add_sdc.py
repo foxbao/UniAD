@@ -204,6 +204,100 @@ def _future_traj(info,
     return traj, mask, stop_reason
 
 
+def _planning_traj(info,
+                   token_to_info,
+                   lidar2ego,
+                   planning_steps,
+                   max_step_time_diff,
+                   max_displacement,
+                   require_valid_localization):
+    """Future SDC pose (x, y, yaw) in current LiDAR frame.
+
+    Mirrors _future_traj but adds a yaw channel derived from the rotation
+    of future-lidar -> current-lidar.  Used by PlanningHead's L2 + collision
+    losses, which expect [1, T, 3] ego-frame ground truth.
+    """
+    plan = np.zeros((1, planning_steps, 3), dtype=np.float32)
+    mask = np.zeros((1, planning_steps, 3), dtype=np.float32)
+
+    if require_valid_localization and not _localization_valid(info):
+        return plan, mask, 'invalid_current_localization'
+
+    curr_scene = info.get('scene_token', '')
+    global2lidar_curr = _global_to_lidar_matrix(info, lidar2ego)
+    lidar2global_curr = _ego2global(info) @ lidar2ego
+
+    prev_info = info
+    future_token = info.get('next', '')
+    stop_reason = 'ok'
+    for step in range(planning_steps):
+        if not future_token or future_token not in token_to_info:
+            stop_reason = 'chain_end'
+            break
+
+        future_info = token_to_info[future_token]
+        if curr_scene and future_info.get('scene_token', '') != curr_scene:
+            stop_reason = 'scene_boundary'
+            break
+        if require_valid_localization and not _localization_valid(future_info):
+            stop_reason = 'invalid_future_localization'
+            break
+
+        dt = float(future_info.get('timestamp', 0.0)) - float(
+            prev_info.get('timestamp', 0.0))
+        if dt <= 0.0 or dt > max_step_time_diff:
+            stop_reason = 'time_gap'
+            break
+
+        # Position
+        pos_global = np.concatenate([_global_origin(future_info), [1.0]])
+        pos_curr = global2lidar_curr @ pos_global
+        xy = pos_curr[:2].astype(np.float32)
+        if float(np.linalg.norm(xy)) > max_displacement:
+            stop_reason = 'displacement_guard'
+            break
+
+        # Yaw from future lidar pose expressed in current lidar frame.
+        lidar2global_future = _ego2global(future_info) @ lidar2ego
+        future_in_curr = (
+            np.linalg.inv(lidar2global_curr) @ lidar2global_future)
+        yaw = float(np.arctan2(future_in_curr[1, 0], future_in_curr[0, 0]))
+
+        plan[0, step] = [xy[0], xy[1], yaw]
+        mask[0, step] = 1.0
+        prev_info = future_info
+        future_token = future_info.get('next', '')
+
+    return plan, mask, stop_reason
+
+
+def _command_from_plan(plan, mask, lateral_threshold, yaw_threshold):
+    """Rule-based driving command (0=Right, 1=Left, 2=Straight).
+
+    Inspects the last valid future step.  Yaw is the dominant signal for
+    long IGVs in port operations: a 90-deg berth approach barely moves
+    the ego center laterally over 3 s but rotates the heading sharply,
+    so |yaw| > yaw_threshold trumps the lateral check.  Lateral position
+    is used as a backup for slow lane drifts where yaw stays small.
+    """
+    valid = mask[0, :, 0].astype(bool)
+    if not valid.any():
+        return 2
+    last = int(np.where(valid)[0].max())
+    yaw = float(plan[0, last, 2])
+    if yaw > yaw_threshold:
+        return 1
+    if yaw < -yaw_threshold:
+        return 0
+    dy = float(plan[0, last, 1])
+    if dy > lateral_threshold:
+        return 1
+    if dy < -lateral_threshold:
+        return 0
+    return 2
+
+
+
 def _atomic_dump(data, out_path):
     out_path = Path(out_path)
     mmcv.mkdir_or_exist(str(out_path.parent))
@@ -216,6 +310,9 @@ def add_sdc_to_pkl(pkl_path,
                    out_path=None,
                    in_place=False,
                    future_steps=6,
+                   planning_steps=6,
+                   command_lateral_threshold=2.0,
+                   command_yaw_threshold=0.1,
                    sdc_label_name='IGV-Empty',
                    sdc_label_id=None,
                    sdc_label_mapping=None,
@@ -239,7 +336,7 @@ def add_sdc_to_pkl(pkl_path,
     print(f'\n{"=" * 60}')
     print(f'Processing: {pkl_path}')
     print(f'Output:     {out_path}')
-    print(f'Future steps: {future_steps}')
+    print(f'Future steps: {future_steps}  Planning steps: {planning_steps}')
 
     data = mmcv.load(str(pkl_path))
     infos = _get_infos(data)
@@ -259,7 +356,10 @@ def add_sdc_to_pkl(pkl_path,
 
     reason_counts = {}
     velocity_counts = {}
+    plan_reason_counts = {}
     valid_steps = []
+    valid_plan_steps = []
+    command_counts = {0: 0, 1: 0, 2: 0}
     invalid_localization_frames = 0
 
     for info in tqdm(infos, desc='Adding SDC'):
@@ -292,16 +392,39 @@ def add_sdc_to_pkl(pkl_path,
         reason_counts[reason] = reason_counts.get(reason, 0) + 1
         valid_steps.append(int(mask[0, :, 0].sum()))
 
+        plan, plan_mask, plan_reason = _planning_traj(
+            info,
+            token_to_info,
+            lidar2ego,
+            planning_steps=planning_steps,
+            max_step_time_diff=max_step_time_diff,
+            max_displacement=max_displacement,
+            require_valid_localization=require_valid_localization)
+        plan_reason_counts[plan_reason] = plan_reason_counts.get(
+            plan_reason, 0) + 1
+        valid_plan_steps.append(int(plan_mask[0, :, 0].sum()))
+        command = _command_from_plan(plan, plan_mask,
+                                     command_lateral_threshold,
+                                     command_yaw_threshold)
+        command_counts[command] = command_counts.get(command, 0) + 1
+
         info['gt_sdc_bbox'] = np.asarray([bbox], dtype=np.float32)
         info['gt_sdc_label'] = np.asarray([sdc_label], dtype=np.int64)
         info['gt_sdc_fut_traj'] = traj
         info['gt_sdc_fut_traj_mask'] = mask
+        info['sdc_planning'] = plan
+        info['sdc_planning_mask'] = plan_mask
+        info['command'] = np.asarray([command], dtype=np.int64)
 
     valid_steps = np.asarray(valid_steps, dtype=np.float32)
+    valid_plan_steps = np.asarray(valid_plan_steps, dtype=np.float32)
     print(f'Invalid localization frames: {invalid_localization_frames}')
     print('Future stop reasons:')
     for key in sorted(reason_counts):
         print(f'  {key:30s} {reason_counts[key]}')
+    print('Planning stop reasons:')
+    for key in sorted(plan_reason_counts):
+        print(f'  {key:30s} {plan_reason_counts[key]}')
     print('Velocity reasons:')
     for key in sorted(velocity_counts):
         print(f'  {key:30s} {velocity_counts[key]}')
@@ -310,6 +433,16 @@ def add_sdc_to_pkl(pkl_path,
           f'p50={np.percentile(valid_steps, 50):.1f}, '
           f'p95={np.percentile(valid_steps, 95):.1f}, '
           f'max={valid_steps.max():.0f}')
+    print('Valid planning steps per frame: '
+          f'mean={valid_plan_steps.mean():.2f}, '
+          f'p50={np.percentile(valid_plan_steps, 50):.1f}, '
+          f'p95={np.percentile(valid_plan_steps, 95):.1f}, '
+          f'max={valid_plan_steps.max():.0f}')
+    print('Command distribution: '
+          f'Right={command_counts[0]} '
+          f'Left={command_counts[1]} '
+          f'Straight={command_counts[2]} '
+          f'(yaw>{command_yaw_threshold} rad or |dy|>{command_lateral_threshold} m)')
 
     _atomic_dump(data, out_path)
     print(f'Saved to: {out_path}')
@@ -330,6 +463,18 @@ def main():
     parser.add_argument(
         '--future-steps', type=int, default=6,
         help='Number of future SDC steps to store.')
+    parser.add_argument(
+        '--planning-steps', type=int, default=6,
+        help='Number of future SDC planning steps to store.')
+    parser.add_argument(
+        '--command-lateral-threshold', type=float, default=2.0,
+        help='Backup |dy| threshold (metres) at the last valid future '
+             'step beyond which command becomes Left/Right; only fires '
+             'when --command-yaw-threshold is not exceeded.')
+    parser.add_argument(
+        '--command-yaw-threshold', type=float, default=0.1,
+        help='Primary |yaw| threshold (radians) at the last valid future '
+             'step that flips command to Left/Right. ~0.1 rad ~= 6 deg.')
     parser.add_argument(
         '--sdc-label-name', default='IGV-Empty',
         help='Class name used as SDC label when --sdc-label-id is not set.')
@@ -364,6 +509,9 @@ def main():
             out_path=args.out_path,
             in_place=args.in_place,
             future_steps=args.future_steps,
+            planning_steps=args.planning_steps,
+            command_lateral_threshold=args.command_lateral_threshold,
+            command_yaw_threshold=args.command_yaw_threshold,
             sdc_label_name=args.sdc_label_name,
             sdc_label_id=args.sdc_label_id,
             sdc_label_mapping=args.sdc_label_mapping,
