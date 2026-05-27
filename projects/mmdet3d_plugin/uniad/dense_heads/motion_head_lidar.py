@@ -57,6 +57,39 @@ class MotionHeadLidar(MotionHead):
         all_matched_idxes = [outs_track['track_query_matched_idxes']]
         track_boxes = outs_track['track_bbox_results']
 
+        # Append SDC query/GT to the tail so MotionFormer attends to it
+        # alongside the active object queries; it is split back out below.
+        with_sdc = (
+            'sdc_embedding' in outs_track
+            and gt_sdc_fut_traj is not None
+            and gt_sdc_fut_traj_mask is not None)
+        if with_sdc:
+            sdc_match_index = torch.zeros(
+                (1,),
+                dtype=all_matched_idxes[0].dtype,
+                device=all_matched_idxes[0].device)
+            sdc_match_index[0] = gt_fut_traj[0].shape[0]
+            all_matched_idxes = [
+                torch.cat([all_matched_idxes[0], sdc_match_index], dim=0)
+            ]
+            gt_fut_traj[0] = torch.cat(
+                [gt_fut_traj[0], gt_sdc_fut_traj[0]], dim=0)
+            gt_fut_traj_mask[0] = torch.cat(
+                [gt_fut_traj_mask[0], gt_sdc_fut_traj_mask[0]], dim=0)
+            track_query = torch.cat(
+                [track_query, outs_track['sdc_embedding'][None, None, None, :]],
+                dim=2)
+            sdc_track_boxes = outs_track['sdc_track_bbox_results']
+            track_boxes[0][0].tensor = torch.cat(
+                [track_boxes[0][0].tensor, sdc_track_boxes[0][0].tensor],
+                dim=0)
+            track_boxes[0][1] = torch.cat(
+                [track_boxes[0][1], sdc_track_boxes[0][1]], dim=0)
+            track_boxes[0][2] = torch.cat(
+                [track_boxes[0][2], sdc_track_boxes[0][2]], dim=0)
+            track_boxes[0][3] = torch.cat(
+                [track_boxes[0][3], sdc_track_boxes[0][3]], dim=0)
+
         if track_query.size(2) == 0:
             zero = bev_embed.sum() * 0
             losses = dict(
@@ -100,6 +133,19 @@ class MotionHeadLidar(MotionHead):
         ]
         losses = self.loss(*loss_inputs)
 
+        # Split SDC slot back out so downstream planning can consume it,
+        # leaving traj/track_query as object-only for the vehicle filter.
+        if with_sdc:
+            all_matched_idxes[0] = all_matched_idxes[0][:-1]
+            outs_motion['sdc_traj_query'] = outs_motion['traj_query'][:, :, -1]
+            outs_motion['sdc_track_query'] = outs_motion['track_query'][:, -1]
+            outs_motion['sdc_track_query_pos'] = (
+                outs_motion['track_query_pos'][:, -1])
+            outs_motion['traj_query'] = outs_motion['traj_query'][:, :, :-1]
+            outs_motion['track_query'] = outs_motion['track_query'][:, :-1]
+            outs_motion['track_query_pos'] = (
+                outs_motion['track_query_pos'][:, :-1])
+
         def filter_vehicle_query(outs_motion, all_matched_idxes,
                                  gt_labels_3d, vehicle_id_list):
             if all_matched_idxes[0].numel() == 0:
@@ -133,6 +179,24 @@ class MotionHeadLidar(MotionHead):
         track_query = outs_track['track_query_embeddings'][None, None, ...]
         track_boxes = outs_track['track_bbox_results']
 
+        with_sdc = (
+            'sdc_embedding' in outs_track
+            and outs_track.get('sdc_embedding') is not None)
+        if with_sdc:
+            track_query = torch.cat(
+                [track_query, outs_track['sdc_embedding'][None, None, None, :]],
+                dim=2)
+            sdc_track_boxes = outs_track['sdc_track_bbox_results']
+            track_boxes[0][0].tensor = torch.cat(
+                [track_boxes[0][0].tensor, sdc_track_boxes[0][0].tensor],
+                dim=0)
+            track_boxes[0][1] = torch.cat(
+                [track_boxes[0][1], sdc_track_boxes[0][1]], dim=0)
+            track_boxes[0][2] = torch.cat(
+                [track_boxes[0][2], sdc_track_boxes[0][2]], dim=0)
+            track_boxes[0][3] = torch.cat(
+                [track_boxes[0][3], sdc_track_boxes[0][3]], dim=0)
+
         if track_query.size(2) == 0:
             empty_traj = track_query.new_zeros(
                 (0, self.num_anchor, self.predict_steps, 5))
@@ -157,6 +221,22 @@ class MotionHeadLidar(MotionHead):
         traj_results = self.get_trajs(outs_motion, track_boxes)
         _, scores, labels, _, _ = track_boxes[0]
         outs_motion['track_scores'] = scores[None, :]
+
+        # Split SDC out before vehicle filter (camera's [-1]=0 trick relies
+        # on its vehicle_id_list including 0; ours does not, so we remove
+        # the SDC slot explicitly and filter the remainder).
+        if with_sdc:
+            outs_motion['sdc_traj_query'] = outs_motion['traj_query'][:, :, -1]
+            outs_motion['sdc_track_query'] = outs_motion['track_query'][:, -1]
+            outs_motion['sdc_track_query_pos'] = (
+                outs_motion['track_query_pos'][:, -1])
+            outs_motion['traj_query'] = outs_motion['traj_query'][:, :, :-1]
+            outs_motion['track_query'] = outs_motion['track_query'][:, :-1]
+            outs_motion['track_query_pos'] = (
+                outs_motion['track_query_pos'][:, :-1])
+            outs_motion['track_scores'] = outs_motion['track_scores'][:, :-1]
+            labels = labels[:-1]
+
         if labels.numel() > 0:
             vehicle_mask = torch.zeros_like(labels, dtype=torch.bool)
             for veh_id in self.vehicle_id_list:
@@ -169,4 +249,5 @@ class MotionHeadLidar(MotionHead):
                                                                             vehicle_mask]
             outs_motion['track_scores'] = outs_motion['track_scores'][:,
                                                                       vehicle_mask]
+
         return traj_results, outs_motion
