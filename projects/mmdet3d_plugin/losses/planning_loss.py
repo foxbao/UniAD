@@ -28,10 +28,11 @@ class PlanningLoss(nn.Module):
 
 @LOSSES.register_module()
 class CollisionLoss(nn.Module):
-    def __init__(self, delta=0.5, weight=1.0):
+    def __init__(self, delta=0.5, weight=1.0,
+                 ego_width=1.85, ego_length=4.084):
         super(CollisionLoss, self).__init__()
-        self.w = 1.85 + delta
-        self.h = 4.084 + delta
+        self.w = ego_width + delta
+        self.h = ego_length + delta
         self.weight = weight
     
     def forward(self, sdc_traj_all, sdc_planning_gt, sdc_planning_gt_mask, future_gt_bbox):

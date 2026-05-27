@@ -12,13 +12,16 @@ class UniADMotionLidar(UniADTrackLidar):
     def __init__(self,
                  motion_head=None,
                  occ_head=None,
+                 planning_head=None,
                  task_loss_weight=None,
                  **kwargs):
         super().__init__(**kwargs)
         self.motion_head = build_head(motion_head) if motion_head else None
         self.occ_head = build_head(occ_head) if occ_head else None
+        self.planning_head = (
+            build_head(planning_head) if planning_head else None)
         self.task_loss_weight = task_loss_weight or dict(
-            track=1.0, motion=1.0, occ=1.0)
+            track=1.0, motion=1.0, occ=1.0, planning=1.0)
 
     @property
     def with_motion_head(self):
@@ -28,6 +31,11 @@ class UniADMotionLidar(UniADTrackLidar):
     def with_occ_head(self):
         return hasattr(self, 'occ_head') and self.occ_head is not None
 
+    @property
+    def with_planning_head(self):
+        return (hasattr(self, 'planning_head')
+                and self.planning_head is not None)
+
     @staticmethod
     def _bev_for_motion_head(bev_embed):
         if bev_embed.dim() == 4:
@@ -36,6 +44,27 @@ class UniADMotionLidar(UniADTrackLidar):
             return bev_embed
         raise ValueError('MotionHead expects BEV shape [HW, B, C] or '
                          f'[B, C, H, W], got {tuple(bev_embed.shape)}.')
+
+    @staticmethod
+    def _bev_pos_for_planning_head(bev_pos, bev_h, bev_w):
+        """Reshape [B, HW, C] -> [B, C, H, W] for PlanningHead.
+
+        The lidar tracker's LearnedBEVPositionalEncoding already flattens
+        spatial dims, while PlanningHead's forward calls
+        ``rearrange(bev_pos, 'b c h w -> (h w) b c')`` which assumes the
+        4D camera convention.  Restore the 4D layout to keep the head
+        unchanged.
+        """
+        if bev_pos.dim() == 4:
+            return bev_pos
+        if bev_pos.dim() == 3:
+            b, hw, c = bev_pos.shape
+            assert hw == bev_h * bev_w, (
+                f'bev_pos length {hw} != bev_h*bev_w '
+                f'{bev_h}*{bev_w}={bev_h * bev_w}')
+            return bev_pos.permute(0, 2, 1).reshape(b, c, bev_h, bev_w)
+        raise ValueError('bev_pos must be [B, HW, C] or [B, C, H, W], '
+                         f'got {tuple(bev_pos.shape)}.')
 
     def loss_weighted_and_prefixed(self, loss_dict, prefix=''):
         loss_factor = self.task_loss_weight.get(prefix, 1.0)
@@ -100,6 +129,12 @@ class UniADMotionLidar(UniADTrackLidar):
                       gt_fut_traj_mask=None,
                       gt_past_traj=None,
                       gt_past_traj_mask=None,
+                      gt_sdc_fut_traj=None,
+                      gt_sdc_fut_traj_mask=None,
+                      sdc_planning=None,
+                      sdc_planning_mask=None,
+                      command=None,
+                      gt_future_boxes=None,
                       l2g_t=None,
                       l2g_r_mat=None,
                       timestamp=None,
@@ -139,6 +174,8 @@ class UniADMotionLidar(UniADTrackLidar):
                 gt_labels_3d,
                 gt_fut_traj=gt_fut_traj,
                 gt_fut_traj_mask=gt_fut_traj_mask,
+                gt_sdc_fut_traj=gt_sdc_fut_traj,
+                gt_sdc_fut_traj_mask=gt_sdc_fut_traj_mask,
                 outs_track=outs_track)
             outs_motion = ret_dict_motion['outs_motion']
             outs_motion['bev_pos'] = outs_track.get('bev_pos')
@@ -161,6 +198,25 @@ class UniADMotionLidar(UniADTrackLidar):
                 gt_img_is_valid=gt_occ_img_is_valid)
             losses.update(
                 self.loss_weighted_and_prefixed(losses_occ, prefix='occ'))
+
+        if self.with_planning_head:
+            if not self.with_motion_head:
+                raise RuntimeError(
+                    'PlanningHead requires MotionHead outputs.')
+            outs_motion['bev_pos'] = self._bev_pos_for_planning_head(
+                outs_motion['bev_pos'],
+                self.planning_head.bev_h,
+                self.planning_head.bev_w)
+            outs_planning = self.planning_head.forward_train(
+                bev_embed,
+                outs_motion,
+                sdc_planning=sdc_planning,
+                sdc_planning_mask=sdc_planning_mask,
+                command=command,
+                gt_future_boxes=gt_future_boxes)
+            losses.update(
+                self.loss_weighted_and_prefixed(
+                    outs_planning['losses'], prefix='planning'))
 
         for key, value in losses.items():
             losses[key] = torch.nan_to_num(value)
