@@ -59,7 +59,7 @@ DEFAULT_CLASS_NAMES = (
     'ContainerForklift', 'Forklift', 'WheelCrane',
 )
 DEFAULT_GRID_CONF = {
-    'xbound': [-80.0, 80.0, 0.8],
+    'xbound': [-64.0, 64.0, 0.8],
     'ybound': [-48.0, 48.0, 0.8],
     'zbound': [-10.0, 10.0, 20.0],
 }

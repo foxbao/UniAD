@@ -38,16 +38,16 @@ label_mapping = [
 num_classes = len(class_names)
 input_modality = dict(use_lidar=True, use_camera=False)
 
-point_cloud_range = [-80.0, -48.0, -2.0, 80.0, 48.0, 6.0]
+point_cloud_range = [-64.0, -48.0, -2.0, 64.0, 48.0, 6.0]
 voxel_size = [0.1, 0.1, 0.2]
-sparse_shape = [41, 960, 1600]
+sparse_shape = [41, 960, 1280]
 queue_length = 4
 _dim_ = 256
 _pos_dim_ = _dim_ // 2
 _ffn_dim_ = _dim_ * 2
 _num_levels_ = 1
 bev_h_ = 120
-bev_w_ = 200
+bev_w_ = 160
 
 model = dict(
     type='BEVFormerLidar',
@@ -101,7 +101,7 @@ model = dict(
         sync_cls_avg_factor=True,
         bbox_coder=dict(
             type='NMSFreeCoder',
-            post_center_range=[-80.0, -48.0, -10.0, 80.0, 48.0, 10.0],
+            post_center_range=[-64.0, -48.0, -10.0, 64.0, 48.0, 10.0],
             pc_range=point_cloud_range,
             max_num=300,
             voxel_size=voxel_size,
@@ -169,7 +169,7 @@ model = dict(
         pts=dict(
             max_num=300,
             score_threshold=0.05,
-            post_center_range=[-80.0, -48.0, -10.0, 80.0, 48.0, 10.0])))
+            post_center_range=[-64.0, -48.0, -10.0, 64.0, 48.0, 10.0])))
 
 train_pipeline = [
     dict(

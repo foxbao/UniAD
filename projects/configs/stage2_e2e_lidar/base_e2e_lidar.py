@@ -1,4 +1,4 @@
-_base_ = ['../stage1_track_map_lidar/base_track_map_lidar.py']
+_base_ = ['../stage1_track_map_lidar/base_track_lidar.py']
 
 class_names = [
     'Pedestrian', 'Car', 'IGV-Full', 'Truck', 'Trailer-Empty',
@@ -10,13 +10,13 @@ label_mapping = [
     5, 6, 7, 8, 9,
     10, 11, 8, 8, 12,
 ]
-point_cloud_range = [-80.0, -48.0, -2.0, 80.0, 48.0, 6.0]
+point_cloud_range = [-64.0, -48.0, -2.0, 64.0, 48.0, 6.0]
 file_client_args = dict(backend='disk')
 num_classes = len(class_names)
 _dim_ = 256
 _ffn_dim_ = _dim_ * 2
 bev_h_ = 120
-bev_w_ = 200
+bev_w_ = 160
 predict_steps = 6
 predict_modes = 6
 use_nonlinear_optimizer = False

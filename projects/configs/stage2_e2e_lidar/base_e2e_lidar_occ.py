@@ -10,16 +10,16 @@ label_mapping = [
     5, 6, 7, 8, 9,
     10, 11, 8, 8, 12,
 ]
-point_cloud_range = [-80.0, -48.0, -2.0, 80.0, 48.0, 6.0]
+point_cloud_range = [-64.0, -48.0, -2.0, 64.0, 48.0, 6.0]
 file_client_args = dict(backend='disk')
 bev_h_ = 120
-bev_w_ = 200
+bev_w_ = 160
 vehicle_id_list = [1, 2, 3, 4, 5, 6, 7, 8, 10, 11, 12]
 
 occ_n_future = 4
 occ_receptive_field = 3
 occflow_grid_conf = {
-    'xbound': [-80.0, 80.0, 0.8],
+    'xbound': [-64.0, 64.0, 0.8],
     'ybound': [-48.0, 48.0, 0.8],
     'zbound': [-10.0, 10.0, 20.0],
 }

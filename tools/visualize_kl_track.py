@@ -3,8 +3,8 @@
 
 Example:
     CUDA_VISIBLE_DEVICES=0 python tools/visualize_kl_track.py \
-        --config projects/configs/stage1_track_map_lidar/base_track_map_lidar.py \
-        --checkpoint projects/work_dirs/stage1_track_map_lidar/base_track_map_lidar/epoch_1.pth \
+        --config projects/configs/stage1_track_map_lidar/base_track_lidar.py \
+        --checkpoint projects/work_dirs/stage1_track_map_lidar/base_track_lidar/epoch_1.pth \
         --out-dir projects/work_dirs/vis_track_epoch1_scene0 \
         --start-index 0 --max-frames 24 \
         --score-thr 0.0 --annotate

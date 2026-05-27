@@ -11,7 +11,7 @@ label_mapping = [
     10, 11, 8, 8, 12,
 ]
 num_classes = len(class_names)
-point_cloud_range = [-80.0, -48.0, -2.0, 80.0, 48.0, 6.0]
+point_cloud_range = [-64.0, -48.0, -2.0, 64.0, 48.0, 6.0]
 file_client_args = dict(backend='disk')
 dataset_type = 'KlTrackDataset'
 queue_length = 4
@@ -28,6 +28,7 @@ model = dict(
     score_thresh=0.4,
     filter_score_thresh=0.35,
     gt_iou_threshold=train_gt_iou_threshold,
+    with_sdc=True,
     qim_args=dict(
         qim_type='QIMBase',
         merger_dropout=0,
@@ -45,7 +46,8 @@ model = dict(
         code_weights=[1.0, 1.0, 1.0, 1.0, 1.0,
                       1.0, 1.0, 1.0, 0.2, 0.2],
         loss_past_traj_weight=0.0,
-        with_sdc=False,
+        with_sdc=True,
+        sdc_query_index=600,
         assigner=dict(
             type='HungarianAssigner3DTrack',
             cls_cost=dict(type='FocalLossCost', weight=2.0),
@@ -84,7 +86,9 @@ train_pipeline = [
         type='Collect3D',
         keys=[
             'points', 'gt_bboxes_3d', 'gt_labels_3d', 'gt_inds',
-            'gt_past_traj', 'gt_past_traj_mask'
+            'gt_past_traj', 'gt_past_traj_mask',
+            'gt_sdc_bbox', 'gt_sdc_label',
+            'gt_sdc_fut_traj', 'gt_sdc_fut_traj_mask'
         ]),
 ]
 
@@ -100,11 +104,11 @@ data = dict(
 
 total_epochs = 6
 runner = dict(type='EpochBasedRunner', max_epochs=total_epochs)
-optimizer = dict(type='AdamW', lr=1e-4, weight_decay=0.01)
+optimizer = dict(type='AdamW', lr=2e-4, weight_decay=0.01)
 optimizer_config = dict(grad_clip=dict(max_norm=35, norm_type=2))
 evaluation = dict(interval=1)
 
 load_from = './projects/work_dirs/bevformer_lidar/base_bevformer_lidar/latest.pth'
 resume_from = None
-work_dir = './projects/work_dirs/stage1_track_map_lidar/base_track_map_lidar'
+work_dir = './projects/work_dirs/stage1_track_map_lidar/base_track_lidar'
 find_unused_parameters = True
