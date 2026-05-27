@@ -1175,6 +1175,242 @@ class KlDataset(Custom3DDataset):
         print_log('\n' + AsciiTable(table_data).table, logger=logger)
         return ret_dict
 
+    def _evaluate_planning(self,
+                           results,
+                           logger=None,
+                           ego_width=3.0,
+                           ego_length=14.6,
+                           eval_steps=(1, 3, 5)):
+        """Compute L2 / collision metrics for SDC planning.
+
+        Mirrors UniAD's PlanningMetric but parameterised for the KL
+        IGV (3.0 x 14.6 m) and our BEV grid (0.8 m / cell over the
+        config-supplied point_cloud_range). Collision is checked
+        against gt_segmentation, the rasterised future-object map
+        produced by GenerateOccFlowLabels in the test pipeline.
+
+        eval_steps is a tuple of 0-indexed planning steps used for
+        per-time slices. With dt = 0.5 s, (1, 3, 5) corresponds to
+        the 1 s / 2 s / 3 s reporting points used by camera UniAD.
+        """
+        pcr = np.asarray(self._planning_pc_range(), dtype=np.float32)
+        cell = float(self._planning_cell_size())
+        # bev grid order: [H_y, W_x] (rows are y, cols are x)
+        bev_w = int(round((pcr[3] - pcr[0]) / cell))
+        bev_h = int(round((pcr[4] - pcr[1]) / cell))
+        x0, y0 = float(pcr[0]), float(pcr[1])
+
+        # Ego footprint in cell units, ego-centric (x forward, y left).
+        # Polygon corners: front-right, front-left, rear-left, rear-right.
+        ego_pts_m = np.array([
+            [+ego_length / 2.0, -ego_width / 2.0],
+            [+ego_length / 2.0, +ego_width / 2.0],
+            [-ego_length / 2.0, +ego_width / 2.0],
+            [-ego_length / 2.0, -ego_width / 2.0],
+        ], dtype=np.float32)
+
+        try:
+            from skimage.draw import polygon as draw_polygon
+        except ImportError as exc:  # skimage is already a dep
+            raise ImportError(
+                'skimage required for planning collision rate') from exc
+
+        def ego_footprint_offsets():
+            # Cell offsets covered by the ego footprint when centred
+            # at (0, 0); reused per trajectory step.
+            pts_cell = ego_pts_m / cell
+            # polygon expects (row, col) -> (y, x)
+            rr, cc = draw_polygon(pts_cell[:, 1], pts_cell[:, 0])
+            return rr.astype(np.int32), cc.astype(np.int32)
+
+        rr0, cc0 = ego_footprint_offsets()
+
+        def collision_at(traj_xy, segmentation):
+            """traj_xy: [T, 2] in metres (lidar frame, ego-relative).
+            segmentation: [T+1, H_bev, W_bev] uint8/long. We index
+            t -> segmentation[t + 1] (skip current frame)."""
+            T = traj_xy.shape[0]
+            collisions = np.zeros(T, dtype=np.bool_)
+            seg_T = segmentation.shape[0]
+            for t in range(T):
+                seg_idx = min(t + 1, seg_T - 1)
+                seg_t = segmentation[seg_idx]
+                cx = int(round((float(traj_xy[t, 0]) - x0) / cell))
+                cy = int(round((float(traj_xy[t, 1]) - y0) / cell))
+                rr = rr0 + cy
+                cc = cc0 + cx
+                m = (rr >= 0) & (rr < bev_h) & (cc >= 0) & (cc < bev_w)
+                if not m.any():
+                    continue
+                if seg_t[rr[m], cc[m]].any():
+                    collisions[t] = True
+            return collisions
+
+        T_max = max(eval_steps) + 1
+        # Per-step accumulators
+        l2_sum = np.zeros(T_max, dtype=np.float64)
+        l2_n = np.zeros(T_max, dtype=np.int64)
+        col_sum = np.zeros(T_max, dtype=np.int64)
+        col_n = np.zeros(T_max, dtype=np.int64)
+
+        # Per-command split (Right=0, Left=1, Straight=2)
+        per_cmd = {c: dict(l2_sum=np.zeros(T_max),
+                           l2_n=np.zeros(T_max, dtype=np.int64),
+                           col_sum=np.zeros(T_max, dtype=np.int64),
+                           col_n=np.zeros(T_max, dtype=np.int64))
+                   for c in (0, 1, 2)}
+
+        for result in results:
+            plan = result.get('planning')
+            if plan is None:
+                continue
+            pred_blob = plan.get('result_planning', {})
+            gt_blob = plan.get('planning_gt', {})
+            sdc_traj = pred_blob.get('sdc_traj')
+            sdc_planning = gt_blob.get('sdc_planning')
+            sdc_planning_mask = gt_blob.get('sdc_planning_mask')
+            segmentation = gt_blob.get('segmentation')
+            command = gt_blob.get('command')
+            if sdc_traj is None or sdc_planning is None:
+                continue
+            pred_xy = self._planning_to_numpy(sdc_traj)[..., :2]
+            gt_xy = self._planning_to_numpy(sdc_planning)[..., :2]
+            mask = self._planning_to_numpy(sdc_planning_mask)
+            # Shapes are [1, T, 2 or 3] -> drop the leading 1.
+            pred_xy = pred_xy.reshape(-1, pred_xy.shape[-1])
+            gt_xy = gt_xy.reshape(-1, gt_xy.shape[-1])
+            if mask.ndim == 3:
+                mask = mask[0, :, 0]
+            elif mask.ndim == 2:
+                mask = mask[:, 0]
+            else:
+                mask = mask.reshape(-1)
+            mask = mask.astype(bool)
+
+            cmd_id = None
+            if command is not None:
+                cmd_id = int(np.asarray(
+                    self._planning_to_numpy(command)).reshape(-1)[0])
+
+            T = min(T_max, pred_xy.shape[0], gt_xy.shape[0], len(mask))
+            err = np.linalg.norm(pred_xy[:T, :2] - gt_xy[:T, :2], axis=-1)
+            for t in range(T):
+                if not mask[t]:
+                    continue
+                l2_sum[t] += float(err[t])
+                l2_n[t] += 1
+                if cmd_id in per_cmd:
+                    per_cmd[cmd_id]['l2_sum'][t] += float(err[t])
+                    per_cmd[cmd_id]['l2_n'][t] += 1
+
+            # Collision needs segmentation; skip frames missing it.
+            if segmentation is None:
+                continue
+            seg = self._planning_to_numpy(segmentation)
+            # Expected shape [1, T_seg, H, W] or [T_seg, H, W].
+            if seg.ndim == 4:
+                seg = seg[0]
+            if seg.ndim != 3:
+                continue
+            if seg.shape[-2:] != (bev_h, bev_w):
+                continue
+            cols = collision_at(pred_xy[:T], seg)
+            for t in range(T):
+                if not mask[t]:
+                    continue
+                col_sum[t] += int(cols[t])
+                col_n[t] += 1
+                if cmd_id in per_cmd:
+                    per_cmd[cmd_id]['col_sum'][t] += int(cols[t])
+                    per_cmd[cmd_id]['col_n'][t] += 1
+
+        ret_dict = {}
+
+        def _format(steps, l2sum, l2n, csum, cnum):
+            l2_at = []
+            col_at = []
+            for s in steps:
+                l2 = (l2sum[s] / l2n[s]) if l2n[s] > 0 else float('nan')
+                cl = (csum[s] / cnum[s]) if cnum[s] > 0 else float('nan')
+                l2_at.append(l2)
+                col_at.append(cl)
+            return l2_at, col_at
+
+        l2_at, col_at = _format(eval_steps, l2_sum, l2_n,
+                                col_sum, col_n)
+        labels = [f'{(s + 1) * 0.5:.0f}s' for s in eval_steps]
+        avg_l2 = float(np.nanmean(l2_at)) if l2_at else float('nan')
+        avg_col = float(np.nanmean(col_at)) if col_at else float('nan')
+
+        # Scalar entries for downstream loggers.
+        for s, lbl, l2, cl in zip(eval_steps, labels, l2_at, col_at):
+            ret_dict[f'planning/L2_{lbl}'] = l2
+            ret_dict[f'planning/Collision_{lbl}'] = cl
+        ret_dict['planning/avg.L2'] = avg_l2
+        ret_dict['planning/avg.Collision'] = avg_col
+
+        # Pretty-print summary
+        lines = ['', 'Planning metrics (lower is better):']
+        for s, lbl in zip(eval_steps, labels):
+            lines.append(
+                f'  L2 @ {lbl:>3}: {l2_sum[s] / max(l2_n[s], 1):.3f} m'
+                f'   Collision @ {lbl:>3}: '
+                f'{100.0 * col_sum[s] / max(col_n[s], 1):.2f}% '
+                f'(N={l2_n[s]})')
+        lines.append(f'  avg.L2:        {avg_l2:.3f} m')
+        lines.append(f'  avg.Collision: {100.0 * avg_col:.2f}%')
+
+        # Per-command breakdown (only emit lines that have data).
+        cmd_name = {0: 'Right', 1: 'Left', 2: 'Straight'}
+        per_cmd_lines = ['', 'Planning per command:']
+        for cmd_id in (1, 0, 2):
+            agg = per_cmd[cmd_id]
+            n_total = int(agg['l2_n'].max() if agg['l2_n'].size else 0)
+            if n_total == 0:
+                continue
+            l2_at_c, col_at_c = _format(eval_steps,
+                                        agg['l2_sum'], agg['l2_n'],
+                                        agg['col_sum'], agg['col_n'])
+            avg_l2_c = float(np.nanmean(l2_at_c))
+            avg_col_c = float(np.nanmean(col_at_c))
+            per_cmd_lines.append(
+                f'  {cmd_name[cmd_id]:8s} N={n_total:5d}  '
+                f'avg.L2 {avg_l2_c:.3f} m  '
+                f'avg.Collision {100.0 * avg_col_c:.2f}%')
+            ret_dict[f'planning/{cmd_name[cmd_id]}/avg.L2'] = avg_l2_c
+            ret_dict[f'planning/{cmd_name[cmd_id]}/avg.Collision'] = avg_col_c
+        if len(per_cmd_lines) > 2:
+            lines.extend(per_cmd_lines)
+
+        for line in lines:
+            print_log(line, logger=logger)
+        return ret_dict
+
+    @staticmethod
+    def _planning_to_numpy(value):
+        if isinstance(value, list) and value and hasattr(value[0], 'cpu'):
+            value = value[0]
+        if hasattr(value, 'detach'):
+            value = value.detach().cpu().numpy()
+        return np.asarray(value)
+
+    def _planning_pc_range(self):
+        """Resolve point_cloud_range used to lay out gt_segmentation.
+
+        Falls back to the dataset attribute, then the standard KL
+        ±64/±48 range used by the LiDAR plan config.
+        """
+        for attr in ('pc_range', 'point_cloud_range'):
+            v = getattr(self, attr, None)
+            if v is not None:
+                return list(v)
+        return [-64.0, -48.0, -2.0, 64.0, 48.0, 6.0]
+
+    def _planning_cell_size(self):
+        # Match GenerateOccFlowLabels grid_conf['xbound'][2].
+        return getattr(self, 'occ_cell_size', 0.8)
+
+
     def evaluate(self,
                  results,
                  metric='bbox',
@@ -1201,11 +1437,18 @@ class KlDataset(Custom3DDataset):
 
         norm_results = []
         for result in results:
+            planning = result.get('planning') if isinstance(
+                result, dict) else None
             if 'pts_bbox' in result:
                 result = result['pts_bbox']
             elif 'img_bbox' in result:
                 result = result['img_bbox']
             result = dict(result)
+            if planning is not None:
+                # Preserve the planning sub-dict the detector emits
+                # alongside pts_bbox; the unwrap above would otherwise
+                # drop it since we reassign to result['pts_bbox'].
+                result['planning'] = planning
             if ('track_ids' in result and 'boxes_3d' in result
                     and 'track_boxes_3d' not in result):
                 result['track_boxes_3d'] = result['boxes_3d']
@@ -1265,6 +1508,16 @@ class KlDataset(Custom3DDataset):
         if has_map:
             ret_dict.update(
                 self._evaluate_map_results(norm_results, logger=logger))
+        has_planning = any('planning' in result for result in norm_results)
+        if has_planning:
+            ret_dict.update(
+                self._evaluate_planning(
+                    norm_results,
+                    logger=logger,
+                    ego_width=kwargs.get('planning_ego_width', 3.0),
+                    ego_length=kwargs.get('planning_ego_length', 14.6),
+                    eval_steps=kwargs.get('planning_eval_steps',
+                                          (1, 3, 5))))
 
         if show:
             self.show(norm_results, out_dir, pipeline=pipeline)
