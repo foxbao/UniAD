@@ -264,6 +264,39 @@ class UniADMotionLidar(UniADTrackLidar):
             for key in ('pred_ins_logits', 'pred_ins_sigmoid'):
                 outs_occ.pop(key, None)
             results[0]['occ'] = outs_occ
+        else:
+            outs_occ = dict()
+
+        if self.with_planning_head:
+            sdc_planning = kwargs.get('sdc_planning')
+            sdc_planning_mask = kwargs.get('sdc_planning_mask')
+            command = kwargs.get('command')
+            if command is None:
+                # Without a command, planning would crash on
+                # navi_embed[command]; skip rather than guess a value.
+                return results
+            outs_motion.setdefault('bev_pos', result.get('bev_pos'))
+            outs_motion['bev_pos'] = self._bev_pos_for_planning_head(
+                outs_motion['bev_pos'],
+                self.planning_head.bev_h,
+                self.planning_head.bev_w)
+            # PlanningHead.forward_test reads outs_occflow['seg_out']
+            # unconditionally; supply at least an empty dict so the head
+            # can short-circuit when use_col_optim=False (the col-optim
+            # branch is the only consumer of seg_out).
+            occ_for_plan = outs_occ if 'seg_out' in outs_occ else {
+                'seg_out': bev_embed.new_zeros((1, 1, 1, 1, 1)).long()}
+            result_planning = self.planning_head.forward_test(
+                bev_embed, outs_motion, occ_for_plan, command)
+            results[0]['planning'] = dict(
+                planning_gt=dict(
+                    segmentation=kwargs.get('gt_segmentation'),
+                    sdc_planning=sdc_planning,
+                    sdc_planning_mask=sdc_planning_mask,
+                    command=command,
+                ),
+                result_planning=result_planning,
+            )
 
         for key in ('bev_embed', 'bev_pos', 'track_query_embeddings',
                     'track_query_matched_idxes', 'track_bbox_results'):
