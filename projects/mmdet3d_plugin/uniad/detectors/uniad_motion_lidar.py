@@ -77,6 +77,9 @@ class UniADMotionLidar(UniADTrackLidar):
         """Extract ego2global from img_metas for the current frame."""
         if img_metas is None:
             return None
+        while (isinstance(img_metas, (list, tuple)) and len(img_metas) == 1 and
+               isinstance(img_metas[0], (list, tuple))):
+            img_metas = img_metas[0]
         if isinstance(img_metas, (list, tuple)):
             meta = img_metas[-1] if img_metas else None
         else:
@@ -87,10 +90,19 @@ class UniADMotionLidar(UniADTrackLidar):
             return meta['ego2global']
         if isinstance(meta, dict) and 'queue_metas' in meta:
             qm = meta['queue_metas']
+            if isinstance(qm, dict) and qm:
+                last = qm[max(qm.keys())]
+                if isinstance(last, dict):
+                    return last.get('ego2global')
             if isinstance(qm, (list, tuple)) and qm:
                 last = qm[-1]
                 if isinstance(last, dict):
                     return last.get('ego2global')
+        if isinstance(meta, dict) and meta and all(
+                isinstance(key, int) for key in meta.keys()):
+            last = meta[max(meta.keys())]
+            if isinstance(last, dict):
+                return last.get('ego2global')
         return None
 
     def _fill_empty_occ_query(self, outs_motion, bev_embed):
@@ -125,6 +137,9 @@ class UniADMotionLidar(UniADTrackLidar):
                       gt_bboxes_3d=None,
                       gt_labels_3d=None,
                       gt_inds=None,
+                      gt_lane_labels=None,
+                      gt_lane_bboxes=None,
+                      gt_lane_masks=None,
                       gt_fut_traj=None,
                       gt_fut_traj_mask=None,
                       gt_past_traj=None,
@@ -158,6 +173,22 @@ class UniADMotionLidar(UniADTrackLidar):
         losses.update(
             self.loss_weighted_and_prefixed(losses_track, prefix='track'))
 
+        outs_seg = dict()
+        if self.with_seg_head and gt_lane_labels is not None:
+            current_metas = self._current_img_metas(img_metas)
+            gt_lane_labels = self._seg_batch_list(gt_lane_labels, 1)
+            gt_lane_bboxes = self._seg_batch_list(gt_lane_bboxes, 2)
+            gt_lane_masks = self._seg_batch_list(gt_lane_masks, 3)
+            bev_seg = self._bev_for_seg_head(outs_track['bev_embed'])
+            losses_seg, outs_seg = self.seg_head.forward_train(
+                bev_seg,
+                current_metas,
+                gt_lane_labels,
+                gt_lane_bboxes,
+                gt_lane_masks)
+            losses.update(
+                self.loss_weighted_and_prefixed(losses_seg, prefix='map'))
+
         bev_embed = None
         outs_motion = dict()
         if self.with_motion_head:
@@ -176,7 +207,8 @@ class UniADMotionLidar(UniADTrackLidar):
                 gt_fut_traj_mask=gt_fut_traj_mask,
                 gt_sdc_fut_traj=gt_sdc_fut_traj,
                 gt_sdc_fut_traj_mask=gt_sdc_fut_traj_mask,
-                outs_track=outs_track)
+                outs_track=outs_track,
+                outs_seg=outs_seg)
             outs_motion = ret_dict_motion['outs_motion']
             outs_motion['bev_pos'] = outs_track.get('bev_pos')
             losses.update(

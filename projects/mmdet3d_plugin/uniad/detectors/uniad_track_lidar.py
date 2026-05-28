@@ -6,24 +6,43 @@ import torch.nn as nn
 from mmcv.runner import auto_fp16
 from mmdet.models import DETECTORS, build_head, build_loss
 from mmdet.models.utils.transformer import inverse_sigmoid
+from mmdet3d.models.detectors.mvx_two_stage import MVXTwoStageDetector
 from projects.mmdet3d_plugin.core.bbox.util import denormalize_bbox, normalize_bbox
 
 from ..dense_heads.track_head_plugin import (Instances, MemoryBank,
                                              QueryInteractionModule,
                                              RuntimeTrackerBase)
-from .bevformer_lidar import BEVFormerLidar
 
 
 @DETECTORS.register_module()
-class UniADTrackLidar(BEVFormerLidar):
+class UniADTrackLidar(MVXTwoStageDetector):
     """LiDAR-only UniAD stage-1 tracker.
 
-    This keeps the LiDAR BEVFormer detector/front-end compatible with
-    ``base_bevformer_lidar.py`` checkpoints, then adds UniAD's query
-    interaction, memory bank, and clip matcher for track training.
+    This mirrors camera UniAD's detector/tracker boundary while using the
+    LiDAR voxel backbone and BEVFormer encoder as the BEV front-end.
     """
 
     def __init__(self,
+                 pts_voxel_layer=None,
+                 pts_voxel_encoder=None,
+                 pts_middle_encoder=None,
+                 pts_fusion_layer=None,
+                 img_backbone=None,
+                 pts_backbone=None,
+                 img_neck=None,
+                 pts_neck=None,
+                 pts_bbox_head=None,
+                 img_roi_head=None,
+                 img_rpn_head=None,
+                 train_cfg=None,
+                 test_cfg=None,
+                 pretrained=None,
+                 point_cloud_range=None,
+                 num_query=600,
+                 embed_dims=256,
+                 use_prev_bev=True,
+                 video_test_mode=True,
+                 return_query_feats=True,
                  loss_cfg=None,
                  qim_args=dict(
                      qim_type='QIMBase',
@@ -46,27 +65,43 @@ class UniADTrackLidar(BEVFormerLidar):
                  queue_length=4,
                  with_sdc=False,
                  **kwargs):
-        kwargs['return_query_feats'] = True
-        super().__init__(**kwargs)
+        super().__init__(
+            pts_voxel_layer=pts_voxel_layer,
+            pts_voxel_encoder=pts_voxel_encoder,
+            pts_middle_encoder=pts_middle_encoder,
+            pts_fusion_layer=pts_fusion_layer,
+            img_backbone=img_backbone,
+            pts_backbone=pts_backbone,
+            img_neck=img_neck,
+            pts_neck=pts_neck,
+            pts_bbox_head=pts_bbox_head,
+            img_roi_head=img_roi_head,
+            img_rpn_head=img_rpn_head,
+            train_cfg=train_cfg,
+            test_cfg=test_cfg,
+            pretrained=pretrained)
 
+        if kwargs:
+            raise TypeError(f'Unexpected UniADTrackLidar kwargs: {kwargs}')
+        self.point_cloud_range = point_cloud_range
+        if self.point_cloud_range is None and hasattr(self.pts_bbox_head,
+                                                      'bbox_coder'):
+            self.point_cloud_range = self.pts_bbox_head.bbox_coder.pc_range
+        self.num_query = num_query
+        self.embed_dims = embed_dims
+        self.use_prev_bev = use_prev_bev
+        self.video_test_mode = video_test_mode
+        self.return_query_feats = return_query_feats
+        self.fp16_enabled = False
         self.gt_iou_threshold = gt_iou_threshold
         self.freeze_lidar_backbone = freeze_lidar_backbone
         self.freeze_bev_encoder = freeze_bev_encoder
         self.queue_length = queue_length
         self.with_sdc = with_sdc
-        if with_sdc:
-            # Re-create query embedding with one extra slot for the ego query.
-            num_query, embed_dim = self.query_embedding.weight.shape
-            self.num_detection_queries = num_query
-            new_emb = nn.Embedding(num_query + 1, embed_dim)
-            with torch.no_grad():
-                new_emb.weight[:num_query] = self.query_embedding.weight
-                nn.init.normal_(new_emb.weight[num_query], std=0.02)
-            self.query_embedding = new_emb
-            self.sdc_query_index = num_query
-        else:
-            self.num_detection_queries = self.query_embedding.num_embeddings
-            self.sdc_query_index = None
+        self.query_embedding = nn.Embedding(
+            self.num_query + int(with_sdc), self.embed_dims * 2)
+        self.reference_points = nn.Linear(self.embed_dims, 3)
+        self.sdc_query_index = self.num_query if with_sdc else None
         if freeze_lidar_backbone:
             self._freeze_modules(self._lidar_backbone_modules())
         if freeze_bev_encoder:
@@ -90,6 +125,9 @@ class UniADTrackLidar(BEVFormerLidar):
             0 if self.memory_bank is None else self.memory_bank.max_his_length)
         if loss_cfg is None:
             raise ValueError('UniADTrackLidar requires loss_cfg.')
+        loss_cfg = copy.deepcopy(loss_cfg)
+        if self.with_sdc:
+            loss_cfg['sdc_query_index'] = self.sdc_query_index
         self.criterion = build_loss(loss_cfg)
         self.seg_head = build_head(seg_head) if seg_head is not None else None
         self.task_loss_weight = dict(track=1.0, map=1.0)
@@ -100,6 +138,61 @@ class UniADTrackLidar(BEVFormerLidar):
         self.timestamp = None
         self.l2g_t = None
         self.l2g_r_mat = None
+        self._test_prev_bev = None
+        self._test_scene_token = None
+
+    def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict,
+                              missing_keys, unexpected_keys, error_msgs):
+        """Keep tracker query names aligned with UniAD while loading detector ckpts.
+
+        LiDAR BEVFormer detector checkpoints used the top-level
+        ``query_embedding`` / ``reference_points`` keys for detector queries.
+        In UniADTrackLidar those names intentionally mean tracker queries, as
+        in camera UniAD.  When a source checkpoint has no tracker modules, drop
+        those old detector-query keys and let the tracker query initialize
+        randomly.  Legacy LiDAR tracker checkpoints from the previous naming
+        scheme are still accepted by remapping ``track_*`` keys.
+        """
+        own_state = self.state_dict()
+        marker_keys = [
+            prefix + 'query_interact.self_attn.in_proj_weight',
+            prefix + 'memory_bank.save_proj.weight',
+            prefix + 'criterion.code_weights',
+        ]
+        source_has_tracker = any(key in state_dict for key in marker_keys)
+
+        legacy_pairs = {
+            prefix + 'track_query_embedding.weight':
+            prefix + 'query_embedding.weight',
+            prefix + 'track_reference_points.weight':
+            prefix + 'reference_points.weight',
+            prefix + 'track_reference_points.bias':
+            prefix + 'reference_points.bias',
+        }
+        for old_key, new_key in legacy_pairs.items():
+            if old_key in state_dict:
+                state_dict[new_key] = state_dict[old_key]
+                state_dict.pop(old_key)
+
+        tracker_keys = [
+            prefix + 'query_embedding.weight',
+            prefix + 'reference_points.weight',
+            prefix + 'reference_points.bias',
+        ]
+        for key in tracker_keys:
+            own_key = key[len(prefix):] if key.startswith(prefix) else key
+            if key not in state_dict:
+                continue
+            if not source_has_tracker:
+                state_dict.pop(key)
+                continue
+            if own_key in own_state and state_dict[key].shape != own_state[
+                    own_key].shape:
+                state_dict.pop(key)
+
+        super()._load_from_state_dict(state_dict, prefix, local_metadata,
+                                      strict, missing_keys, unexpected_keys,
+                                      error_msgs)
 
     def _lidar_backbone_modules(self):
         return [
@@ -124,6 +217,122 @@ class UniADTrackLidar(BEVFormerLidar):
             module.eval()
             for param in module.parameters():
                 param.requires_grad = False
+
+    @staticmethod
+    def _unwrap_single_bev(pts_feats):
+        if not isinstance(pts_feats, (list, tuple)) or len(pts_feats) != 1:
+            raise ValueError('UniADTrackLidar expects one BEV feature level, '
+                             f'got {type(pts_feats)}.')
+        return pts_feats[0]
+
+    @staticmethod
+    def _wrap_single_bev(bev):
+        return [bev]
+
+    def encode_bev(self, lidar_bev, prev_bev=None, queue_meta=None):
+        if not self.use_prev_bev:
+            prev_bev = None
+        return self.pts_bbox_head.get_bev_features(
+            lidar_bev, prev_bev=prev_bev, queue_meta=queue_meta)
+
+    def valid_prev_bev(self, prev_bev, queue_meta):
+        if prev_bev is None or not self.use_prev_bev:
+            return None
+        if queue_meta is None:
+            return prev_bev
+        if any(meta is None or not meta.get('prev_bev_exists', False)
+               for meta in queue_meta):
+            return None
+        return prev_bev
+
+    @staticmethod
+    def _normalize_history_points(history_points, batch_size):
+        if history_points is None or len(history_points) == 0:
+            return [[] for _ in range(batch_size)]
+        if batch_size == 1 and isinstance(history_points[0], torch.Tensor):
+            return [list(history_points)]
+        if len(history_points) == batch_size and isinstance(
+                history_points[0], (list, tuple)):
+            return [list(sample_history) for sample_history in history_points]
+        if isinstance(history_points[0], (list, tuple)):
+            per_sample = [[] for _ in range(batch_size)]
+            for step_points in history_points:
+                if len(step_points) != batch_size:
+                    raise ValueError('history_points collate shape mismatch.')
+                for batch_idx, points in enumerate(step_points):
+                    per_sample[batch_idx].append(points)
+            return per_sample
+        raise TypeError(f'Unsupported history_points structure: '
+                        f'{type(history_points)}')
+
+    @staticmethod
+    def current_queue_meta(img_metas):
+        current = []
+        for meta in img_metas:
+            queue_metas = meta.get('queue_metas')
+            if queue_metas is None:
+                current.append(None)
+                continue
+            last_idx = max(queue_metas.keys())
+            current.append(queue_metas[last_idx])
+        return current
+
+    def obtain_history_bev(self, history_points, img_metas):
+        if not self.use_prev_bev or history_points is None:
+            return None
+        batch_size = len(img_metas)
+        history_by_sample = self._normalize_history_points(
+            history_points, batch_size)
+        if not history_by_sample or len(history_by_sample[0]) == 0:
+            return None
+        num_history = len(history_by_sample[0])
+        if any(len(sample_history) != num_history
+               for sample_history in history_by_sample):
+            raise ValueError('All samples must share the same history length.')
+
+        queue_metas = [meta['queue_metas'] for meta in img_metas]
+        prev_bev = None
+        was_training = self.training
+        self.eval()
+        try:
+            with torch.no_grad():
+                for step in range(num_history):
+                    step_points = [
+                        sample_history[step]
+                        for sample_history in history_by_sample
+                    ]
+                    step_lidar_bev = self.extract_lidar_bev_from_points(
+                        step_points, img_metas)
+                    step_meta = None
+                    if prev_bev is not None:
+                        step_meta = [
+                            sample_queue_metas[step]
+                            for sample_queue_metas in queue_metas
+                        ]
+                        prev_bev = self.valid_prev_bev(prev_bev, step_meta)
+                        if prev_bev is None:
+                            step_meta = None
+                    prev_bev = self.encode_bev(
+                        step_lidar_bev, prev_bev, queue_meta=step_meta)
+        finally:
+            if was_training:
+                self.train()
+        return prev_bev
+
+    def _predict_prev_bev(self, history_points, img_metas, current_meta):
+        if not self.use_prev_bev:
+            return None
+        if self.video_test_mode and len(img_metas) == 1:
+            current_scene = (current_meta[0].get('scene_token')
+                             if current_meta and current_meta[0] else None)
+            if current_scene != self._test_scene_token:
+                self._test_prev_bev = None
+                self._test_scene_token = current_scene
+            cached = self.valid_prev_bev(self._test_prev_bev, current_meta)
+            if cached is not None:
+                return cached
+        prev_bev = self.obtain_history_bev(history_points, img_metas)
+        return self.valid_prev_bev(prev_bev, current_meta)
 
     def train(self, mode=True):
         super().train(mode)
@@ -168,6 +377,52 @@ class UniADTrackLidar(BEVFormerLidar):
         if not img_metas:
             return []
         return [copy.deepcopy(img_metas[max(img_metas.keys())])]
+
+    @staticmethod
+    def _as_queue_metas(meta):
+        if isinstance(meta, dict) and meta and all(
+                isinstance(key, int) for key in meta.keys()):
+            return meta
+        if isinstance(meta, dict):
+            queue_metas = meta.get('queue_metas')
+            if isinstance(queue_metas, dict):
+                return queue_metas
+        return None
+
+    @staticmethod
+    def _normalize_test_history_points(points, history_points):
+        if history_points is not None:
+            return history_points
+        points_queue = points
+        if isinstance(points_queue, (list, tuple)) and len(points_queue) == 1:
+            points_queue = points_queue[0]
+        if isinstance(points_queue, (list, tuple)) and len(points_queue) > 1:
+            return list(points_queue[:-1])
+        return history_points
+
+    @classmethod
+    def _normalize_test_img_metas(cls, img_metas):
+        while (isinstance(img_metas, (list, tuple)) and len(img_metas) == 1 and
+               isinstance(img_metas[0], (list, tuple))):
+            img_metas = img_metas[0]
+        if isinstance(img_metas, (list, tuple)) and len(img_metas) == 1 and \
+                isinstance(img_metas[0], dict):
+            queue_metas = cls._as_queue_metas(img_metas[0])
+            if queue_metas is not None:
+                current_idx = max(queue_metas.keys())
+                current_meta = copy.deepcopy(queue_metas[current_idx])
+                current_meta['queue_metas'] = queue_metas
+                return [current_meta], True
+            return img_metas, False
+        if isinstance(img_metas, dict):
+            queue_metas = cls._as_queue_metas(img_metas)
+            if queue_metas is not None:
+                current_idx = max(queue_metas.keys())
+                current_meta = copy.deepcopy(queue_metas[current_idx])
+                current_meta['queue_metas'] = queue_metas
+                return [current_meta], True
+            return [img_metas], False
+        return img_metas, False
 
     @staticmethod
     def _seg_batch_list(value, item_ndim):
@@ -234,7 +489,8 @@ class UniADTrackLidar(BEVFormerLidar):
         num_queries, dim = self.query_embedding.weight.shape
         device = self.query_embedding.weight.device
         query = self.query_embedding.weight
-        track_instances.ref_pts = self.reference_points(query[..., :dim // 2])
+        track_instances.ref_pts = self.reference_points(
+            query[..., :dim // 2])
         track_instances.query = query
         track_instances.output_embedding = torch.zeros(
             (num_queries, dim // 2), device=device)
@@ -743,6 +999,9 @@ class UniADTrackLidar(BEVFormerLidar):
                 flush=True)
         num_frames = len(points_queue)
         device = points_queue[-1].device
+        if self.with_sdc and (gt_sdc_bbox is None or gt_sdc_label is None):
+            raise ValueError('with_sdc=True requires gt_sdc_bbox and '
+                             'gt_sdc_label in the training batch.')
 
         gt_instances_list = []
         for frame_idx in range(num_frames):
@@ -756,20 +1015,25 @@ class UniADTrackLidar(BEVFormerLidar):
                 device)
             if self.with_sdc and gt_sdc_bbox is not None:
                 num_obj = boxes.shape[0]
+                sd_box = gt_sdc_bbox[0][frame_idx].tensor.to(device)
+                sd_box = normalize_bbox(sd_box, self.point_cloud_range)[:1]
+                sd_label = gt_sdc_label[0][frame_idx].to(device)[:1]
                 if num_obj > 0:
-                    sd_box = gt_sdc_bbox[0][frame_idx].tensor.to(device)
-                    sd_box = normalize_bbox(sd_box, self.point_cloud_range)
-                    sd_label = gt_sdc_label[0][frame_idx].to(device)
                     # Instances enforces all fields share length.  The loss
                     # only reads sdc_boxes[:1] / sdc_labels[0:1], so rows past
                     # the first are never used; expanding satisfies the length
                     # check without copying memory.
                     gt_instances.sdc_boxes = (
-                        sd_box[:1].expand(num_obj, -1).contiguous())
+                        sd_box.expand(num_obj, -1).contiguous())
                     gt_instances.sdc_labels = (
-                        sd_label[:1].expand(num_obj).contiguous())
-                # When num_obj == 0 we skip SDC GT for this frame; the matcher
-                # has nothing to match anyway.
+                        sd_label.expand(num_obj).contiguous())
+                else:
+                    # Keep one SDC target even on frames with no regular
+                    # objects.  Bypass the length check because Instances
+                    # length is defined by regular-object fields.
+                    gt_instances.get_fields()['sdc_boxes'] = sd_box.contiguous()
+                    gt_instances.get_fields()['sdc_labels'] = (
+                        sd_label.contiguous())
             gt_instances_list.append(gt_instances)
         self.criterion.initialize_for_single_clip(gt_instances_list)
 
@@ -868,26 +1132,19 @@ class UniADTrackLidar(BEVFormerLidar):
 
     def simple_test(self, points, img_metas, img=None, history_points=None,
                     **kwargs):
+        history_points = self._normalize_test_history_points(
+            points, history_points)
         points_queue = points
         if isinstance(points, (list, tuple)) and len(points) == 1 and isinstance(
                 points[0], (list, tuple)):
             points_queue = points[0]
         if isinstance(points_queue, (list, tuple)):
             points = points_queue[-1]
-        while isinstance(img_metas, (list, tuple)) and len(img_metas) == 1 and \
-                isinstance(img_metas[0], (list, tuple)):
-            img_metas = img_metas[0]
-        if isinstance(img_metas, (list, tuple)) and len(img_metas) == 1 and \
-                isinstance(img_metas[0], dict) and 0 in img_metas[0]:
-            img_metas = [img_metas[0][max(img_metas[0].keys())]]
-        elif isinstance(img_metas, dict):
-            if 0 in img_metas:
-                img_metas = [img_metas[max(img_metas.keys())]]
-            else:
-                img_metas = [img_metas]
+        img_metas, has_queue_meta = self._normalize_test_img_metas(img_metas)
 
-        has_queue_meta = img_metas and isinstance(img_metas[0], dict) and \
-            'queue_metas' in img_metas[0]
+        has_queue_meta = has_queue_meta or (
+            img_metas and isinstance(img_metas[0], dict) and
+            'queue_metas' in img_metas[0])
         if has_queue_meta:
             queue_current_meta = self.current_queue_meta(img_metas)
             current_meta = []

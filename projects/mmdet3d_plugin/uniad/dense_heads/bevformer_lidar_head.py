@@ -620,3 +620,12 @@ class BEVFormerLidarHead(BaseModule):
                         -1, sample_idx][bbox_index].detach().cpu()
             ret_list.append(result)
         return ret_list
+
+
+@HEADS.register_module()
+class BEVFormerLidarTrackHead(BEVFormerLidarHead):
+    """LiDAR BEVFormer head with UniAD tracking trajectory branch enabled."""
+
+    def __init__(self, *args, **kwargs):
+        kwargs['with_track_branch'] = True
+        super().__init__(*args, **kwargs)

@@ -5,4 +5,4 @@ from .motion_head_lidar import MotionHeadLidar
 from .occ_head import OccHead
 from .planning_head import PlanningHeadSingleMode
 from .bevformer_head import BEVFormerHead
-from .bevformer_lidar_head import BEVFormerLidarHead
+from .bevformer_lidar_head import BEVFormerLidarHead, BEVFormerLidarTrackHead
