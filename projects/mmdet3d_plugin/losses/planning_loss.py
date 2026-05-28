@@ -38,12 +38,21 @@ class CollisionLoss(nn.Module):
     def forward(self, sdc_traj_all, sdc_planning_gt, sdc_planning_gt_mask, future_gt_bbox):
         # sdc_traj_all (1, 6, 2)
         # sdc_planning_gt (1,6,3)
-        # sdc_planning_gt_mask (1, 6)
+        # sdc_planning_gt_mask (1, 6, 3)  — channel 0 is the validity flag.
         # future_gt_bbox 6x[lidarboxinstance]
         n_futures = len(future_gt_bbox)
         inter_sum = sdc_traj_all.new_zeros(1, )
+        # Some KL frames near scene end have only K<6 valid planning steps;
+        # the trailing steps hold zero-padded poses that would otherwise
+        # park the ego footprint at the origin and over-count collisions.
+        if sdc_planning_gt_mask is not None:
+            step_valid = sdc_planning_gt_mask[0, :, 0] > 0.5
+        else:
+            step_valid = None
         dump_sdc = []
         for i in range(n_futures):
+            if step_valid is not None and not bool(step_valid[i]):
+                continue
             if len(future_gt_bbox[i].tensor) > 0:
                 future_gt_bbox_corners = future_gt_bbox[i].corners[:, [0,3,4,7], :2] # (N, 8, 3) -> (N, 4, 2) only bev 
                 # sdc_yaw = -sdc_planning_gt[0, i, 2].to(sdc_traj_all.dtype) - 1.5708
@@ -67,12 +76,18 @@ class CollisionLoss(nn.Module):
 
     def to_corners(self, bbox):
         x, y, w, l, theta = bbox
+        # Body frame for KL is FLU: +x forward (length), +y left (width).
+        # sdc_planning yaw uses arctan2(R[1,0], R[0,0]) (CCW positive),
+        # so the body->world rotation is the standard R(theta) =
+        # [[cos, -sin], [sin, cos]]. Earlier UniAD camera code put length
+        # on y and used R(-theta) for nuScenes' RFU convention, which
+        # silently rotated the ego footprint 90 deg under KL.
         corners = torch.tensor([
-            [w/2, -l/2], [w/2, l/2], [-w/2, l/2], [-w/2,-l/2]  
+            [l/2, w/2], [l/2, -w/2], [-l/2, -w/2], [-l/2, w/2]
         ]).to(x.device) # 4,2
         rot_mat = torch.tensor(
-            [[torch.cos(theta), torch.sin(theta)],
-             [-torch.sin(theta), torch.cos(theta)]]
+            [[torch.cos(theta), -torch.sin(theta)],
+             [torch.sin(theta), torch.cos(theta)]]
         ).to(x.device)
         new_corners = rot_mat @ corners.T + torch.tensor(bbox[:2])[:, None].to(x.device)
         return new_corners.T

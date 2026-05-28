@@ -25,6 +25,17 @@ KL_CLASSES = (
 class KlDataset(Custom3DDataset):
     CLASSES = KL_CLASSES
 
+    @staticmethod
+    def _format_point_cloud_range(point_cloud_range, name):
+        if point_cloud_range is None:
+            return None
+        point_cloud_range = np.asarray(point_cloud_range, dtype=np.float32)
+        if point_cloud_range.shape != (6, ):
+            raise ValueError(
+                f'{name} must have shape (6,), got '
+                f'{point_cloud_range.shape}.')
+        return point_cloud_range
+
     def __init__(self,
                  data_root,
                  ann_file,
@@ -39,6 +50,11 @@ class KlDataset(Custom3DDataset):
                  with_velocity=True,
                  use_valid_flag=False,
                  label_mapping=None,
+                 track_past_steps=None,
+                 track_fut_steps=None,
+                 point_cloud_range=None,
+                 eval_point_cloud_range=None,
+                 filter_eval_by_range=True,
                  pi_symmetric_classes=('IGV-Full', 'IGV-Empty',
                                        'WheelCrane'),
                  **kwargs):
@@ -47,6 +63,23 @@ class KlDataset(Custom3DDataset):
         self.data_prefix = data_prefix or {}
         self.with_velocity = with_velocity
         self.use_valid_flag = use_valid_flag
+        self.track_past_steps = (
+            None if track_past_steps is None else int(track_past_steps))
+        self.track_fut_steps = (
+            None if track_fut_steps is None else int(track_fut_steps))
+        if self.track_past_steps is None and self.track_fut_steps is None:
+            self.track_traj_steps = None
+        else:
+            self.track_traj_steps = (
+                int(self.track_past_steps or 0) +
+                int(self.track_fut_steps or 0))
+        self.point_cloud_range = self._format_point_cloud_range(
+            point_cloud_range, 'point_cloud_range')
+        if eval_point_cloud_range is None:
+            eval_point_cloud_range = self.point_cloud_range
+        self.eval_point_cloud_range = self._format_point_cloud_range(
+            eval_point_cloud_range, 'eval_point_cloud_range')
+        self.filter_eval_by_range = bool(filter_eval_by_range)
         self.label_mapping = None
         if label_mapping is not None:
             self.label_mapping = {
@@ -117,6 +150,11 @@ class KlDataset(Custom3DDataset):
             input_dict['ann_info'] = annos
             if self.filter_empty_gt and len(annos['gt_labels_3d']) == 0:
                 return None
+        else:
+            # Test pipeline ops like LoadAnnotations3D still need ann_info
+            # available (e.g. drivable map raycast uses gt_bboxes_3d to
+            # mask obstacles). filter_empty_gt only applies during train.
+            input_dict['ann_info'] = self.get_ann_info(index)
         return input_dict
 
     def get_ann_info(self, index):
@@ -128,6 +166,8 @@ class KlDataset(Custom3DDataset):
         gt_inds = []
         forecasting_locs = []
         forecasting_mask = []
+        track_traj_locs = []
+        track_traj_mask = []
 
         for inst in instances:
             label = inst.get('bbox_label_3d', inst.get('bbox_label', -1))
@@ -150,13 +190,30 @@ class KlDataset(Custom3DDataset):
             gt_labels.append(label)
             gt_names.append(self.CLASSES[label])
             gt_inds.append(int(inst.get('track_id', -1)))
+            inst_fut_traj_locs = np.asarray(
+                inst.get('gt_fut_traj_locs',
+                         inst.get('gt_forecasting_locs',
+                                  np.zeros((0, 2)))),
+                dtype=np.float32)
+            inst_fut_traj_mask = np.asarray(
+                inst.get('gt_fut_traj_mask',
+                         inst.get('gt_forecasting_mask', np.zeros((0, )))),
+                dtype=np.bool_)
             forecasting_locs.append(
                 np.asarray(
-                    inst.get('gt_forecasting_locs', np.zeros((0, 2))),
+                    inst_fut_traj_locs,
                     dtype=np.float32))
             forecasting_mask.append(
                 np.asarray(
-                    inst.get('gt_forecasting_mask', np.zeros((0, ))),
+                    inst_fut_traj_mask,
+                    dtype=np.bool_))
+            track_traj_locs.append(
+                np.asarray(
+                    inst.get('gt_track_traj_locs', inst_fut_traj_locs),
+                    dtype=np.float32))
+            track_traj_mask.append(
+                np.asarray(
+                    inst.get('gt_track_traj_mask', inst_fut_traj_mask),
                     dtype=np.bool_))
 
         box_dim = 9 if self.with_velocity else 7
@@ -173,6 +230,8 @@ class KlDataset(Custom3DDataset):
 
         gt_fut_traj, gt_fut_traj_mask = self._stack_track_trajs(
             forecasting_locs, forecasting_mask)
+        gt_track_traj, gt_track_traj_mask = self._stack_track_trajs(
+            track_traj_locs, track_traj_mask, num_steps=self.track_traj_steps)
         ann_info = dict(
             gt_bboxes_3d=gt_bboxes_3d,
             gt_labels_3d=gt_labels,
@@ -180,12 +239,10 @@ class KlDataset(Custom3DDataset):
             gt_inds=gt_inds,
             gt_fut_traj=gt_fut_traj,
             gt_fut_traj_mask=gt_fut_traj_mask,
-            # UniAD stage-1 names this branch "past_traj", but the head is
-            # configured by step count. KL currently provides future offsets.
-            gt_past_traj=gt_fut_traj.copy(),
-            gt_past_traj_mask=gt_fut_traj_mask.copy(),
-            gt_forecasting_locs=gt_fut_traj,
-            gt_forecasting_mask=gt_fut_traj_mask[..., 0].astype(np.bool_))
+            # UniAD stage-1 names this branch "past_traj"; for KL we store
+            # the configured track trajectory labels there.
+            gt_past_traj=gt_track_traj,
+            gt_past_traj_mask=gt_track_traj_mask)
 
         if 'gt_sdc_bbox' in info:
             sdc_bbox = np.asarray(info['gt_sdc_bbox'], dtype=np.float32)
@@ -210,12 +267,15 @@ class KlDataset(Custom3DDataset):
         return ann_info
 
     @staticmethod
-    def _stack_track_trajs(trajs, masks):
+    def _stack_track_trajs(trajs, masks, num_steps=None):
         if len(trajs) == 0:
-            return (np.zeros((0, 0, 2), dtype=np.float32),
-                    np.zeros((0, 0, 2), dtype=np.float32))
+            steps = int(num_steps or 0)
+            return (np.zeros((0, steps, 2), dtype=np.float32),
+                    np.zeros((0, steps, 2), dtype=np.float32))
 
-        num_steps = max((traj.shape[0] for traj in trajs), default=0)
+        if num_steps is None:
+            num_steps = max((traj.shape[0] for traj in trajs), default=0)
+        num_steps = int(num_steps)
         stacked_trajs = np.zeros((len(trajs), num_steps, 2), dtype=np.float32)
         stacked_masks = np.zeros((len(trajs), num_steps, 2), dtype=np.float32)
         for idx, (traj, mask) in enumerate(zip(trajs, masks)):
@@ -391,12 +451,22 @@ class KlDataset(Custom3DDataset):
         label2cat = {i: cat for i, cat in enumerate(self.CLASSES)}
         gt_by_class = {i: {} for i in label2cat}
         pred_by_class = {i: [] for i in label2cat}
+        eval_range = self._active_eval_point_cloud_range()
+        filtered_gt = 0
+        filtered_pred = 0
 
         for sample_idx, ann_info in enumerate(gt_ann_infos):
             gt_boxes = ann_info['gt_bboxes_3d'].tensor.detach().cpu().numpy()
-            gt_labels = ann_info['gt_labels_3d']
+            gt_labels = np.asarray(ann_info['gt_labels_3d'])
+            if eval_range is not None:
+                gt_mask = self._box_bev_range_mask(gt_boxes, eval_range)
+                filtered_gt += int(len(gt_mask) - gt_mask.sum())
+                gt_boxes = gt_boxes[gt_mask]
+                gt_labels = gt_labels[gt_mask]
             for box, label in zip(gt_boxes, gt_labels):
                 label = int(label)
+                if label not in gt_by_class:
+                    continue
                 gt_by_class[label].setdefault(sample_idx, []).append(box)
 
         for sample_idx, result in enumerate(results):
@@ -406,7 +476,17 @@ class KlDataset(Custom3DDataset):
             box_tensor = boxes.tensor.detach().cpu().numpy()
             scores = result['scores_3d'].detach().cpu().numpy()
             labels = result['labels_3d'].detach().cpu().numpy()
-            order = np.argsort(scores)[::-1][:max_boxes_per_sample]
+            if eval_range is not None:
+                pred_mask = self._box_bev_range_mask(box_tensor, eval_range)
+                filtered_pred += int(len(pred_mask) - pred_mask.sum())
+                valid_indices = np.nonzero(pred_mask)[0]
+            else:
+                valid_indices = np.arange(len(box_tensor))
+            if len(valid_indices) == 0:
+                continue
+            order = valid_indices[
+                np.argsort(scores[valid_indices])[::-1]
+                [:max_boxes_per_sample]]
             for pred_idx in order:
                 label = int(labels[pred_idx])
                 if label not in pred_by_class:
@@ -416,6 +496,15 @@ class KlDataset(Custom3DDataset):
                         sample_idx=sample_idx,
                         box=box_tensor[pred_idx],
                         score=float(scores[pred_idx])))
+
+        if eval_range is not None:
+            print_log(
+                'KL bbox evaluation range filter: '
+                f'x=[{eval_range[0]:.1f}, {eval_range[3]:.1f}], '
+                f'y=[{eval_range[1]:.1f}, {eval_range[4]:.1f}], '
+                f'filtered_gt={filtered_gt}, '
+                f'filtered_pred={filtered_pred}.',
+                logger=logger)
 
         ret_dict = {}
         table_data = [[
@@ -539,12 +628,31 @@ class KlDataset(Custom3DDataset):
             return value.detach().cpu().numpy()
         return np.asarray(value)
 
+    def _active_eval_point_cloud_range(self):
+        if not self.filter_eval_by_range:
+            return None
+        return self.eval_point_cloud_range
+
+    @staticmethod
+    def _box_bev_range_mask(boxes, point_cloud_range):
+        boxes = np.asarray(boxes)
+        num_boxes = int(boxes.shape[0])
+        if num_boxes == 0:
+            return np.zeros((0, ), dtype=np.bool_)
+        point_cloud_range = np.asarray(point_cloud_range, dtype=np.float32)
+        return (
+            (boxes[:, 0] >= point_cloud_range[0]) &
+            (boxes[:, 0] <= point_cloud_range[3]) &
+            (boxes[:, 1] >= point_cloud_range[1]) &
+            (boxes[:, 1] <= point_cloud_range[4]))
+
     @staticmethod
     def _tracking_track_key(scene_token, track_id):
         return f'{scene_token}:{int(track_id)}'
 
     def _collect_tracking_records(self, results, gt_ann_infos):
         records = []
+        eval_range = self._active_eval_point_cloud_range()
         for sample_idx, (result, ann_info) in enumerate(
                 zip(results, gt_ann_infos)):
             info = self._get_raw_info(sample_idx)
@@ -559,8 +667,14 @@ class KlDataset(Custom3DDataset):
             gt_boxes = ann_info['gt_bboxes_3d'].tensor.detach().cpu().numpy()
             gt_labels = np.asarray(ann_info['gt_labels_3d'])
             gt_track_ids = np.asarray(ann_info.get('gt_inds', []))
-            for box, label, track_id in zip(gt_boxes, gt_labels,
-                                            gt_track_ids):
+            if eval_range is not None:
+                gt_mask = self._box_bev_range_mask(gt_boxes, eval_range)
+            else:
+                gt_mask = np.ones((len(gt_boxes), ), dtype=np.bool_)
+            for gt_idx, (box, label, track_id) in enumerate(
+                    zip(gt_boxes, gt_labels, gt_track_ids)):
+                if not gt_mask[gt_idx]:
+                    continue
                 if int(track_id) < 0:
                     continue
                 gt_records.append(
@@ -581,6 +695,12 @@ class KlDataset(Custom3DDataset):
                 scores = self._to_numpy(scores)
                 labels = self._to_numpy(labels)
                 track_ids = self._to_numpy(track_ids)
+                if eval_range is not None:
+                    pred_mask = self._box_bev_range_mask(
+                        box_tensor, eval_range)
+                else:
+                    pred_mask = np.ones((len(box_tensor), ),
+                                        dtype=np.bool_)
                 num_preds = len(box_tensor)
                 if scores is not None:
                     num_preds = min(num_preds, len(scores))
@@ -589,6 +709,8 @@ class KlDataset(Custom3DDataset):
                 if track_ids is not None:
                     num_preds = min(num_preds, len(track_ids))
                 for pred_idx in range(num_preds):
+                    if not pred_mask[pred_idx]:
+                        continue
                     track_id = int(track_ids[pred_idx])
                     if track_id < 0:
                         continue
@@ -952,6 +1074,9 @@ class KlDataset(Custom3DDataset):
             valid_gt = np.array(
                 [self._motion_valid_mask(mask).any() for mask in gt_masks],
                 dtype=np.bool_)
+            eval_range = self._active_eval_point_cloud_range()
+            if eval_range is not None:
+                valid_gt &= self._box_bev_range_mask(gt_boxes, eval_range)
 
             for label in gt_labels[valid_gt]:
                 class_stats[int(label)]['gt'] += 1
@@ -970,6 +1095,12 @@ class KlDataset(Custom3DDataset):
             pred_trajs = self._to_numpy(result['traj'])
             if pred_trajs is None:
                 continue
+            if eval_range is not None:
+                pred_range_mask = self._box_bev_range_mask(
+                    pred_boxes, eval_range)
+            else:
+                pred_range_mask = np.ones((len(pred_boxes), ),
+                                          dtype=np.bool_)
 
             num_preds = min(len(pred_boxes), len(pred_labels),
                             len(pred_trajs))
@@ -981,6 +1112,8 @@ class KlDataset(Custom3DDataset):
                 if not valid_gt[gt_idx]:
                     continue
                 for pred_idx in range(num_preds):
+                    if not pred_range_mask[pred_idx]:
+                        continue
                     if int(pred_labels[pred_idx]) != int(gt_label):
                         continue
                     if (pred_scores is not None
@@ -1823,25 +1956,31 @@ class KlTrackDataset(KlBEVFormerDataset):
         sample = queue[-1]
 
         points_list = [self._dc_data(each['points']) for each in queue]
-        gt_labels_3d_list = [
-            self._dc_data(each['gt_labels_3d']) for each in queue
-        ]
-        gt_bboxes_3d_list = [
-            self._dc_data(each['gt_bboxes_3d']) for each in queue
-        ]
-        gt_inds_list = [
-            self._as_tensor(each.get('gt_inds', []), dtype=torch.long)
-            for each in queue
-        ]
-        gt_past_traj_list = [
-            self._as_tensor(each.get('gt_past_traj', []), dtype=torch.float32)
-            for each in queue
-        ]
-        gt_past_traj_mask_list = [
-            self._as_tensor(each.get('gt_past_traj_mask', []),
-                            dtype=torch.float32)
-            for each in queue
-        ]
+        # Track-level GT (labels/bboxes/inds/past_traj) are absent in
+        # test pipelines that only consume drivable-map fields. Mirror
+        # the optional handling used below for fut_traj / sdc / planning.
+        has_track_gt = all('gt_labels_3d' in each for each in queue)
+        if has_track_gt:
+            gt_labels_3d_list = [
+                self._dc_data(each['gt_labels_3d']) for each in queue
+            ]
+            gt_bboxes_3d_list = [
+                self._dc_data(each['gt_bboxes_3d']) for each in queue
+            ]
+            gt_inds_list = [
+                self._as_tensor(each.get('gt_inds', []), dtype=torch.long)
+                for each in queue
+            ]
+            gt_past_traj_list = [
+                self._as_tensor(each.get('gt_past_traj', []),
+                                dtype=torch.float32)
+                for each in queue
+            ]
+            gt_past_traj_mask_list = [
+                self._as_tensor(each.get('gt_past_traj_mask', []),
+                                dtype=torch.float32)
+                for each in queue
+            ]
         has_fut_traj = all('gt_fut_traj' in each for each in queue)
         if has_fut_traj:
             gt_fut_traj = self._as_tensor(
@@ -1908,6 +2047,7 @@ class KlTrackDataset(KlBEVFormerDataset):
                 token=meta.get('token', ''),
                 timestamp=float(meta.get('timestamp', 0.0)))
             ego2global = np.asarray(meta['ego2global'], dtype=np.float64)
+            frame_meta['ego2global'] = ego2global.copy()
             if idx == 0:
                 frame_meta['prev_bev'] = False
                 frame_meta['prev_bev_exists'] = False
@@ -1934,11 +2074,12 @@ class KlTrackDataset(KlBEVFormerDataset):
         sample['points'] = DC(points_list, stack=False)
         sample['history_points'] = DC(points_list[:-1], stack=False)
         sample['img_metas'] = DC(metas_map, cpu_only=True)
-        sample['gt_labels_3d'] = DC(gt_labels_3d_list)
-        sample['gt_bboxes_3d'] = DC(gt_bboxes_3d_list, cpu_only=True)
-        sample['gt_inds'] = DC(gt_inds_list)
-        sample['gt_past_traj'] = DC(gt_past_traj_list)
-        sample['gt_past_traj_mask'] = DC(gt_past_traj_mask_list)
+        if has_track_gt:
+            sample['gt_labels_3d'] = DC(gt_labels_3d_list)
+            sample['gt_bboxes_3d'] = DC(gt_bboxes_3d_list, cpu_only=True)
+            sample['gt_inds'] = DC(gt_inds_list)
+            sample['gt_past_traj'] = DC(gt_past_traj_list)
+            sample['gt_past_traj_mask'] = DC(gt_past_traj_mask_list)
         if has_fut_traj:
             sample['gt_fut_traj'] = DC(gt_fut_traj)
             sample['gt_fut_traj_mask'] = DC(gt_fut_traj_mask)
