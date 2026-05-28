@@ -239,6 +239,18 @@ def update_kl_infos(pkl_path, out_dir):
                 instance['bbox_3d_isvalid'] = ori_info['valid_flag'][j]
                 if 'track_ids' in ori_info:
                     instance['track_id'] = ori_info['track_ids'][j]
+                if 'gt_fut_traj_locs' in ori_info:
+                    instance['gt_fut_traj_locs'] = ori_info[
+                        'gt_fut_traj_locs'][j]
+                if 'gt_fut_traj_mask' in ori_info:
+                    instance['gt_fut_traj_mask'] = ori_info[
+                        'gt_fut_traj_mask'][j]
+                if 'gt_track_traj_locs' in ori_info:
+                    instance['gt_track_traj_locs'] = ori_info[
+                        'gt_track_traj_locs'][j]
+                if 'gt_track_traj_mask' in ori_info:
+                    instance['gt_track_traj_mask'] = ori_info[
+                        'gt_track_traj_mask'][j]
                 if 'gt_forecasting_locs' in ori_info:
                     instance['gt_forecasting_locs'] = ori_info[
                         'gt_forecasting_locs'][j]

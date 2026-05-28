@@ -267,12 +267,15 @@ def gt_arrays_from_info_with_motion(info: dict, dataset_cfg,
         track_ids.append(int(inst.get('track_id', -1)))
 
         traj = np.asarray(
-            inst.get('gt_forecasting_locs', inst.get('gt_fut_traj',
-                                                     np.zeros((0, 2)))),
+            inst.get('gt_fut_traj_locs',
+                     inst.get('gt_forecasting_locs',
+                              inst.get('gt_fut_traj', np.zeros((0, 2))))),
             dtype=np.float32)
         mask = np.asarray(
-            inst.get('gt_forecasting_mask', inst.get('gt_fut_traj_mask',
-                                                     np.zeros((0, )))))
+            inst.get('gt_fut_traj_mask',
+                     inst.get('gt_forecasting_mask',
+                              inst.get('gt_fut_traj_mask',
+                                       np.zeros((0, ))))))
         trajs.append(traj)
         traj_masks.append(mask)
 

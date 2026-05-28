@@ -143,34 +143,32 @@ def draw_boxes(ax, boxes: np.ndarray, color: str, alpha: float = 0.8,
 
 
 def draw_other_futures(ax, info: dict) -> None:
-    locs = info.get('gt_forecasting_locs')
-    mask = info.get('gt_forecasting_mask')
-    if locs is None or mask is None:
-        return
+    # add_forecasting.py writes per-instance gt_fut_traj_locs / _mask under
+    # info['instances'][i] (not at the info top level), so iterate the
+    # instance list rather than indexing a top-level array.
     instances = info.get('instances') or []
     if not instances:
         return
-    locs = np.asarray(locs, dtype=np.float32)
-    mask = np.asarray(mask, dtype=bool)
-    # gt_forecasting_locs is in ego frame relative to the object's
-    # current position. Add the box center to get world-aligned points
-    # in the current LiDAR frame.
-    n = min(len(instances), locs.shape[0]) if locs.ndim >= 2 else 0
-    for i in range(n):
-        inst = instances[i]
-        bbox = inst.get('bbox_3d') if isinstance(inst, dict) else None
-        if bbox is None:
+    # Future trajectory labels are relative to the object's current
+    # position. Add the box center to get world-aligned points in the
+    # current LiDAR frame.
+    for inst in instances:
+        if not isinstance(inst, dict):
             continue
-        cx, cy = float(bbox[0]), float(bbox[1])
-        if locs.ndim != 3 or i >= locs.shape[0]:
+        bbox = inst.get('bbox_3d')
+        locs = inst.get('gt_fut_traj_locs', inst.get('gt_forecasting_locs'))
+        mask = inst.get('gt_fut_traj_mask', inst.get('gt_forecasting_mask'))
+        if bbox is None or locs is None or mask is None:
             continue
-        traj = locs[i]
-        m = mask[i] if i < mask.shape[0] else np.zeros(traj.shape[0],
-                                                       dtype=bool)
-        valid = m if m.dtype == bool else m.astype(bool)
+        traj = np.asarray(locs, dtype=np.float32)
+        m = np.asarray(mask).astype(bool)
+        if traj.ndim != 2 or traj.shape[-1] < 2:
+            continue
+        valid = m[:traj.shape[0]] if m.ndim == 1 else m.any(axis=-1)[:traj.shape[0]]
         if not valid.any():
             continue
-        pts = traj[valid] + np.array([cx, cy], dtype=np.float32)
+        cx, cy = float(bbox[0]), float(bbox[1])
+        pts = traj[valid, :2] + np.array([cx, cy], dtype=np.float32)
         pts_disp = lidar_xy_to_display(pts)
         ax.plot(pts_disp[:, 0], pts_disp[:, 1],
                 color='tab:blue', linewidth=0.8, alpha=0.5)

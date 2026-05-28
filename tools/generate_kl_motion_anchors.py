@@ -1,4 +1,4 @@
-"""Generate KL-dataset motion anchors via K-means on gt_forecasting_locs.
+"""Generate KL-dataset motion anchors via K-means on gt_fut_traj_locs.
 
 Output format matches motion_anchor_infos_mode6.pkl:
   {
@@ -12,7 +12,7 @@ Usage:
   python tools/generate_kl_motion_anchors.py \
       --info data/kl_8/kl_infos_train.pkl \
       --out  data/others/motion_anchor_infos_kl.pkl \
-      --k 6 --steps 6
+      --k 6 --steps 12
 """
 
 import argparse
@@ -36,8 +36,8 @@ GROUPS = [
 def collect_trajs(data_list, steps):
     """Return dict[group_idx -> list of (steps, 2) arrays].
 
-    The trajectories are transformed from the ego frame (where
-    gt_forecasting_locs lives) into the *object-local* frame, because
+    The trajectories are transformed from the LiDAR frame (where
+    gt_fut_traj_locs lives) into the *object-local* frame, because
     UniAD's `anchor_coordinate_transform` rotates anchors by `yaw - pi`
     at runtime. Anchors must therefore be authored in the object-local
     convention used by nuScenes (heading aligned with +y after that rot).
@@ -53,12 +53,14 @@ def collect_trajs(data_list, steps):
             label = inst.get('bbox_label_3d', inst.get('bbox_label', -1))
             if label not in cls2group:
                 continue
-            locs = inst.get('gt_forecasting_locs')
-            mask = inst.get('gt_forecasting_mask')
+            locs = inst.get('gt_fut_traj_locs',
+                            inst.get('gt_forecasting_locs'))
+            mask = inst.get('gt_fut_traj_mask',
+                            inst.get('gt_forecasting_mask'))
             bbox = inst.get('bbox_3d')
             if locs is None or mask is None or bbox is None:
                 continue
-            locs = np.array(locs, dtype=np.float32)   # (T, 2) in ego frame
+            locs = np.array(locs, dtype=np.float32)   # (T, 2) in LiDAR frame
             mask = np.array(mask, dtype=bool)
             if locs.shape[0] < steps or mask[:steps].sum() < steps:
                 continue
@@ -151,7 +153,7 @@ def main():
     parser.add_argument('--info', default='data/kl_8/kl_infos_train.pkl')
     parser.add_argument('--out',  default='data/others/motion_anchor_infos_kl.pkl')
     parser.add_argument('--k',     type=int, default=6)
-    parser.add_argument('--steps', type=int, default=6)
+    parser.add_argument('--steps', type=int, default=12)
     args = parser.parse_args()
 
     print(f'Loading {args.info} ...')

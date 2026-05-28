@@ -68,9 +68,25 @@ def kl_data_prep(root_path,
         forecast_cfg = dict(cfg.forecast_cfg)
     if bool(forecast_cfg.get('enable', False)):
         from data_converter.add_forecasting import add_forecasting_to_pkl
-        forecast_steps = int(forecast_cfg.get('forecast_steps', 6))
-        add_forecasting_to_pkl(info_train_path, forecast_steps=forecast_steps)
-        add_forecasting_to_pkl(info_val_path, forecast_steps=forecast_steps)
+        future_steps = int(
+            forecast_cfg.get('future_steps',
+                             forecast_cfg.get('forecast_steps', 12)))
+        track_past_steps = int(
+            forecast_cfg.get('track_past_steps',
+                             forecast_cfg.get('past_steps', 4)))
+        track_fut_steps = int(
+            forecast_cfg.get('track_fut_steps',
+                             forecast_cfg.get('fut_steps', 4)))
+        add_forecasting_to_pkl(
+            info_train_path,
+            future_steps=future_steps,
+            track_past_steps=track_past_steps,
+            track_fut_steps=track_fut_steps)
+        add_forecasting_to_pkl(
+            info_val_path,
+            future_steps=future_steps,
+            track_past_steps=track_past_steps,
+            track_fut_steps=track_fut_steps)
 
     velocity_cfg = {}
     if cfg is not None and hasattr(cfg, 'velocity_cfg'):
@@ -97,10 +113,16 @@ def kl_data_prep(root_path,
         from data_converter.add_sdc import add_sdc_to_pkl
         sdc_kwargs = dict(
             future_steps=int(sdc_cfg.get('future_steps', 6)),
-            sdc_label_name=sdc_cfg.get('sdc_label_name', 'Car'),
+            planning_steps=int(sdc_cfg.get('planning_steps', 6)),
+            command_lateral_threshold=float(
+                sdc_cfg.get('command_lateral_threshold', 2.0)),
+            command_yaw_threshold=float(
+                sdc_cfg.get('command_yaw_threshold', 0.1)),
+            sdc_label_name=sdc_cfg.get('sdc_label_name', 'IGV-Empty'),
             sdc_label_id=sdc_cfg.get('sdc_label_id', None),
-            sdc_size=tuple(sdc_cfg.get('sdc_size', (4.08, 1.73, 1.56))),
-            sdc_z=float(sdc_cfg.get('sdc_z', 0.0)),
+            sdc_label_mapping=sdc_cfg.get('sdc_label_mapping', None),
+            sdc_size=tuple(sdc_cfg.get('sdc_size', (14.6, 3.0, 2.16))),
+            sdc_z=float(sdc_cfg.get('sdc_z', 0.98)),
             sdc_yaw=float(sdc_cfg.get('sdc_yaw', 0.0)),
             min_dt=float(sdc_cfg.get('min_dt', 1e-3)),
             max_time_diff=float(sdc_cfg.get('max_time_diff', 1.5)),

@@ -70,8 +70,10 @@ temporal_chain_cfg = dict(
 
 
 forecast_cfg = dict(
-    enable=False,
-    forecast_steps=6)
+    enable=True,
+    future_steps=12,
+    track_past_steps=4,
+    track_fut_steps=4)
 
 
 velocity_cfg = dict(
@@ -83,10 +85,10 @@ velocity_cfg = dict(
 
 sdc_cfg = dict(
     enable=True,
-    future_steps=6,
-    sdc_label_name='Car',
-    sdc_size=(4.08, 1.73, 1.56),
-    sdc_z=0.0,
+    future_steps=12,
+    sdc_label_name='IGV-Empty',
+    sdc_size=(14.6, 3.0, 2.16),
+    sdc_z=0.98,
     sdc_yaw=0.0,
     min_dt=1e-3,
     max_time_diff=1.5,
