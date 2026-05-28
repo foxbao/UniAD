@@ -17,7 +17,7 @@ _dim_ = 256
 _ffn_dim_ = _dim_ * 2
 bev_h_ = 120
 bev_w_ = 160
-predict_steps = 6
+predict_steps = 12
 predict_modes = 6
 use_nonlinear_optimizer = False
 pedestrian_id_list = [0]
@@ -106,7 +106,10 @@ train_pipeline = [
 
 data = dict(
     samples_per_gpu=1,
-    train=dict(pipeline=train_pipeline, label_mapping=label_mapping))
+    train=dict(
+        pipeline=train_pipeline,
+        label_mapping=label_mapping,
+        point_cloud_range=point_cloud_range))
 
 optimizer = dict(type='AdamW', lr=2e-4, weight_decay=0.01)
 optimizer_config = dict(grad_clip=dict(max_norm=35, norm_type=2))

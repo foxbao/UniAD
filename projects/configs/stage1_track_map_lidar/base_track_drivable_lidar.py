@@ -142,7 +142,8 @@ train_pipeline = [
         type='Collect3D',
         keys=[
             'points', 'gt_bboxes_3d', 'gt_labels_3d', 'gt_inds',
-            'gt_past_traj', 'gt_past_traj_mask',
+            'gt_past_traj', 'gt_past_traj_mask', 'gt_fut_traj',
+            'gt_fut_traj_mask',
             'gt_sdc_bbox', 'gt_sdc_label',
             'gt_sdc_fut_traj', 'gt_sdc_fut_traj_mask',
             'gt_lane_labels', 'gt_lane_bboxes', 'gt_lane_masks'
@@ -156,6 +157,15 @@ test_pipeline = [
         load_dim=4,
         use_dim=4,
         file_client_args=file_client_args),
+    # LoadAnnotations3D supplies gt_bboxes_3d so GenerateKLDrivableMapLabels'
+    # raycast obstacle suppression matches train-time behaviour. Without
+    # it, drivable masks at eval time include voxels inside obstacles,
+    # inflating lane IoU relative to training.
+    dict(
+        type='LoadAnnotations3D',
+        with_bbox_3d=True,
+        with_label_3d=True,
+        with_attr_label=False),
     dict(type='PointsRangeFilter', point_cloud_range=point_cloud_range),
     dict(
         type='GenerateKLDrivableMapLabels',
@@ -176,8 +186,14 @@ test_pipeline = [
 ]
 
 data = dict(
-    train=dict(pipeline=train_pipeline),
-    val=dict(pipeline=test_pipeline),
-    test=dict(pipeline=test_pipeline))
+    train=dict(
+        pipeline=train_pipeline,
+        point_cloud_range=point_cloud_range),
+    val=dict(
+        pipeline=test_pipeline,
+        point_cloud_range=point_cloud_range),
+    test=dict(
+        pipeline=test_pipeline,
+        point_cloud_range=point_cloud_range))
 
 work_dir = './projects/work_dirs/stage1_track_map_lidar/base_track_drivable_lidar'
