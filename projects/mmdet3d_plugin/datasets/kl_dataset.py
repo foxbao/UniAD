@@ -146,7 +146,7 @@ class KlDataset(Custom3DDataset):
                 info.get('ego2global', np.eye(4)), dtype=np.float64))
 
         if not self.test_mode:
-            annos = self.get_ann_info(index)
+            annos = KlDataset.get_ann_info(self, index)
             input_dict['ann_info'] = annos
             if self.filter_empty_gt and len(annos['gt_labels_3d']) == 0:
                 return None
@@ -154,7 +154,7 @@ class KlDataset(Custom3DDataset):
             # Test pipeline ops like LoadAnnotations3D still need ann_info
             # available (e.g. drivable map raycast uses gt_bboxes_3d to
             # mask obstacles). filter_empty_gt only applies during train.
-            input_dict['ann_info'] = self.get_ann_info(index)
+            input_dict['ann_info'] = KlDataset.get_ann_info(self, index)
         return input_dict
 
     def get_ann_info(self, index):

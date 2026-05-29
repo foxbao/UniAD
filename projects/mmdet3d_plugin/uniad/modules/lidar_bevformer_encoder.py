@@ -17,14 +17,18 @@ class _BEVFeedForward(nn.Module):
                  hidden_dims: int,
                  dropout: float = 0.1) -> None:
         super().__init__()
-        self.fc1 = nn.Linear(embed_dims, hidden_dims)
-        self.act = nn.ReLU(inplace=True)
-        self.drop1 = nn.Dropout(dropout)
-        self.fc2 = nn.Linear(hidden_dims, embed_dims)
-        self.drop2 = nn.Dropout(dropout)
+        self.layers = nn.Sequential(
+            nn.Sequential(
+                nn.Linear(embed_dims, hidden_dims),
+                nn.ReLU(inplace=True),
+                nn.Dropout(dropout),
+            ),
+            nn.Linear(hidden_dims, embed_dims),
+            nn.Dropout(dropout),
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.drop2(self.fc2(self.drop1(self.act(self.fc1(x)))))
+        return self.layers(x)
 
 
 class LearnedBEVPositionalEncoding(nn.Module):
@@ -70,24 +74,28 @@ class LidarBEVFormerLayer(BaseModule):
                  dropout: float = 0.1,
                  init_cfg=None) -> None:
         super().__init__(init_cfg=init_cfg)
-        self.temporal_attn = LidarTemporalSelfAttention(
-            embed_dims=embed_dims,
-            num_heads=num_heads,
-            num_levels=1,
-            num_points=temporal_num_points,
-            dropout=dropout,
-            batch_first=True)
-        self.norm1 = nn.LayerNorm(embed_dims)
-        self.spatial_attn = LidarSpatialCrossAttention(
-            embed_dims=embed_dims,
-            num_heads=num_heads,
-            num_levels=1,
-            num_points=spatial_num_points,
-            dropout=dropout,
-            batch_first=True)
-        self.norm2 = nn.LayerNorm(embed_dims)
-        self.ffn = _BEVFeedForward(embed_dims, ffn_channels, dropout=dropout)
-        self.norm3 = nn.LayerNorm(embed_dims)
+        self.attentions = nn.ModuleList([
+            LidarTemporalSelfAttention(
+                embed_dims=embed_dims,
+                num_heads=num_heads,
+                num_levels=1,
+                num_points=temporal_num_points,
+                dropout=dropout,
+                batch_first=True),
+            LidarSpatialCrossAttention(
+                embed_dims=embed_dims,
+                num_heads=num_heads,
+                num_levels=1,
+                num_points=spatial_num_points,
+                dropout=dropout,
+                batch_first=True),
+        ])
+        self.norms = nn.ModuleList([nn.LayerNorm(embed_dims)])
+        self.norms.append(nn.LayerNorm(embed_dims))
+        self.ffns = nn.ModuleList([
+            _BEVFeedForward(embed_dims, ffn_channels, dropout=dropout)
+        ])
+        self.norms.append(nn.LayerNorm(embed_dims))
 
     def forward(self,
                 query: torch.Tensor,
@@ -111,7 +119,7 @@ class LidarBEVFormerLayer(BaseModule):
             [shift_ref_2d, reference_points], dim=1)
         hybrid_ref_2d = hybrid_ref_2d.reshape(query.size(0) * 2,
                                               query.size(1), 1, 2)
-        query = self.temporal_attn(
+        query = self.attentions[0](
             query,
             value=temporal_value,
             identity=query,
@@ -119,9 +127,9 @@ class LidarBEVFormerLayer(BaseModule):
             reference_points=hybrid_ref_2d,
             spatial_shapes=spatial_shapes,
             level_start_index=level_start_index)
-        query = self.norm1(query)
+        query = self.norms[0](query)
 
-        query = self.spatial_attn(
+        query = self.attentions[1](
             query,
             value=lidar_value,
             identity=query,
@@ -129,9 +137,9 @@ class LidarBEVFormerLayer(BaseModule):
             reference_points=reference_points.unsqueeze(2),
             spatial_shapes=spatial_shapes,
             level_start_index=level_start_index)
-        query = self.norm2(query)
+        query = self.norms[1](query)
 
-        query = self.norm3(query + self.ffn(query))
+        query = self.norms[2](query + self.ffns[0](query))
         return query
 
 

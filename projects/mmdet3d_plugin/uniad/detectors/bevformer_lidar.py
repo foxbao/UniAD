@@ -4,7 +4,7 @@ import torch
 from mmcv.runner import auto_fp16
 from mmdet.models import DETECTORS
 from mmdet3d.models.detectors.mvx_two_stage import MVXTwoStageDetector
-from torch import Tensor, nn
+from torch import Tensor
 
 
 @DETECTORS.register_module()
@@ -55,15 +55,8 @@ class BEVFormerLidar(MVXTwoStageDetector):
         self.return_query_feats = return_query_feats
         self.fp16_enabled = False
 
-        self.query_embedding = nn.Embedding(num_query, embed_dims * 2)
-        self.reference_points = nn.Linear(embed_dims, 3)
         self._test_prev_bev = None
         self._test_scene_token = None
-        self._init_detector_queries()
-
-    def _init_detector_queries(self):
-        nn.init.xavier_uniform_(self.reference_points.weight)
-        nn.init.constant_(self.reference_points.bias, 0)
 
     @staticmethod
     def _unwrap_single_bev(pts_feats) -> Tensor:
@@ -144,15 +137,6 @@ class BEVFormerLidar(MVXTwoStageDetector):
             current.append(queue_metas[last_idx])
         return current
 
-    def _detector_query_inputs(self, batch_size: int, device: torch.device,
-                               dtype: torch.dtype):
-        query_embeds = self.query_embedding.weight.to(device=device)
-        ref_points = self.reference_points(query_embeds[:, :self.embed_dims])
-        query_embeds = query_embeds.to(dtype=dtype)
-        ref_points = ref_points.to(dtype=dtype)
-        ref_points = ref_points[None].expand(batch_size, -1, -1)
-        return query_embeds, ref_points
-
     def obtain_history_bev(self, history_points, img_metas):
         if not self.use_prev_bev or history_points is None:
             return None
@@ -214,12 +198,8 @@ class BEVFormerLidar(MVXTwoStageDetector):
                       **kwargs):
         bev_embed, _ = self._extract_current_bev_embed(
             points, img_metas, history_points)
-        query_embeds, ref_points = self._detector_query_inputs(
-            bev_embed.size(0), bev_embed.device, bev_embed.dtype)
         preds = self.pts_bbox_head.get_detections(
-            self._wrap_single_bev(bev_embed),
-            object_query_embeds=query_embeds,
-            ref_points=ref_points)
+            self._wrap_single_bev(bev_embed))
         gt_bboxes_3d = [boxes.to(bev_embed.device) for boxes in gt_bboxes_3d]
         gt_labels_3d = [
             torch.as_tensor(labels, device=bev_embed.device, dtype=torch.long)
@@ -238,12 +218,8 @@ class BEVFormerLidar(MVXTwoStageDetector):
                                           current_meta)
         bev_embed = self.encode_bev(
             lidar_bev, prev_bev, queue_meta=current_meta)
-        query_embeds, ref_points = self._detector_query_inputs(
-            bev_embed.size(0), bev_embed.device, bev_embed.dtype)
         preds = self.pts_bbox_head.get_detections(
-            self._wrap_single_bev(bev_embed),
-            object_query_embeds=query_embeds,
-            ref_points=ref_points)
+            self._wrap_single_bev(bev_embed))
         results = self.pts_bbox_head.predict_by_feat(
             preds, img_metas, return_query_feats=self.return_query_feats)
         if self.video_test_mode and len(img_metas) == 1:

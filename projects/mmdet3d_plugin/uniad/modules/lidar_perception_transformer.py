@@ -8,6 +8,7 @@ import torch
 import torch.nn.functional as F
 from mmcv.cnn.bricks.transformer import build_transformer_layer_sequence
 from mmcv.runner import BaseModule
+from torch import nn
 
 from .lidar_bevformer_encoder import LidarBEVFormerEncoder
 
@@ -48,6 +49,9 @@ class LidarPerceptionTransformer(BaseModule):
         self.decoder = (
             build_transformer_layer_sequence(decoder)
             if decoder is not None else None)
+        self.reference_points = nn.Linear(self.embed_dims, 3)
+        nn.init.xavier_uniform_(self.reference_points.weight)
+        nn.init.constant_(self.reference_points.bias, 0)
 
     def shift_from_queue_meta(self,
                               queue_meta: Optional[Sequence[dict]],
@@ -192,7 +196,7 @@ class LidarPerceptionTransformer(BaseModule):
                             object_query_embed: torch.Tensor,
                             bev_h: int,
                             bev_w: int,
-                            reference_points: torch.Tensor,
+                            reference_points: Optional[torch.Tensor] = None,
                             reg_branches=None,
                             cls_branches=None,
                             img_metas=None):
@@ -206,19 +210,24 @@ class LidarPerceptionTransformer(BaseModule):
         query_pos = query_pos.unsqueeze(0).expand(batch_size, -1, -1)
         query = query.unsqueeze(0).expand(batch_size, -1, -1)
 
-        if reference_points.dim() == 2:
-            reference_points = reference_points.unsqueeze(0).expand(
-                batch_size, -1, -1)
-        elif reference_points.dim() == 3:
-            if reference_points.size(0) == 1 and batch_size != 1:
-                reference_points = reference_points.expand(batch_size, -1, -1)
-            elif reference_points.size(0) != batch_size:
-                raise ValueError('reference_points batch size mismatch: '
-                                 f'expected {batch_size}, got '
-                                 f'{reference_points.size(0)}.')
+        if reference_points is None:
+            reference_points = self.reference_points(query_pos)
         else:
-            raise ValueError('reference_points must have shape [N, 3] or '
-                             f'[B, N, 3], got {tuple(reference_points.shape)}.')
+            if reference_points.dim() == 2:
+                reference_points = reference_points.unsqueeze(0).expand(
+                    batch_size, -1, -1)
+            elif reference_points.dim() == 3:
+                if reference_points.size(0) == 1 and batch_size != 1:
+                    reference_points = reference_points.expand(
+                        batch_size, -1, -1)
+                elif reference_points.size(0) != batch_size:
+                    raise ValueError('reference_points batch size mismatch: '
+                                     f'expected {batch_size}, got '
+                                     f'{reference_points.size(0)}.')
+            else:
+                raise ValueError('reference_points must have shape [N, 3] or '
+                                 f'[B, N, 3], got '
+                                 f'{tuple(reference_points.shape)}.')
         reference_points = reference_points.sigmoid()
         init_reference_out = reference_points
 

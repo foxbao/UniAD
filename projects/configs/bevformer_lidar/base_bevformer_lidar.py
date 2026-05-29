@@ -52,8 +52,6 @@ bev_w_ = 160
 model = dict(
     type='BEVFormerLidar',
     point_cloud_range=point_cloud_range,
-    num_query=600,
-    embed_dims=_dim_,
     video_test_mode=True,
     return_query_feats=False,
     pts_voxel_layer=dict(
@@ -207,8 +205,8 @@ test_pipeline = [
 ]
 
 data = dict(
-    samples_per_gpu=4,
-    workers_per_gpu=4,
+    samples_per_gpu=5,
+    workers_per_gpu=8,
     train=dict(
         type=dataset_type,
         data_root=data_root,

@@ -58,10 +58,12 @@ def denormalize_bbox(preds: Tensor) -> Tensor:
 
 @HEADS.register_module()
 class BEVFormerLidarHead(BaseModule):
-    """UniAD-aligned DETR head over BEVFormer-style BEV features.
+    """DETR head over LiDAR BEVFormer-style BEV features.
 
-    The detector supplies object queries and inverse-sigmoid reference points
-    each call. The head owns:
+    By default this mirrors camera BEVFormer: the head owns object queries and
+    the transformer owns reference points. UniAD tracking callers can still
+    supply external queries/reference points when ``detector_owns_queries`` is
+    enabled. The head owns:
       * the BEV query / positional encoding consumed by the BEV encoder, plus
         the LiDAR-feature projection;
       * the ``transformer`` with its BEV encoder and detection decoder;
@@ -106,9 +108,8 @@ class BEVFormerLidarHead(BaseModule):
                  with_track_branch: bool = False,
                  past_steps: int = 0,
                  fut_steps: int = 6,
-        # Accepted for config-symmetry with BEVDETRHead; this head
-        # does not own queries, so num_query is informational only.
-        num_query: Optional[int] = None) -> None:
+                 detector_owns_queries: bool = False,
+                 num_query: Optional[int] = None) -> None:
         super().__init__(init_cfg=init_cfg)
 
         self.in_channels = int(in_channels)
@@ -131,6 +132,10 @@ class BEVFormerLidarHead(BaseModule):
         self.pi_symmetric_class_indices = list(
             (train_cfg or {}).get('pi_symmetric_class_indices', []) or [])
         self.num_query = num_query
+        self.detector_owns_queries = detector_owns_queries
+        if not self.detector_owns_queries and self.num_query is None:
+            raise ValueError('BEVFormerLidarHead requires num_query when it '
+                             'owns object queries.')
         self.bev_h = bev_h
         self.bev_w = bev_w
         self.lidar_in_channels = int(lidar_in_channels or self.in_channels)
@@ -191,6 +196,9 @@ class BEVFormerLidarHead(BaseModule):
 
         # ---- DETR decoder over BEV memory ----------------------------------
         self.input_proj = nn.Conv2d(in_channels, embed_dims, kernel_size=1)
+        if not self.detector_owns_queries:
+            self.query_embedding = nn.Embedding(self.num_query,
+                                                self.embed_dims * 2)
 
         self.cls_branches = nn.ModuleList(
             [self._make_cls_branch(num_reg_fcs)
@@ -325,25 +333,29 @@ class BEVFormerLidarHead(BaseModule):
                              f'map, got {type(feats)} with len={len(feats)}.')
         return feats[0]
 
-    def forward(self, feats, object_query_embeds: Tensor,
-                ref_points: Tensor) -> dict:
-        """Run decoder. ``object_query_embeds`` and ``ref_points`` are
-        mandatory and supplied by the detector (UniAD convention).
+    def forward(self, feats, object_query_embeds: Optional[Tensor] = None,
+                ref_points: Optional[Tensor] = None) -> dict:
+        """Run decoder.
 
         Args:
             feats: Single-element list containing BEV tensor [B, C, H, W].
             object_query_embeds: [N, 2*D] where first half is query_pos,
-                second half is query_feat.
-            ref_points: [B, N, 3] logit-space reference points
-                (inverse_sigmoid of normalized (cx, cy, cz)).
+                second half is query_feat. Defaults to this head's learned
+                query embedding.
+            ref_points: Optional [N, 3] or [B, N, 3] logit-space reference
+                points. Defaults to the transformer's learned reference layer.
         """
-        if object_query_embeds is None or ref_points is None:
-            raise ValueError('BEVFormerTrackHead.forward requires '
-                             'object_query_embeds and ref_points; the '
-                             'detector owns these tensors.')
-
         bev = self._unwrap_feats(feats)
         batch_size, _, bev_h, bev_w = bev.shape
+        if object_query_embeds is None:
+            if self.detector_owns_queries:
+                raise ValueError('object_query_embeds must be supplied when '
+                                 'detector_owns_queries=True.')
+            object_query_embeds = self.query_embedding.weight
+        object_query_embeds = object_query_embeds.to(
+            device=bev.device, dtype=bev.dtype)
+        if ref_points is not None:
+            ref_points = ref_points.to(device=bev.device, dtype=bev.dtype)
 
         memory = self.input_proj(bev)
         memory = memory.flatten(2).permute(2, 0, 1).contiguous()
@@ -411,9 +423,9 @@ class BEVFormerLidarHead(BaseModule):
             self.pc_range[5] - self.pc_range[2]) + self.pc_range[2]
         return raw
 
-    def get_detections(self, feats, object_query_embeds: Tensor,
-                       ref_points: Tensor) -> dict:
-        """UniAD-compatible entry point — alias for ``forward``."""
+    def get_detections(self, feats, object_query_embeds: Optional[Tensor] = None,
+                       ref_points: Optional[Tensor] = None) -> dict:
+        """Detection entry point. External queries keep UniAD compatibility."""
         return self.forward(feats, object_query_embeds=object_query_embeds,
                             ref_points=ref_points)
 
@@ -628,4 +640,5 @@ class BEVFormerLidarTrackHead(BEVFormerLidarHead):
 
     def __init__(self, *args, **kwargs):
         kwargs['with_track_branch'] = True
+        kwargs.setdefault('detector_owns_queries', True)
         super().__init__(*args, **kwargs)
