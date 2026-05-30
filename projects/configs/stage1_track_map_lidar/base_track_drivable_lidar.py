@@ -29,6 +29,7 @@ model = dict(
         bev_w=bev_w_,
         canvas_size=canvas_size,
         pc_range=point_cloud_range,
+        eval_drivable_only=True,
         num_query=300,
         num_classes=4,
         num_things_classes=3,

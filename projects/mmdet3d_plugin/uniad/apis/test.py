@@ -38,6 +38,48 @@ def custom_encode_mask_results(mask_results):
     return [encoded_mask_results]
 
 
+def _detach_results_to_cpu(data):
+    if isinstance(data, torch.Tensor):
+        return data.detach().cpu()
+    if isinstance(data, dict):
+        return {key: _detach_results_to_cpu(value)
+                for key, value in data.items()}
+    if isinstance(data, list):
+        return [_detach_results_to_cpu(value) for value in data]
+    if isinstance(data, tuple):
+        return tuple(_detach_results_to_cpu(value) for value in data)
+    if (hasattr(data, 'tensor') and isinstance(data.tensor, torch.Tensor)
+            and hasattr(data, 'to')):
+        return data.to('cpu')
+    return data
+
+
+def _strip_unused_eval_outputs(result):
+    if os.environ.get('ENABLE_PLOT_MODE', None) is not None:
+        return result
+
+    keep_keys = {
+        'boxes_3d', 'scores_3d', 'labels_3d',
+        'track_boxes_3d', 'track_scores', 'track_labels_3d', 'track_ids',
+        'boxes_3d_det', 'scores_3d_det', 'labels_3d_det',
+        'ret_iou', 'planning_traj', 'planning_traj_gt', 'command',
+    }
+
+    result_items = result if isinstance(result, list) else [result]
+    for item in result_items:
+        if not isinstance(item, dict):
+            continue
+        pts_bbox = item.get('pts_bbox', None)
+        if not isinstance(pts_bbox, dict):
+            continue
+        item['pts_bbox'] = {
+            key: value
+            for key, value in pts_bbox.items()
+            if key in keep_keys or key.startswith('traj')
+        }
+    return result
+
+
 def _get_occ_eval_slices(key, occ_tensor):
     height, width = occ_tensor.shape[-2:]
     if key == '100x100':
@@ -156,6 +198,9 @@ def custom_multi_gpu_test(model, data_loader, tmpdir=None, gpu_collect=False):
                 for k in ['bbox', 'segm', 'labels', 'panoptic', 'drivable', 'score_list', 'lane', 'lane_score', 'stuff_score_list']:
                     if k in result[0]['pts_bbox'] and isinstance(result[0]['pts_bbox'][k], torch.Tensor):
                         result[0]['pts_bbox'][k] = result[0]['pts_bbox'][k].detach().cpu()
+
+            result = _strip_unused_eval_outputs(result)
+            result = _detach_results_to_cpu(result)
 
             # encode mask results
             if isinstance(result, dict):

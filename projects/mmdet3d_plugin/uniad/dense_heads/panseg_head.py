@@ -51,6 +51,7 @@ class PansegformerHead(SegDETRHead):
             quality_threshold_stuff=0.25,
             overlap_threshold_things=0.4,
             overlap_threshold_stuff=0.2,
+            eval_drivable_only=False,
             thing_transformer_head=dict(
                 type='TransformerHead',  # mask decoder for things
                 d_model=256,
@@ -86,6 +87,7 @@ class PansegformerHead(SegDETRHead):
         self.quality_threshold_stuff = quality_threshold_stuff
         self.overlap_threshold_things = overlap_threshold_things
         self.overlap_threshold_stuff = overlap_threshold_stuff
+        self.eval_drivable_only = eval_drivable_only
         self.fp16_enabled = False
 
         if self.as_two_stage:
@@ -1172,10 +1174,57 @@ class PansegformerHead(SegDETRHead):
             ori_shape = (self.canvas_size[0], self.canvas_size[1], 3)
             scale_factor = 1
 
+            i = img_id
+            if self.eval_drivable_only:
+                stuff_query = self.stuff_query.weight[None, :, :self.embed_dims]
+                stuff_query_pos = self.stuff_query.weight[None, :,
+                                                          self.embed_dims:]
+                mask_stuff, mask_inter_stuff, query_inter_stuff = self.stuff_mask_head(
+                    memory[i:i + 1],
+                    memory_mask[i:i + 1],
+                    None,
+                    stuff_query,
+                    None,
+                    stuff_query_pos,
+                    hw_lvl=hw_lvl)
+                attn_map = mask_stuff.squeeze(-1)
+
+                stuff_query = query_inter_stuff[-1]
+                scores_stuff = self.cls_stuff_branches[-1](
+                    stuff_query).sigmoid().reshape(-1)
+
+                mask_pred = attn_map.reshape(-1, *hw_lvl[0])
+                mask_pred = F.interpolate(mask_pred.unsqueeze(0),
+                                          size=ori_shape[:2],
+                                          mode='bilinear').squeeze(0)
+
+                score_list.append(mask_pred)
+                drivable_list.append(mask_pred[-1] > 0.5)
+                lane = torch.zeros((self.num_things_classes, *mask_pred.shape[-2:]),
+                                   device=mask_pred.device).to(torch.long)
+                lane_score = torch.zeros(
+                    (self.num_things_classes, *mask_pred.shape[-2:]),
+                    device=mask_pred.device).to(mask_pred.dtype)
+                results = torch.zeros((2, *mask_pred.shape[-2:]),
+                                      device=mask_pred.device).to(torch.long)
+                file_name = img_metas[img_id]['pts_filename'].split('/')[-1].split('.')[0]
+                panoptic_list.append(
+                    (results.permute(1, 2, 0).cpu().numpy(), file_name, ori_shape))
+                bbox_list.append(mask_pred.new_zeros((0, 5)))
+                labels_list.append(torch.zeros((0,),
+                                               device=mask_pred.device,
+                                               dtype=torch.long))
+                seg_list.append(torch.zeros((0, *mask_pred.shape[-2:]),
+                                            device=mask_pred.device,
+                                            dtype=torch.bool))
+                lane_list.append(lane)
+                lane_score_list.append(lane_score)
+                stuff_score_list.append(scores_stuff)
+                continue
+
             index, bbox, labels = self._get_bboxes_single(
                 cls_score, bbox_pred, img_shape, scale_factor, rescale)
 
-            i = img_id
             thing_query = query[i:i + 1, index, :]
             thing_query_pos = query_pos[i:i + 1, index, :]
             joint_query = torch.cat([
