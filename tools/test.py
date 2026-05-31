@@ -11,10 +11,10 @@ from mmcv.parallel import MMDataParallel, MMDistributedDataParallel
 from mmcv.runner import (get_dist_info, init_dist, load_checkpoint,
                          wrap_fp16_model)
 
-from mmdet3d.apis import single_gpu_test
-from mmdet3d.datasets import build_dataset
-from projects.mmdet3d_plugin.datasets.builder import build_dataloader
-from mmdet3d.models import build_model
+import sys
+sys.path.insert(1, '/home/labuser/bjyang/BEVFormer_tensorrt')
+from third_party.uniad_mmdet3d.datasets.builder import build_dataloader, build_dataset
+from third_party.uniad_mmdet3d.models.builder import build_model
 from mmdet.apis import set_random_seed
 from projects.mmdet3d_plugin.uniad.apis.test import custom_multi_gpu_test
 from mmdet.datasets import replace_ImageToTensor
@@ -258,4 +258,5 @@ def main():
 
 
 if __name__ == '__main__':
+    torch.multiprocessing.set_start_method('fork')
     main()

@@ -10,7 +10,7 @@ GPUS=$3                                              #
 # -------------------------------------------------- #
 GPUS_PER_NODE=$(($GPUS<8?$GPUS:8))
 
-MASTER_PORT=${MASTER_PORT:-28596}
+MASTER_PORT=${MASTER_PORT:-28591}
 WORK_DIR=$(echo ${CFG%.*} | sed -e "s/configs/work_dirs/g")/
 # Intermediate files and logs will be saved to UniAD/projects/work_dirs/
 
