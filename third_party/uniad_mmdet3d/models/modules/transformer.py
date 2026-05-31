@@ -190,7 +190,7 @@ class PerceptionTransformer(BaseModule):
             spatial_shapes, dtype=torch.long, device=bev_pos.device
         )
         level_start_index = torch.cat(
-            (spatial_shapes.new_zeros((1,)), spatial_shapes.prod(1).cumsum(0)[:-1])
+            (spatial_shapes.new_zeros((1,)), (spatial_shapes[:, 0] * spatial_shapes[:, 1]).cumsum(0)[:-1])
         )
 
         feat_flatten = feat_flatten.permute(
