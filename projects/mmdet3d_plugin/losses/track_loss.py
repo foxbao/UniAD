@@ -20,8 +20,12 @@ from mmdet.core import build_assigner
 from mmdet.models import build_loss
 from mmdet.models.builder import LOSSES
 from mmdet.core import reduce_mean
-from mmdet3d.core.bbox.iou_calculators.iou3d_calculator import (
+import sys
+# sys.path.insert(1, '/path/to/UniAD_tensorrt')
+from third_party.uniad_mmdet3d.core.bbox.iou_calculators.iou3d_calculator import (
     bbox_overlaps_nearest_3d as iou_3d, )
+# from mmdet3d.core.bbox.iou_calculators.iou3d_calculator import (
+#     bbox_overlaps_nearest_3d as iou_3d, )
 from projects.mmdet3d_plugin.core.bbox.util import denormalize_bbox
 
 
@@ -58,7 +62,7 @@ def accuracy(output, target, topk=(1, )):
     return res
 
 
-@LOSSES.register_module()
+@LOSSES.register_module(force=True)
 class ClipMatcher(nn.Module):
     def __init__(
             self,

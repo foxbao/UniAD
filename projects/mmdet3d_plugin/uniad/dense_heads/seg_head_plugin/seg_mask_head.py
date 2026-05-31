@@ -13,7 +13,7 @@ import math
 from mmcv.runner import force_fp32
 
 count = 0
-
+fp16_enabled=False
 
 class Mlp(nn.Module):
     def __init__(self,
@@ -23,7 +23,7 @@ class Mlp(nn.Module):
                  act_layer=nn.GELU,
                  drop=0.):
         super().__init__()
-        self.fp16_enabled = False
+        self.fp16_enabled = fp16_enabled
         out_features = out_features or in_features
         hidden_features = hidden_features or in_features
         self.fc1 = nn.Linear(in_features, hidden_features)
@@ -54,7 +54,7 @@ class SelfAttention(nn.Module):
         super().__init__()
         self.num_heads = num_heads
         head_dim = dim // num_heads
-        self.fp16_enabled = False
+        self.fp16_enabled = fp16_enabled
         self.scale = qk_scale or head_dim**-0.5
 
         self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
@@ -93,7 +93,7 @@ class Attention(nn.Module):
                  attn_drop=0.,
                  proj_drop=0.):
         super().__init__()
-        self.fp16_enabled = False
+        self.fp16_enabled = fp16_enabled
         self.num_heads = num_heads
         head_dim = dim // num_heads
         self.scale = qk_scale or head_dim**-0.5
@@ -119,10 +119,9 @@ class Attention(nn.Module):
                 nn.init.xavier_uniform_(p)
 
     @force_fp32(apply_to=('query', 'key', 'value'))
-    def forward(self, query, key, value, key_padding_mask, hw_lvl):
+    def forward(self, query, key, value):#, key_padding_mask, hw_lvl):
         B, N, C = query.shape
         _, L, _ = key.shape
-        #print('query, key, value', query.shape, value.shape, key.shape)
         q = self.q(query).reshape(B, N,
                                   self.num_heads, C // self.num_heads).permute(
                                       0, 2, 1,
@@ -165,7 +164,7 @@ class AttentionTail(nn.Module):
                  attn_drop=0.,
                  proj_drop=0.):
         super().__init__()
-        self.fp16_enabled = False
+        self.fp16_enabled = fp16_enabled
         self.num_heads = num_heads
         head_dim = dim // num_heads
         self.scale = qk_scale or head_dim**-0.5
@@ -189,7 +188,7 @@ class AttentionTail(nn.Module):
                 nn.init.xavier_uniform_(p)
 
     @force_fp32(apply_to=('query', 'key'))
-    def forward(self, query, key, key_padding_mask, hw_lvl=None):
+    def forward(self, query, key):#, key_padding_mask, hw_lvl=None):
         B, N, C = query.shape
         _, L, _ = key.shape
         #print('query, key, value', query.shape, value.shape, key.shape)
@@ -226,7 +225,7 @@ class Block(nn.Module):
                  norm_layer=nn.LayerNorm,
                  self_attn=False):
         super().__init__()
-        self.fp16_enabled = False
+        self.fp16_enabled = fp16_enabled
         self.head_norm1 = norm_layer(dim)
         self.self_attn = self_attn
         self.attn = Attention(cfg,
@@ -257,11 +256,11 @@ class Block(nn.Module):
             self.norm3 = norm_layer(dim)
 
     @force_fp32(apply_to=('query', 'key', 'value'))
-    def forward(self, query, key, value, key_padding_mask=None, hw_lvl=None):
+    def forward(self, query, key, value):#, key_padding_mask=None, hw_lvl=None):
         if self.self_attn:
             query = query + self.drop_path(self.self_attention(query))
             query = self.norm3(query)
-        x, mask = self.attn(query, key, value, key_padding_mask, hw_lvl=hw_lvl)
+        x, mask = self.attn(query, key, value)#, key_padding_mask, hw_lvl=hw_lvl)
         query = query + self.drop_path(x)
         query = self.head_norm1(query)
 
@@ -322,7 +321,7 @@ class SegMaskHead(nn.Module):
                  self_attn=False):
         super().__init__()
 
-        self.fp16_enabled = False
+        self.fp16_enabled = fp16_enabled
         mlp_ratio = 4
         qkv_bias = True
         qk_scale = None
@@ -370,24 +369,22 @@ class SegMaskHead(nn.Module):
     @force_fp32(apply_to=('memory', 'mask_memory', 'pos_memory', 'query_embed',
                           'mask_query', 'pos_query'))
     def forward(self, memory, mask_memory, pos_memory, query_embed, mask_query,
-                pos_query, hw_lvl):
+                pos_query):#, hw_lvl):
         if mask_memory is not None and isinstance(mask_memory, torch.Tensor):
             mask_memory = mask_memory.to(torch.bool)
         masks = []
         inter_query = []
         for i, block in enumerate(self.blocks):
-            query_embed, mask = block(self.with_pos_embed(
-                query_embed, pos_query),
+            query_embed, mask = block(self.with_pos_embed(query_embed, pos_query),
                                       self.with_pos_embed(memory, pos_memory),
-                                      memory,
-                                      key_padding_mask=mask_memory,
-                                      hw_lvl=hw_lvl)
+                                      memory,)
+                                    #   key_padding_mask=mask_memory,
+                                    #   hw_lvl=hw_lvl)
             masks.append(mask)
             inter_query.append(query_embed)
-            #if i == 1:
-            #    return mask, masks, inter_query
+
         attn = self.attnen(self.with_pos_embed(query_embed, pos_query),
-                           self.with_pos_embed(memory, pos_memory),
-                           key_padding_mask=mask_memory,
-                           hw_lvl=hw_lvl)
+                           self.with_pos_embed(memory, pos_memory),)
+                        #    key_padding_mask=mask_memory,
+                        #    hw_lvl=hw_lvl)
         return attn, masks, inter_query

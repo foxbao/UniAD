@@ -3,13 +3,18 @@
 import numpy as np
 from mmcv.parallel import DataContainer as DC
 
-from mmdet3d.core.bbox import BaseInstance3DBoxes
-from mmdet3d.core.points import BasePoints
+import sys
+# sys.path.insert(1, '/path/to/UniAD_tensorrt')
+from third_party.uniad_mmdet3d.core.bbox import BaseInstance3DBoxes
+from third_party.uniad_mmdet3d.core.points import BasePoints
+from third_party.uniad_mmdet3d.datasets.pipelines import DefaultFormatBundle3D
+# from mmdet3d.core.bbox import BaseInstance3DBoxes
+# from mmdet3d.core.points import BasePoints
 from mmdet.datasets.builder import PIPELINES
 from mmdet.datasets.pipelines import to_tensor
-from mmdet3d.datasets.pipelines import DefaultFormatBundle3D
+# from mmdet3d.datasets.pipelines import DefaultFormatBundle3D
 
-@PIPELINES.register_module()
+@PIPELINES.register_module(force=True)
 class CustomDefaultFormatBundle3D(DefaultFormatBundle3D):
     """Default formatting bundle.
     It simplifies the pipeline of formatting common fields for voxels,

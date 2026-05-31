@@ -10,8 +10,12 @@ import torch
 import mmcv
 from mmdet.datasets import DATASETS
 from mmdet.datasets.pipelines import to_tensor
-from mmdet3d.datasets import NuScenesDataset
-from mmdet3d.core.bbox import LiDARInstance3DBoxes
+# from mmdet3d.datasets import NuScenesDataset
+import sys
+# sys.path.insert(1, '/path/to/UniAD_tensorrt')
+from third_party.uniad_mmdet3d.datasets import NuScenesDataset
+# from mmdet3d.core.bbox import LiDARInstance3DBoxes
+from third_party.uniad_mmdet3d.core.bbox import LiDARInstance3DBoxes
 
 from os import path as osp
 from nuscenes.eval.common.utils import quaternion_yaw, Quaternion
@@ -34,7 +38,7 @@ from .data_utils.data_utils import lidar_nusc_box_to_global, obtain_map_info, ou
 from nuscenes.prediction import convert_local_coords_to_global
 
 
-@DATASETS.register_module()
+@DATASETS.register_module(force=True)
 class NuScenesE2EDataset(NuScenesDataset):
     r"""NuScenes E2E Dataset.
 
@@ -981,8 +985,7 @@ class NuScenesE2EDataset(NuScenesDataset):
                  result_names=['pts_bbox'],
                  show=False,
                  out_dir=None,
-                 pipeline=None,
-                 planning_evaluation_strategy="uniad"):
+                 pipeline=None):
         """Evaluation in nuScenes protocol.
         Args:
             results (list[dict]): Testing results of the dataset.
@@ -1025,7 +1028,6 @@ class NuScenesE2EDataset(NuScenesDataset):
             if 'planning_results_computed' in results.keys():
                 planning_results_computed = results['planning_results_computed']
                 planning_tab = PrettyTable()
-                planning_tab.title = f"{planning_evaluation_strategy}'s definition planning metrics"
                 planning_tab.field_names = [
                     "metrics", "0.5s", "1.0s", "1.5s", "2.0s", "2.5s", "3.0s"]
                 for key in planning_results_computed.keys():
@@ -1033,14 +1035,7 @@ class NuScenesE2EDataset(NuScenesDataset):
                     row_value = []
                     row_value.append(key)
                     for i in range(len(value)):
-                        if planning_evaluation_strategy == "stp3":
-                            row_value.append("%.4f" % float(value[: i + 1].mean()))
-                        elif planning_evaluation_strategy == "uniad":
-                            row_value.append("%.4f" % float(value[i]))
-                        else:
-                            raise ValueError(
-                                "planning_evaluation_strategy should be uniad or spt3"
-                            )
+                        row_value.append('%.4f' % float(value[i]))
                     planning_tab.add_row(row_value)
                 print(planning_tab)
             results = results['bbox_results']  # get bbox_results
