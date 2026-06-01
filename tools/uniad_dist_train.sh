@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+set -o pipefail
 
 T=`date +%m%d%H%M`
 
@@ -13,6 +14,7 @@ NNODES=`expr $GPUS / $GPUS_PER_NODE`
 MASTER_PORT=${MASTER_PORT:-28599}
 MASTER_ADDR=${MASTER_ADDR:-"127.0.0.1"}
 RANK=${RANK:-0}
+TORCHRUN=${TORCHRUN:-torchrun}
 
 WORK_DIR=$(echo ${CFG%.*} | sed -e "s/configs/work_dirs/g")/
 # Intermediate files and logs will be saved to UniAD/projects/work_dirs/
@@ -22,12 +24,13 @@ if [ ! -d ${WORK_DIR}logs ]; then
 fi
 
 PYTHONPATH="$(dirname $0)/..":$PYTHONPATH \
-python -m torch.distributed.launch \
+${TORCHRUN} \
     --nproc_per_node=${GPUS_PER_NODE} \
     --master_addr=${MASTER_ADDR} \
     --master_port=${MASTER_PORT} \
     --nnodes=${NNODES} \
     --node_rank=${RANK} \
+    --max_restarts=0 \
     $(dirname "$0")/train.py \
     $CFG \
     --launcher pytorch ${@:3} \

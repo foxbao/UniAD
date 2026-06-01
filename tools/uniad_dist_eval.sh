@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+set -o pipefail
 
 T=`date +%m%d%H%M`
 
@@ -11,6 +12,7 @@ GPUS=$3                                              #
 GPUS_PER_NODE=$(($GPUS<8?$GPUS:8))
 
 MASTER_PORT=${MASTER_PORT:-28591}
+TORCHRUN=${TORCHRUN:-torchrun}
 WORK_DIR=$(echo ${CFG%.*} | sed -e "s/configs/work_dirs/g")/
 # Intermediate files and logs will be saved to UniAD/projects/work_dirs/
 
@@ -19,9 +21,10 @@ if [ ! -d ${WORK_DIR}logs ]; then
 fi
 
 PYTHONPATH="$(dirname $0)/..":$PYTHONPATH \
-python -m torch.distributed.launch \
+${TORCHRUN} \
     --nproc_per_node=$GPUS_PER_NODE \
     --master_port=$MASTER_PORT \
+    --max_restarts=0 \
     $(dirname "$0")/test.py \
     $CFG \
     $CKPT \
