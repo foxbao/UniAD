@@ -20,8 +20,6 @@ from mmdet.core import build_assigner
 from mmdet.models import build_loss
 from mmdet.models.builder import LOSSES
 from mmdet.core import reduce_mean
-import sys
-sys.path.insert(1, '/home/labuser/bjyang/BEVFormer_tensorrt')
 from third_party.uniad_mmdet3d.core.bbox.iou_calculators.iou3d_calculator import (
     bbox_overlaps_nearest_3d as iou_3d, )
 from projects.mmdet3d_plugin.core.bbox.util import denormalize_bbox
@@ -82,6 +80,8 @@ class ClipMatcher(nn.Module):
                           alpha=0.25,
                           loss_weight=2.0),
             loss_bbox=dict(type="L1Loss", loss_weight=0.25),
+            with_sdc=True,
+            sdc_query_index=900,
     ):
         """Create the criterion.
         Parameters:
@@ -100,6 +100,8 @@ class ClipMatcher(nn.Module):
 
         self.weight_dict = weight_dict
         self.loss_past_traj_weight = loss_past_traj_weight
+        self.with_sdc = with_sdc
+        self.sdc_query_index = sdc_query_index
         # self.losses = ['labels', 'boxes', 'cardinality']
         self.losses = ["labels", "boxes", "past_trajs"]
         self.focal_loss = True
@@ -192,6 +194,12 @@ class ClipMatcher(nn.Module):
 
     def loss_past_trajs(self, outputs, gt_instances: List[Instances],
                    indices: List[tuple]):
+        if self.loss_past_traj_weight <= 0:
+            pred_trajs = torch.nan_to_num(
+                outputs["pred_past_trajs"], nan=0.0, posinf=0.0,
+                neginf=0.0)
+            return {"loss_past_trajs": pred_trajs.sum() * 0.0}
+
         # We ignore the regression loss of the track-disappear slots.
         # TODO: Make this filter process more elegant.
         filtered_idx = []
@@ -200,7 +208,9 @@ class ClipMatcher(nn.Module):
             filtered_idx.append((src_per_img[keep], tgt_per_img[keep]))
         indices = filtered_idx
         idx = self._get_src_permutation_idx(indices)
-        src_trajs = outputs["pred_past_trajs"][idx]
+        src_trajs = torch.nan_to_num(
+            outputs["pred_past_trajs"][idx], nan=0.0, posinf=0.0,
+            neginf=0.0)
         target_trajs = torch.cat(
             [
                 gt_per_img.past_traj[i]
@@ -208,6 +218,8 @@ class ClipMatcher(nn.Module):
             ],
             dim=0,
         )
+        target_trajs = torch.nan_to_num(
+            target_trajs, nan=0.0, posinf=0.0, neginf=0.0)
         target_trajs_mask = torch.cat(
             [
                 gt_per_img.past_traj_mask[i]
@@ -215,6 +227,8 @@ class ClipMatcher(nn.Module):
             ],
             dim=0,
         )
+        target_trajs_mask = torch.nan_to_num(
+            target_trajs_mask, nan=0.0, posinf=0.0, neginf=0.0)
 
         # for pad target, don't calculate regression loss, judged by whether obj_id=-1
         target_obj_ids = torch.cat(
@@ -233,7 +247,9 @@ class ClipMatcher(nn.Module):
     
     def compute_past_traj_loss(self, src, tgt, tgt_mask):
         loss = torch.abs(src - tgt) * tgt_mask
-        return torch.sum(loss)/ (torch.sum(tgt_mask>0) + 1e-5)
+        avg_factor = torch.sum(tgt_mask > 0).float().clamp(min=1.0)
+        avg_factor = reduce_mean(avg_factor)
+        return torch.sum(loss) / avg_factor.clamp(min=1.0)
 
     def loss_boxes(self, outputs, gt_instances: List[Instances],
                    indices: List[tuple]):
@@ -249,9 +265,8 @@ class ClipMatcher(nn.Module):
             filtered_idx.append((src_per_img[keep], tgt_per_img[keep]))
         indices = filtered_idx
         idx = self._get_src_permutation_idx(indices)
-        src_boxes = outputs["pred_boxes"][idx]
-        sdc_boxes = outputs["pred_sdc_boxes"][0, -1:]
-        target_sdc_boxes = gt_instances[0].sdc_boxes[:1]
+        src_boxes = torch.nan_to_num(
+            outputs["pred_boxes"][idx], nan=0.0, posinf=0.0, neginf=0.0)
         target_boxes = torch.cat(
             [
                 gt_per_img.boxes[i]
@@ -259,9 +274,8 @@ class ClipMatcher(nn.Module):
             ],
             dim=0,
         )
-        
-        src_boxes = torch.cat([src_boxes, sdc_boxes], dim=0)
-        target_boxes = torch.cat([target_boxes, target_sdc_boxes], dim=0)
+        target_boxes = torch.nan_to_num(
+            target_boxes, nan=0.0, posinf=0.0, neginf=0.0)
 
         # for pad target, don't calculate regression loss, judged by whether obj_id=-1
         target_obj_ids = torch.cat(
@@ -273,11 +287,22 @@ class ClipMatcher(nn.Module):
         )
         # [num_matched]
 
-        target_obj_ids = torch.cat([target_obj_ids, torch.zeros(1).to(target_obj_ids.device)], dim=0)
+        if self.with_sdc:
+            sdc_boxes = outputs["pred_sdc_boxes"][0, -1:]
+            target_sdc_boxes = gt_instances[0].sdc_boxes[:1]
+            src_boxes = torch.cat([src_boxes, sdc_boxes], dim=0)
+            target_boxes = torch.cat([target_boxes, target_sdc_boxes], dim=0)
+            target_obj_ids = torch.cat([
+                target_obj_ids,
+                torch.zeros(1).to(target_obj_ids.device)
+            ], dim=0)
         mask = target_obj_ids != -1
         bbox_weights = torch.ones_like(target_boxes) * self.code_weights
         avg_factor = src_boxes[mask].size(0)
         avg_factor = reduce_mean(target_boxes.new_tensor([avg_factor]))
+        avg_factor = torch.clamp(avg_factor, min=1.0)
+        if mask.sum() == 0:
+            return {"loss_bbox": src_boxes.sum() * 0}
         loss_bbox = self.loss_bboxes(
             src_boxes[mask],
             target_boxes[mask],
@@ -301,7 +326,9 @@ class ClipMatcher(nn.Module):
         indices: [(src_idx, tgt_idx)]
         """
         # [bs=1, num_query, num_classes]
-        src_logits = outputs["pred_logits"]
+        src_logits = torch.nan_to_num(
+            outputs["pred_logits"], nan=0.0, posinf=50.0, neginf=-50.0)
+        src_logits = src_logits.clamp(min=-50.0, max=50.0)
         sdc_logits = outputs["pred_sdc_logits"]
         # batch_idx, src_idx
         idx = self._get_src_permutation_idx(indices)
@@ -324,17 +351,19 @@ class ClipMatcher(nn.Module):
         target_classes_o = torch.cat(labels)
         # [bs, num_query]
         target_classes[idx] = target_classes_o
-        target_sdc_classes = gt_instances[0].sdc_labels[0:1].unsqueeze(0)
-        if sdc_logits is not None:
+        if self.with_sdc and sdc_logits is not None:
+            target_sdc_classes = gt_instances[0].sdc_labels[0:1].unsqueeze(0)
             src_logits = torch.cat([src_logits, sdc_logits], dim=1)
             target_classes = torch.cat([target_classes, target_sdc_classes], dim=1)
         label_weights = torch.ones_like(target_classes)
         # float tensor
         avg_factor = target_classes_o.numel(
         )  # pos + mathced gt for disapper track
-        avg_factor += 1 # sdc
+        if self.with_sdc:
+            avg_factor += 1 # sdc
         
         avg_factor = reduce_mean(src_logits.new_tensor([avg_factor]))
+        avg_factor = torch.clamp(avg_factor, min=1.0)
         loss_ce = self.loss_cls(
             src_logits.flatten(0, 1),
             target_classes.flatten(0),
@@ -364,14 +393,30 @@ class ClipMatcher(nn.Module):
         gt_instances_i = self.gt_instances[
             self._current_frame_idx]  # gt instances of i-th image.
         track_instances: Instances = outputs_without_aux["track_instances"]
-        pred_logits_i = track_instances.pred_logits
-        pred_boxes_i = track_instances.pred_boxes
-        # modified the hard code, 900:901, sdc query
-        pred_sdc_logits_i = track_instances.pred_logits[900:901].unsqueeze(0) 
-        pred_sdc_boxes_i = track_instances.pred_boxes[900:901].unsqueeze(0) 
-        # -2 means the sdc query in this code
-        track_instances.obj_idxes[900]=-2
-        pred_past_trajs_i = track_instances.pred_past_trajs  # predicted past trajs of i-th image.
+        pred_logits_i = torch.nan_to_num(
+            track_instances.pred_logits, nan=0.0, posinf=50.0,
+            neginf=-50.0).clamp(min=-50.0, max=50.0)
+        pred_boxes_i = torch.nan_to_num(
+            track_instances.pred_boxes, nan=0.0, posinf=0.0, neginf=0.0)
+        track_instances.pred_logits = pred_logits_i
+        track_instances.pred_boxes = pred_boxes_i
+        if self.with_sdc:
+            # -2 means the SDC query in this code.
+            sdc_idx = self.sdc_query_index
+            pred_sdc_logits_i = (
+                track_instances.pred_logits[sdc_idx:sdc_idx + 1]
+                .unsqueeze(0))
+            pred_sdc_boxes_i = (
+                track_instances.pred_boxes[sdc_idx:sdc_idx + 1]
+                .unsqueeze(0))
+            track_instances.obj_idxes[sdc_idx] = -2
+        else:
+            pred_sdc_logits_i = None
+            pred_sdc_boxes_i = None
+        pred_past_trajs_i = torch.nan_to_num(
+            track_instances.pred_past_trajs, nan=0.0, posinf=0.0,
+            neginf=0.0)  # predicted past trajs of i-th image.
+        track_instances.pred_past_trajs = pred_past_trajs_i
 
         obj_idxes = gt_instances_i.obj_ids
         obj_idxes_list = obj_idxes.detach().cpu().numpy().tolist()
@@ -451,7 +496,13 @@ class ClipMatcher(nn.Module):
                 gt_bboxes = torch.cat([v["boxes"] for v in targets])
 
             bbox_pred = bbox_preds[0]
-            cls_pred = cls_preds[0]
+            bbox_pred = torch.nan_to_num(
+                bbox_pred, nan=0.0, posinf=0.0, neginf=0.0)
+            cls_pred = torch.nan_to_num(
+                cls_preds[0], nan=0.0, posinf=50.0,
+                neginf=-50.0).clamp(min=-50.0, max=50.0)
+            gt_bboxes = torch.nan_to_num(
+                gt_bboxes, nan=0.0, posinf=0.0, neginf=0.0)
 
             src_idx, tgt_idx = matcher.assign(bbox_pred, cls_pred, gt_bboxes,
                                               gt_labels)
@@ -494,9 +545,15 @@ class ClipMatcher(nn.Module):
                     gt_boxes = gt_instances_i.boxes[
                         track_instances.matched_gt_idxes[active_idxes]]
                     iou_3ds = iou_3d(
-                        denormalize_bbox(gt_boxes, None)[..., :7],
-                        denormalize_bbox(active_track_boxes, None)[..., :7],
+                        torch.nan_to_num(
+                            denormalize_bbox(gt_boxes, None), nan=0.0,
+                            posinf=0.0, neginf=0.0)[..., :7],
+                        torch.nan_to_num(
+                            denormalize_bbox(active_track_boxes, None),
+                            nan=0.0, posinf=0.0, neginf=0.0)[..., :7],
                     )
+                    iou_3ds = torch.nan_to_num(
+                        iou_3ds, nan=0.0, posinf=0.0, neginf=0.0)
                     track_instances.iou[active_idxes] = torch.tensor([
                         iou_3ds[i, i] for i in range(gt_boxes.shape[0])
                     ]).to(gt_boxes.device)
@@ -535,8 +592,11 @@ class ClipMatcher(nn.Module):
                 }
                 new_matched_indices_layer = match_for_single_decoder_layer(
                     unmatched_outputs_layer, self.matcher)
-                matched_indices_layer = torch.cat(
-                    [new_matched_indices_layer, prev_matched_indices], dim=0)
+                if new_matched_indices_layer is not None:
+                    matched_indices_layer = torch.cat(
+                        [new_matched_indices_layer, prev_matched_indices], dim=0)
+                else:
+                    matched_indices_layer = prev_matched_indices
                 for loss in self.losses:
                     if loss == "masks":
                         # Intermediate masks losses are too costly to compute, we ignore them.
@@ -616,6 +676,6 @@ class ClipMatcher(nn.Module):
                 self.losses_dict["pred_loss_{}".format(i)] = pred_loss_i
             else:
                 self.losses_dict["pred_loss_{}".format(i)] = torch.tensor(
-                    [0.0]).cuda()
+                    [0.0], device=pred_boxes_i.device)
 
             decay_ratio = decay_ratio * 0.5
