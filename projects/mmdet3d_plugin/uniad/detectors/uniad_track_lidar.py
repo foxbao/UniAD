@@ -1126,10 +1126,14 @@ class UniADTrackLidar(MVXTwoStageDetector):
             losses.update(
                 self.loss_weighted_and_prefixed(losses_seg, prefix='map'))
 
-        return {
-            key: torch.nan_to_num(value, nan=0.0, posinf=1e4, neginf=-1e4)
-            for key, value in sorted(losses.items())
-        }
+        sanitized_losses = {}
+        for key, value in sorted(losses.items()):
+            if not torch.isfinite(value).all():
+                raise FloatingPointError(
+                    f'Non-finite training loss in {key}: '
+                    f'{value.detach().cpu()}')
+            sanitized_losses[key] = value
+        return sanitized_losses
 
     def simple_test(self, points, img_metas, img=None, history_points=None,
                     **kwargs):
