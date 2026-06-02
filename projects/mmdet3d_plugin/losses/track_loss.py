@@ -122,6 +122,15 @@ class ClipMatcher(nn.Module):
         tgt_idx = torch.cat([tgt for (_, tgt) in indices])
         return batch_idx, tgt_idx
 
+    @staticmethod
+    def _check_finite_tensor(name, value):
+        if not torch.isfinite(value).all():
+            bad_count = (~torch.isfinite(value.detach())).sum().item()
+            raise FloatingPointError(
+                f'Non-finite ClipMatcher tensor in {name}: '
+                f'shape={tuple(value.shape)}, bad_count={bad_count}')
+        return value
+
     def initialize_for_single_clip(self, gt_instances: List[Instances]):
         self.gt_instances = gt_instances
         self.num_samples = 0
@@ -208,9 +217,8 @@ class ClipMatcher(nn.Module):
             filtered_idx.append((src_per_img[keep], tgt_per_img[keep]))
         indices = filtered_idx
         idx = self._get_src_permutation_idx(indices)
-        src_trajs = torch.nan_to_num(
-            outputs["pred_past_trajs"][idx], nan=0.0, posinf=0.0,
-            neginf=0.0)
+        src_trajs = self._check_finite_tensor(
+            'pred_past_trajs', outputs["pred_past_trajs"][idx])
         target_trajs = torch.cat(
             [
                 gt_per_img.past_traj[i]
@@ -265,8 +273,8 @@ class ClipMatcher(nn.Module):
             filtered_idx.append((src_per_img[keep], tgt_per_img[keep]))
         indices = filtered_idx
         idx = self._get_src_permutation_idx(indices)
-        src_boxes = torch.nan_to_num(
-            outputs["pred_boxes"][idx], nan=0.0, posinf=0.0, neginf=0.0)
+        src_boxes = self._check_finite_tensor(
+            'pred_boxes', outputs["pred_boxes"][idx])
         target_boxes = torch.cat(
             [
                 gt_per_img.boxes[i]
@@ -289,6 +297,7 @@ class ClipMatcher(nn.Module):
 
         if self.with_sdc:
             sdc_boxes = outputs["pred_sdc_boxes"][0, -1:]
+            self._check_finite_tensor('pred_sdc_boxes', sdc_boxes)
             target_sdc_boxes = gt_instances[0].sdc_boxes[:1]
             src_boxes = torch.cat([src_boxes, sdc_boxes], dim=0)
             target_boxes = torch.cat([target_boxes, target_sdc_boxes], dim=0)
@@ -326,10 +335,14 @@ class ClipMatcher(nn.Module):
         indices: [(src_idx, tgt_idx)]
         """
         # [bs=1, num_query, num_classes]
-        src_logits = torch.nan_to_num(
-            outputs["pred_logits"], nan=0.0, posinf=50.0, neginf=-50.0)
-        src_logits = src_logits.clamp(min=-50.0, max=50.0)
+        src_logits = self._check_finite_tensor(
+            'pred_logits', outputs["pred_logits"]).clamp(
+                min=-50.0, max=50.0)
         sdc_logits = outputs["pred_sdc_logits"]
+        if sdc_logits is not None:
+            sdc_logits = self._check_finite_tensor(
+                'pred_sdc_logits', sdc_logits).clamp(
+                    min=-50.0, max=50.0)
         # batch_idx, src_idx
         idx = self._get_src_permutation_idx(indices)
         # [bs, num_query]
@@ -393,6 +406,14 @@ class ClipMatcher(nn.Module):
         gt_instances_i = self.gt_instances[
             self._current_frame_idx]  # gt instances of i-th image.
         track_instances: Instances = outputs_without_aux["track_instances"]
+        self._check_finite_tensor(
+            'track_instances.pred_logits', track_instances.pred_logits)
+        self._check_finite_tensor(
+            'track_instances.pred_boxes', track_instances.pred_boxes)
+        if self.loss_past_traj_weight > 0:
+            self._check_finite_tensor(
+                'track_instances.pred_past_trajs',
+                track_instances.pred_past_trajs)
         pred_logits_i = torch.nan_to_num(
             track_instances.pred_logits, nan=0.0, posinf=50.0,
             neginf=-50.0).clamp(min=-50.0, max=50.0)

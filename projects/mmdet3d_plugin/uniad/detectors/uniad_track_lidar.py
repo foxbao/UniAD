@@ -582,6 +582,15 @@ class UniADTrackLidar(MVXTwoStageDetector):
             output_past_trajs, nan=0.0, posinf=0.0, neginf=0.0)
         return output_classes, output_coords, output_past_trajs
 
+    @staticmethod
+    def _check_finite_tensor(name, value):
+        if not torch.isfinite(value).all():
+            bad_count = (~torch.isfinite(value.detach())).sum().item()
+            raise FloatingPointError(
+                f'Non-finite UniADTrackLidar tensor in {name}: '
+                f'shape={tuple(value.shape)}, bad_count={bad_count}')
+        return value
+
     def _track_instances2results(self, track_instances, img_metas,
                                  with_mask=True):
         if isinstance(img_metas, (list, tuple)) and len(img_metas) == 1 and \
@@ -893,6 +902,11 @@ class UniADTrackLidar(MVXTwoStageDetector):
         output_past_trajs = det_output['all_past_traj_preds']
         last_ref_pts = det_output['last_ref_points']
         query_feats = det_output['query_feats']
+        self._check_finite_tensor('all_cls_scores', output_classes)
+        self._check_finite_tensor('all_bbox_preds', output_coords)
+        if getattr(self.criterion, 'loss_past_traj_weight', 0.0) > 0:
+            self._check_finite_tensor('all_past_traj_preds',
+                                      output_past_trajs)
         output_classes, output_coords, output_past_trajs = \
             self._sanitize_track_outputs(output_classes, output_coords,
                                          output_past_trajs)
