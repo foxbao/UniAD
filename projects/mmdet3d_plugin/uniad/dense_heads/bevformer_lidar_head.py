@@ -478,6 +478,17 @@ class BEVFormerLidarHead(BaseModule):
         return (list(labels), list(label_weights), list(bbox_targets),
                 list(bbox_weights), num_total_pos, num_total_neg)
 
+    @staticmethod
+    def _check_finite_loss(name: str, value: Optional[Tensor]
+                           ) -> Optional[Tensor]:
+        if value is None:
+            return None
+        if not torch.isfinite(value).all():
+            raise FloatingPointError(
+                f'Non-finite BEVFormerLidarHead loss in {name}: '
+                f'{value.detach().cpu()}')
+        return value
+
     def loss_by_feat_single(self, batch_cls_scores: Tensor,
                             batch_bbox_preds: Tensor,
                             gt_bboxes_list: List,
@@ -563,10 +574,13 @@ class BEVFormerLidarHead(BaseModule):
                     pred_bev, tgt_bev, avg_factor=num_total_pos)
             else:
                 loss_iou = bbox_preds.new_zeros(())
-        return (torch.nan_to_num(loss_cls), torch.nan_to_num(loss_bbox),
-                torch.nan_to_num(loss_iou) if loss_iou is not None else None,
-                torch.nan_to_num(vel_l1).detach(),
-                torch.nan_to_num(vel_l2).detach())
+        loss_cls = self._check_finite_loss('loss_cls', loss_cls)
+        loss_bbox = self._check_finite_loss('loss_bbox', loss_bbox)
+        loss_iou = self._check_finite_loss('loss_iou', loss_iou)
+        vel_l1 = self._check_finite_loss('vel_l1', vel_l1)
+        vel_l2 = self._check_finite_loss('vel_l2', vel_l2)
+        return (loss_cls, loss_bbox, loss_iou, vel_l1.detach(),
+                vel_l2.detach())
 
     def loss_by_feat(self, preds: dict, gt_bboxes_list: List,
                      gt_labels_list: List[Tensor]) -> dict:
