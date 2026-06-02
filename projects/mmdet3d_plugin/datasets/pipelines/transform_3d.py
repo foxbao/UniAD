@@ -3,8 +3,6 @@ from numpy import random
 import mmcv
 from mmdet.datasets.builder import PIPELINES
 from mmcv.parallel import DataContainer as DC
-import sys
-sys.path.insert(1, '/home/labuser/bjyang/BEVFormer_tensorrt')
 from third_party.uniad_mmdet3d.datasets.pipelines import ObjectRangeFilter, ObjectNameFilter
 from third_party.uniad_mmdet3d.core.bbox import CameraInstance3DBoxes, DepthInstance3DBoxes, LiDARInstance3DBoxes
 
@@ -445,6 +443,60 @@ class ObjectNameFilterTrack(object):
         repr_str = self.__class__.__name__
         repr_str += f'(classes={self.classes})'
         return repr_str
+
+
+@PIPELINES.register_module(force=True)
+class PointShuffle(object):
+    """Shuffle input points and aligned point-level masks."""
+
+    def __call__(self, input_dict):
+        idx = input_dict['points'].shuffle()
+        idx = idx.cpu().numpy()
+
+        pts_instance_mask = input_dict.get('pts_instance_mask', None)
+        pts_semantic_mask = input_dict.get('pts_semantic_mask', None)
+
+        if pts_instance_mask is not None:
+            input_dict['pts_instance_mask'] = pts_instance_mask[idx]
+
+        if pts_semantic_mask is not None:
+            input_dict['pts_semantic_mask'] = pts_semantic_mask[idx]
+
+        return input_dict
+
+    def __repr__(self):
+        return self.__class__.__name__
+
+
+@PIPELINES.register_module(force=True)
+class PointsRangeFilter(object):
+    """Filter input points by 3D point cloud range."""
+
+    def __init__(self, point_cloud_range):
+        self.pcd_range = np.array(point_cloud_range, dtype=np.float32)
+
+    def __call__(self, input_dict):
+        points = input_dict['points']
+        points_mask = points.in_range_3d(self.pcd_range)
+        input_dict['points'] = points[points_mask]
+        points_mask = points_mask.cpu().numpy()
+
+        pts_instance_mask = input_dict.get('pts_instance_mask', None)
+        pts_semantic_mask = input_dict.get('pts_semantic_mask', None)
+
+        if pts_instance_mask is not None:
+            input_dict['pts_instance_mask'] = pts_instance_mask[points_mask]
+
+        if pts_semantic_mask is not None:
+            input_dict['pts_semantic_mask'] = pts_semantic_mask[points_mask]
+
+        return input_dict
+
+    def __repr__(self):
+        repr_str = self.__class__.__name__
+        repr_str += f'(point_cloud_range={self.pcd_range.tolist()})'
+        return repr_str
+
 
 @PIPELINES.register_module(force=True)
 class CustomObjectRangeFilter(ObjectRangeFilter):
