@@ -7,6 +7,7 @@ import sklearn
 import mmcv
 import copy
 import os
+import re
 import time
 import warnings
 from mmcv import Config, DictAction
@@ -28,12 +29,45 @@ warnings.filterwarnings("ignore")
 from mmcv.utils import TORCH_VERSION, digit_version
 
 
+def _find_latest_checkpoint(work_dir):
+    """Find the newest checkpoint in work_dir for auto-resume."""
+    if work_dir is None:
+        return None
+
+    work_dir = osp.abspath(work_dir)
+    if not osp.isdir(work_dir):
+        return None
+
+    latest_path = osp.join(work_dir, 'latest.pth')
+    if osp.isfile(latest_path):
+        return latest_path
+
+    checkpoint_pattern = re.compile(r'^(epoch|iter)_(\d+)\.pth$')
+    checkpoints = []
+    for filename in os.listdir(work_dir):
+        match = checkpoint_pattern.match(filename)
+        if match is None:
+            continue
+        priority = 1 if match.group(1) == 'epoch' else 0
+        checkpoints.append(
+            (int(match.group(2)), priority, osp.join(work_dir, filename)))
+
+    if not checkpoints:
+        return None
+
+    return max(checkpoints)[2]
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description='Train a detector')
     parser.add_argument('config', help='train config file path')
     parser.add_argument('--work-dir', help='the dir to save logs and models')
     parser.add_argument(
         '--resume-from', help='the checkpoint file to resume from')
+    parser.add_argument(
+        '--resume',
+        action='store_true',
+        help='auto resume from the latest checkpoint in work_dir')
     parser.add_argument(
         '--no-validate',
         action='store_true',
@@ -145,9 +179,15 @@ def main():
         # use config filename as default work_dir if cfg.work_dir is None
         cfg.work_dir = osp.join('./work_dirs',
                                 osp.splitext(osp.basename(args.config))[0])
-    # if args.resume_from is not None:
     if args.resume_from is not None and osp.isfile(args.resume_from):
         cfg.resume_from = args.resume_from
+    elif args.resume:
+        latest_checkpoint = _find_latest_checkpoint(cfg.work_dir)
+        if latest_checkpoint is None:
+            raise FileNotFoundError(
+                f'--resume is specified, but no latest.pth, epoch_*.pth, '
+                f'or iter_*.pth checkpoint was found in {cfg.work_dir}')
+        cfg.resume_from = latest_checkpoint
     if args.gpu_ids is not None:
         cfg.gpu_ids = args.gpu_ids
     else:

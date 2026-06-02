@@ -23,6 +23,7 @@ from ..utils.bricks import run_time
 from mmcv.runner import force_fp32, auto_fp16
 
 
+@TRANSFORMER.register_module(name="BEVFormerPerceptionTransformer", force=True)
 @TRANSFORMER.register_module()
 class PerceptionTransformer(BaseModule):
     """Implements the Detr3D transformer.
