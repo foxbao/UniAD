@@ -167,6 +167,11 @@ def custom_multi_gpu_test(model, data_loader, tmpdir=None, gpu_collect=False):
         planning_results = planning_metrics.compute()
         planning_metrics.reset()
 
+    # Pure BEVFormer detection datasets expect a plain list of bbox results.
+    # UniAD/e2e datasets need the dict below for mask/occ/planning metrics.
+    if not eval_occ and not eval_planning and mask_results is None:
+        return bbox_results
+
     ret_results = dict()
     ret_results['bbox_results'] = bbox_results
     if eval_occ:
