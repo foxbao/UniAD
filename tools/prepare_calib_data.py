@@ -368,6 +368,9 @@ def main():
     prev_angle = 0
     shape0 = 901
     shape0_dict = {}
+    num_calib_data = 0
+    npz_data = {}
+    calib_data_path = os.path.join(os.getcwd(), 'calib_data_shape0_' + str(shape0) + '.npz')
     for sample_id, data in tqdm(enumerate(data_loader)):
         img_metas = data["img_metas"][0].data
         timestamp = data["timestamp"][0] if data["timestamp"] is not None else None
@@ -497,15 +500,15 @@ def main():
             
         else:
             # save calibration data
-            num_calib_data = 0
             if shape0 == onnx_inputs['prev_track_intances0'].shape[0]:
                 for key in onnx_input_shapes.keys():
                     if key not in onnx_inputs:
-                        npz_data = {}
+                        continue
+                    if key not in npz_data:
                         npz_data[key] = onnx_inputs[key].detach().cpu().numpy()
                     else:
                         npz_data[key] = np.concatenate([npz_data[key], onnx_inputs[key].detach().cpu().numpy()], axis=0)
-                np.savez('/workspace/UniAD/calib_data_shape0_'+str(shape0)+'.npz', **npz_data)
+                np.savez(calib_data_path, **npz_data)
                 num_calib_data += 1
                 print('num_calib_data: ', num_calib_data)
 
