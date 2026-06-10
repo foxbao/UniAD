@@ -8,6 +8,7 @@ import time
 import mmcv
 import torch
 import torch.distributed as dist
+from mmcv.parallel import DataContainer
 from mmcv.runner import get_dist_info
 
 from ..dense_heads.occ_head_plugin import IntersectionOverUnion, PanopticMetric
@@ -37,6 +38,21 @@ def custom_encode_mask_results(mask_results):
                         dtype='uint8'))[0])  # encoded with RLE
     return [encoded_mask_results]
 
+
+def _unwrap_model(model):
+    return model.module if hasattr(model, 'module') else model
+
+
+def _scatter_data_for_eval(model, data):
+    """Scatter MMCV DataContainer batches before direct DDP eval forward."""
+    if not isinstance(data.get('points'), DataContainer):
+        return model, data
+    if not hasattr(model, 'scatter') or not getattr(model, 'device_ids', None):
+        return model, data
+    _, scattered_kwargs = model.scatter((), data, model.device_ids)
+    return _unwrap_model(model), scattered_kwargs[0]
+
+
 def custom_multi_gpu_test(model, data_loader, tmpdir=None, gpu_collect=False):
     """Test model with multiple gpus.
     This method tests model with multiple gpus and collects the results
@@ -56,8 +72,9 @@ def custom_multi_gpu_test(model, data_loader, tmpdir=None, gpu_collect=False):
     model.eval()
 
     # Occ eval init
-    eval_occ = hasattr(model.module, 'with_occ_head') \
-                and model.module.with_occ_head
+    model_to_eval = _unwrap_model(model)
+    eval_occ = hasattr(model_to_eval, 'with_occ_head') \
+                and model_to_eval.with_occ_head
     if eval_occ:
         # 30mx30m, 100mx100m at 50cm resolution
         EVALUATION_RANGES = {'8x8': (17, 33), '25x25': (0, 50)}
@@ -70,8 +87,8 @@ def custom_multi_gpu_test(model, data_loader, tmpdir=None, gpu_collect=False):
             panoptic_metrics[key] = PanopticMetric(n_classes=n_classes, temporally_consistent=True).cuda()
     
     # Plan eval init
-    eval_planning =  hasattr(model.module, 'with_planning_head') \
-                      and model.module.with_planning_head
+    eval_planning =  hasattr(model_to_eval, 'with_planning_head') \
+                      and model_to_eval.with_planning_head
     if eval_planning:
         planning_metrics = PlanningMetric(conf={
             'xbound': [-12.5, 12.5, 0.5],
@@ -90,7 +107,8 @@ def custom_multi_gpu_test(model, data_loader, tmpdir=None, gpu_collect=False):
     num_occ = 0
     for i, data in enumerate(data_loader):
         with torch.no_grad():
-            result = model(return_loss=False, rescale=True, **data)
+            forward_model, data = _scatter_data_for_eval(model, data)
+            result = forward_model(return_loss=False, rescale=True, **data)
 
             # EVAL planning
             if eval_planning:
