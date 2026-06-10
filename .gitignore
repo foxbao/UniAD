@@ -150,3 +150,6 @@ debug/
 *projs/
 
 core.*
+
+# Local deployment/golden dump artifacts
+dumped_inputs/
