@@ -150,3 +150,10 @@ debug/
 *projs/
 
 core.*
+
+# TensorRT export and validation artifacts
+onnx/
+engine/
+dumped_inputs/
+nuscenes_np/
+calib_data_shape*.npz
