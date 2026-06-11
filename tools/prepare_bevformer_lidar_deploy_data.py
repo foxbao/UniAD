@@ -72,7 +72,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-frames", type=int, default=1)
     parser.add_argument(
         "--out-dir",
-        default="dumped_inputs/bevformer_lidar_deploy_data_epoch2",
+        default="dumped_inputs/bevformer_lidar_deploy_data",
         help="Output directory for deployment input files.")
     parser.add_argument(
         "--no-gt",
