@@ -463,8 +463,19 @@ class BEVFormerLidarHead(BaseModule):
         return self.forward(feats, object_query_embeds=object_query_embeds,
                             ref_points=ref_points)
 
-    def get_detections_trt(self, bev_embed: Tensor) -> dict:
-        return self.forward([bev_embed])
+    def get_detections_trt(self,
+                           bev_embed: Tensor,
+                           object_query_embeds: Optional[Tensor] = None,
+                           ref_points: Optional[Tensor] = None):
+        outs = self.forward(
+            [bev_embed],
+            object_query_embeds=object_query_embeds,
+            ref_points=ref_points)
+        if object_query_embeds is None and ref_points is None:
+            return outs
+        return (outs['all_cls_scores'], outs['all_bbox_preds'],
+                outs['all_past_traj_preds'], outs['last_ref_points'],
+                outs['query_feats'])
 
     # ------------------------- target / loss ------------------------------
 
@@ -698,3 +709,8 @@ class BEVFormerLidarTrackHead(BEVFormerLidarHead):
         kwargs['with_track_branch'] = True
         kwargs.setdefault('detector_owns_queries', True)
         super().__init__(*args, **kwargs)
+
+
+@HEADS.register_module()
+class BEVFormerLidarTrackHeadTRTP(BEVFormerLidarTrackHead):
+    """LiDAR BEVFormer track head configured for TensorRT plugin export."""
