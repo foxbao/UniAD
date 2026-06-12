@@ -30,6 +30,7 @@ class OccHead(BaseModule):
 
                  # BEV
                  grid_conf = None,
+                 bev_grid_conf=None,
 
                  bev_size=(200, 200),
                  bev_emb_dim=256,
@@ -70,11 +71,12 @@ class OccHead(BaseModule):
         self.spatial_extent = spatial_extent
         self.ignore_index  = ignore_index
 
-        bevformer_bev_conf = {
+        default_bev_grid_conf = {
             'xbound': [-51.2, 51.2, 0.512],
             'ybound': [-51.2, 51.2, 0.512],
             'zbound': [-10.0, 10.0, 20.0],
         }
+        bevformer_bev_conf = bev_grid_conf or default_bev_grid_conf
         self.bev_sampler =  BevFeatureSlicer(bevformer_bev_conf, grid_conf)
         self.bevslicer = bevslicer
         
@@ -234,8 +236,8 @@ class OccHead(BaseModule):
             temporal_embed_for_mask_attn.append(cur_ins_emb_for_mask_attn)
 
             # cur_state = rearrange(cur_state, 'b c h w -> (h w) b c')
-            b,c,h,w=cur_state.shape
-            cur_state = cur_state.view(b,c,h*w).permute(2,0,1)
+            b, c, h, w = cur_state.shape
+            cur_state = cur_state.view(b, c, h * w).permute(2, 0, 1)
             # cur_ins_query = rearrange(cur_ins_query, 'b q c -> q b c')
             cur_ins_query=cur_ins_query.permute(1,0,2)
 
@@ -254,9 +256,8 @@ class OccHead(BaseModule):
                 )  # out size: [h'*w', b, c]
 
             # cur_state = rearrange(cur_state, '(h w) b c -> b c h w', h=self.bev_size[0]//8)
-            cur_state_h = int(cur_state.shape[0]**0.5)
             _, b, c = cur_state.shape
-            cur_state = cur_state.permute(1,2,0).view(b,c,cur_state_h,cur_state_h)
+            cur_state = cur_state.permute(1, 2, 0).view(b, c, h, w)
             
             # Upscale to /4
             cur_state = self.upsample_adds[i](cur_state, last_state)

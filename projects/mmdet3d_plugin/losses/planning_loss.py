@@ -28,21 +28,37 @@ class PlanningLoss(nn.Module):
 
 @LOSSES.register_module(force=True)
 class CollisionLoss(nn.Module):
-    def __init__(self, delta=0.5, weight=1.0):
+    def __init__(self,
+                 delta=0.5,
+                 weight=1.0,
+                 ego_width=1.85,
+                 ego_length=4.084,
+                 coordinate_frame='rfu'):
         super(CollisionLoss, self).__init__()
-        self.w = 1.85 + delta
-        self.h = 4.084 + delta
+        self.w = ego_width + delta
+        self.h = ego_length + delta
         self.weight = weight
+        self.coordinate_frame = coordinate_frame.lower()
+        assert self.coordinate_frame in ['rfu', 'flu']
     
     def forward(self, sdc_traj_all, sdc_planning_gt, sdc_planning_gt_mask, future_gt_bbox):
         # sdc_traj_all (1, 6, 2)
         # sdc_planning_gt (1,6,3)
-        # sdc_planning_gt_mask (1, 6)
+        # sdc_planning_gt_mask: [1, 6] or [1, 6, 3]
         # future_gt_bbox 6x[lidarboxinstance]
         n_futures = len(future_gt_bbox)
         inter_sum = sdc_traj_all.new_zeros(1, )
+        if sdc_planning_gt_mask is not None:
+            step_valid = sdc_planning_gt_mask[..., 0] \
+                if sdc_planning_gt_mask.shape[-1] == 3 \
+                else sdc_planning_gt_mask
+            step_valid = step_valid.reshape(-1) > 0.5
+        else:
+            step_valid = None
         dump_sdc = []
         for i in range(n_futures):
+            if step_valid is not None and i < step_valid.numel() and not bool(step_valid[i]):
+                continue
             if len(future_gt_bbox[i].tensor) > 0:
                 future_gt_bbox_corners = future_gt_bbox[i].corners[:, [0,3,4,7], :2] # (N, 8, 3) -> (N, 4, 2) only bev 
                 # sdc_yaw = -sdc_planning_gt[0, i, 2].to(sdc_traj_all.dtype) - 1.5708
@@ -66,12 +82,21 @@ class CollisionLoss(nn.Module):
 
     def to_corners(self, bbox):
         x, y, w, l, theta = bbox
-        corners = torch.tensor([
-            [w/2, -l/2], [w/2, l/2], [-w/2, l/2], [-w/2,-l/2]  
-        ]).to(x.device) # 4,2
-        rot_mat = torch.tensor(
-            [[torch.cos(theta), torch.sin(theta)],
-             [-torch.sin(theta), torch.cos(theta)]]
-        ).to(x.device)
+        if self.coordinate_frame == 'flu':
+            corners = torch.tensor([
+                [l/2, w/2], [l/2, -w/2], [-l/2, -w/2], [-l/2, w/2]
+            ]).to(x.device)
+            rot_mat = torch.tensor(
+                [[torch.cos(theta), -torch.sin(theta)],
+                 [torch.sin(theta), torch.cos(theta)]]
+            ).to(x.device)
+        else:
+            corners = torch.tensor([
+                [w/2, -l/2], [w/2, l/2], [-w/2, l/2], [-w/2, -l/2]
+            ]).to(x.device)
+            rot_mat = torch.tensor(
+                [[torch.cos(theta), torch.sin(theta)],
+                 [-torch.sin(theta), torch.cos(theta)]]
+            ).to(x.device)
         new_corners = rot_mat @ corners.T + torch.tensor(bbox[:2])[:, None].to(x.device)
         return new_corners.T

@@ -9,7 +9,13 @@ import os
 
 @PIPELINES.register_module(force=True)
 class GenerateOccFlowLabels(object):
-    def __init__(self, grid_conf, ignore_index=255, only_vehicle=True, filter_invisible=True, deal_instance_255=False):
+    def __init__(self,
+                 grid_conf,
+                 ignore_index=255,
+                 only_vehicle=True,
+                 filter_invisible=True,
+                 deal_instance_255=False,
+                 filter_cls_ids=None):
         self.grid_conf = grid_conf
         self.bev_resolution, self.bev_start_position, self.bev_dimension = calculate_birds_eye_view_parameters(
             grid_conf['xbound'], grid_conf['ybound'], grid_conf['zbound'],
@@ -37,7 +43,9 @@ class GenerateOccFlowLabels(object):
         self.plan_cls_ids = np.array([nusc_classes.index(
             cls_name) for cls_name in plan_classes])
         
-        if only_vehicle:
+        if filter_cls_ids is not None:
+            self.filter_cls_ids = np.array(filter_cls_ids, dtype=np.int64)
+        elif only_vehicle:
             self.filter_cls_ids = self.vehicle_cls_ids
         else:
             self.filter_cls_ids = self.plan_cls_ids
