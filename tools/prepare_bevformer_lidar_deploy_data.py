@@ -188,15 +188,28 @@ def to_jsonable(value):
 def points_to_numpy(points) -> np.ndarray:
     points = unwrap_data(points)
     if isinstance(points, (list, tuple)):
-        if len(points) != 1:
-            raise ValueError(f"Expected one point tensor, got {len(points)}.")
-        points = points[0]
+        if len(points) == 0:
+            raise ValueError("Expected at least one point tensor, got 0.")
+        # Track datasets return a temporal queue. Deployment consumes the
+        # current frame, which is stored as the last queue item.
+        points = points[-1]
     if torch.is_tensor(points):
         points = points.detach().cpu().numpy()
     points = np.asarray(points, dtype=np.float32)
     if points.ndim != 2:
         raise ValueError(f"Expected NxC point array, got {points.shape}.")
     return np.ascontiguousarray(points)
+
+
+def current_img_metas(img_metas):
+    img_metas = unwrap_data(img_metas)
+    if isinstance(img_metas, dict):
+        return [img_metas]
+    if isinstance(img_metas, (list, tuple)):
+        if len(img_metas) == 0:
+            return []
+        return [img_metas[-1]]
+    return img_metas
 
 
 def boxes_to_numpy(boxes_3d) -> np.ndarray:
@@ -274,9 +287,7 @@ def main() -> None:
         points.tofile(osp.join(out_dir, raw_bin))
         np.save(osp.join(out_dir, raw_npy), points)
 
-        img_metas = unwrap_data(sample["img_metas"])
-        if isinstance(img_metas, dict):
-            img_metas = [img_metas]
+        img_metas = current_img_metas(sample["img_metas"])
         meta_json = frame_name("img_metas", frame_id, "json")
         with open(osp.join(out_dir, meta_json), "w") as f:
             json.dump(to_jsonable(img_metas), f, indent=2)
