@@ -1074,3 +1074,109 @@ class MotionHeadTRTP(MotionHeadTRT):
                     out_track_query,
                     track_query_pos,
                     track_scores,)
+
+
+@HEADS.register_module()
+class MotionHeadLidarTRTP(MotionHeadTRTP):
+    """TensorRT export adapter for LiDAR-only track + motion.
+
+    The camera ``MotionHeadTRTP`` filters vehicle queries before splitting the
+    SDC slot, which assumes the nuScenes class mapping where label 0 is a
+    vehicle.  The LiDAR KL class mapping uses label 0 for pedestrians, so this
+    adapter keeps the deploy output in active-track order and drops the SDC
+    slot only from the returned trajectory tensors.
+    """
+
+    def forward_test_trt_with_queries(self,
+                                      bev_embed,
+                                      track_query_embeddings,
+                                      track_boxes_1,
+                                      track_boxes_2,
+                                      gravity_center,
+                                      yaw,
+                                      sdc_embedding,
+                                      sdc_gravity_center,
+                                      sdc_yaw,
+                                      sdc_track_boxes_1,
+                                      sdc_track_boxes_2,
+                                      lane_query,
+                                      lane_query_pos):
+        num_track = track_query_embeddings.shape[0]
+        track_query = track_query_embeddings[None, None, ...]
+        track_query = torch.cat(
+            [track_query, sdc_embedding[None, None, None, :]], dim=2)
+
+        gravity_center = torch.cat([gravity_center, sdc_gravity_center], dim=0)
+        yaw = torch.cat([yaw, sdc_yaw], dim=0)
+        track_boxes_1 = torch.cat([track_boxes_1, sdc_track_boxes_1], dim=0)
+        track_boxes_2 = torch.cat([track_boxes_2, sdc_track_boxes_2], dim=0)
+
+        outputs_traj_scores,\
+        outputs_trajs,\
+        valid_traj_masks,\
+        inter_states,\
+        out_track_query,\
+        track_query_pos = self.forward_trt(bev_embed,
+                                           track_query,
+                                           lane_query,
+                                           lane_query_pos,
+                                           track_boxes_1,
+                                           track_boxes_2,
+                                           gravity_center,
+                                           yaw,)
+
+        sdc_traj_query = inter_states[:, :, -1]
+        sdc_track_query = out_track_query[:, -1]
+        sdc_track_query_pos = track_query_pos[:, -1]
+        inter_states = inter_states[:, :, :num_track]
+        out_track_query = out_track_query[:, :num_track]
+        track_query_pos = track_query_pos[:, :num_track]
+        track_scores = track_boxes_1[None, :num_track]
+
+        return (
+            outputs_traj_scores[:, :, :num_track],
+            outputs_trajs[:, :, :num_track],
+            valid_traj_masks[:, :num_track].float(),
+            inter_states,
+            out_track_query,
+            track_query_pos,
+            sdc_traj_query,
+            sdc_track_query,
+            sdc_track_query_pos,
+            track_scores,
+        )
+
+    def forward_test_trt(self,
+                         bev_embed,
+                         track_query_embeddings,
+                         track_boxes_1,
+                         track_boxes_2,
+                         gravity_center,
+                         yaw,
+                         sdc_embedding,
+                         sdc_gravity_center,
+                         sdc_yaw,
+                         sdc_track_boxes_1,
+                         sdc_track_boxes_2,
+                         lane_query,
+                         lane_query_pos):
+        outputs_traj_scores, outputs_trajs, valid_traj_masks, _, _, _, _, _, _, _ = \
+            self.forward_test_trt_with_queries(
+                bev_embed,
+                track_query_embeddings,
+                track_boxes_1,
+                track_boxes_2,
+                gravity_center,
+                yaw,
+                sdc_embedding,
+                sdc_gravity_center,
+                sdc_yaw,
+                sdc_track_boxes_1,
+                sdc_track_boxes_2,
+                lane_query,
+                lane_query_pos)
+        return (
+            outputs_traj_scores,
+            outputs_trajs,
+            valid_traj_masks,
+        )
