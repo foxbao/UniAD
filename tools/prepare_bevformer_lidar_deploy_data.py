@@ -212,6 +212,42 @@ def current_img_metas(img_metas):
     return img_metas
 
 
+def numeric_key(key):
+    try:
+        return (0, int(key))
+    except (TypeError, ValueError):
+        return (1, str(key))
+
+
+def current_meta_entry(img_metas):
+    if not img_metas:
+        return None
+    meta = img_metas[0]
+    if not isinstance(meta, dict):
+        return None
+    if isinstance(meta.get("queue_metas"), dict):
+        meta = meta["queue_metas"]
+    if "ego_motion_delta" in meta:
+        return meta
+
+    dict_items = [
+        (key, value) for key, value in meta.items() if isinstance(value, dict)
+    ]
+    if not dict_items:
+        return None
+    key, value = sorted(dict_items, key=lambda item: numeric_key(item[0]))[-1]
+    return value
+
+
+def attach_optional_planning_metadata(img_metas, sample):
+    current_meta = current_meta_entry(img_metas)
+    if current_meta is None:
+        return
+    for key in ("command", "sdc_planning", "sdc_planning_mask"):
+        if key in sample:
+            current_meta[key] = to_jsonable(unwrap_data(sample[key]))
+
+
 def boxes_to_numpy(boxes_3d) -> np.ndarray:
     if boxes_3d is None:
         return np.zeros((0, 9), dtype=np.float32)
@@ -288,6 +324,7 @@ def main() -> None:
         np.save(osp.join(out_dir, raw_npy), points)
 
         img_metas = current_img_metas(sample["img_metas"])
+        attach_optional_planning_metadata(img_metas, sample)
         meta_json = frame_name("img_metas", frame_id, "json")
         with open(osp.join(out_dir, meta_json), "w") as f:
             json.dump(to_jsonable(img_metas), f, indent=2)
@@ -312,6 +349,8 @@ def main() -> None:
             "raw_points": raw_bin,
             "raw_points_npy": raw_npy,
             "img_metas": meta_json,
+            "command": to_jsonable(unwrap_data(sample["command"]))
+            if "command" in sample else None,
             "gt_detections": gt_txt,
             "num_points": int(points.shape[0]),
             "point_dim": int(points.shape[1]),
