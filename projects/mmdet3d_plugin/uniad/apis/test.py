@@ -53,6 +53,49 @@ def _scatter_data_for_eval(model, data):
     return _unwrap_model(model), scattered_kwargs[0]
 
 
+def _base_dataset(dataset):
+    while hasattr(dataset, 'dataset'):
+        dataset = dataset.dataset
+    return dataset
+
+
+def _occ_grid_cell_sizes(dataset, height, width):
+    dataset = _base_dataset(dataset)
+    point_cloud_range = None
+    for attr in ('eval_point_cloud_range', 'point_cloud_range', 'pc_range'):
+        value = getattr(dataset, attr, None)
+        if value is not None:
+            point_cloud_range = np.asarray(value, dtype=np.float32)
+            break
+    if point_cloud_range is not None and point_cloud_range.shape[0] >= 5:
+        cell_x = float(point_cloud_range[3] - point_cloud_range[0]) / width
+        cell_y = float(point_cloud_range[4] - point_cloud_range[1]) / height
+        return cell_y, cell_x
+    if hasattr(dataset, '_planning_cell_size'):
+        cell = float(dataset._planning_cell_size())
+        return cell, cell
+    return 0.5, 0.5
+
+
+def _center_slice(length, size):
+    size = max(1, min(int(size), int(length)))
+    start = max(0, (int(length) - size) // 2)
+    return slice(start, start + size)
+
+
+def _build_occ_eval_ranges(dataset, occ_tensor):
+    height, width = occ_tensor.shape[-2:]
+    cell_y, cell_x = _occ_grid_cell_sizes(dataset, height, width)
+    center_h = int(round(30.0 / cell_y))
+    center_w = int(round(30.0 / cell_x))
+    return {
+        'center30m': (
+            _center_slice(height, center_h),
+            _center_slice(width, center_w)),
+        'full': (slice(0, height), slice(0, width)),
+    }
+
+
 def custom_multi_gpu_test(model, data_loader, tmpdir=None, gpu_collect=False):
     """Test model with multiple gpus.
     This method tests model with multiple gpus and collects the results
@@ -76,15 +119,10 @@ def custom_multi_gpu_test(model, data_loader, tmpdir=None, gpu_collect=False):
     eval_occ = hasattr(model_to_eval, 'with_occ_head') \
                 and model_to_eval.with_occ_head
     if eval_occ:
-        # 30mx30m, 100mx100m at 50cm resolution
-        EVALUATION_RANGES = {'8x8': (17, 33), '25x25': (0, 50)}
+        evaluation_ranges = None
         n_classes = 2
         iou_metrics = {}
-        for key in EVALUATION_RANGES.keys():
-            iou_metrics[key] = IntersectionOverUnion(n_classes).cuda()
         panoptic_metrics = {}
-        for key in EVALUATION_RANGES.keys():
-            panoptic_metrics[key] = PanopticMetric(n_classes=n_classes, temporally_consistent=True).cuda()
     
     # Plan eval init
     eval_planning =  hasattr(model_to_eval, 'with_planning_head') \
@@ -128,13 +166,28 @@ def custom_multi_gpu_test(model, data_loader, tmpdir=None, gpu_collect=False):
                 occ_has_invalid_frame = data['gt_occ_has_invalid_frame'][0]
                 occ_to_eval = not occ_has_invalid_frame.item()
                 if occ_to_eval and 'occ' in result[0].keys():
+                    if evaluation_ranges is None:
+                        evaluation_ranges = _build_occ_eval_ranges(
+                            dataset, result[0]['occ']['seg_out'])
+                        metric_device = result[0]['occ']['seg_out'].device
+                        for key in evaluation_ranges:
+                            iou_metrics[key] = IntersectionOverUnion(
+                                n_classes).to(metric_device)
+                            panoptic_metrics[key] = PanopticMetric(
+                                n_classes=n_classes,
+                                temporally_consistent=True).to(metric_device)
                     num_occ += 1
-                    for key, grid in EVALUATION_RANGES.items():
-                        limits = slice(grid[0], grid[1])
-                        iou_metrics[key](result[0]['occ']['seg_out'][..., limits, limits].contiguous(),
-                                        result[0]['occ']['seg_gt'][..., limits, limits].contiguous())
-                        panoptic_metrics[key](result[0]['occ']['ins_seg_out'][..., limits, limits].contiguous().detach(),
-                                                result[0]['occ']['ins_seg_gt'][..., limits, limits].contiguous())
+                    for key, (y_limits, x_limits) in evaluation_ranges.items():
+                        iou_metrics[key](
+                            result[0]['occ']['seg_out'][
+                                ..., y_limits, x_limits].contiguous(),
+                            result[0]['occ']['seg_gt'][
+                                ..., y_limits, x_limits].contiguous())
+                        panoptic_metrics[key](
+                            result[0]['occ']['ins_seg_out'][
+                                ..., y_limits, x_limits].contiguous().detach(),
+                            result[0]['occ']['ins_seg_gt'][
+                                ..., y_limits, x_limits].contiguous())
 
             # Pop out unnecessary occ results, avoid appending it to cpu when collect_results_cpu
             if os.environ.get('ENABLE_PLOT_MODE', None) is None:
@@ -194,7 +247,7 @@ def custom_multi_gpu_test(model, data_loader, tmpdir=None, gpu_collect=False):
     ret_results['bbox_results'] = bbox_results
     if eval_occ:
         occ_results = {}
-        for key, grid in EVALUATION_RANGES.items():
+        for key in iou_metrics:
             panoptic_scores = panoptic_metrics[key].compute()
             for panoptic_key, value in panoptic_scores.items():
                 occ_results[f'{panoptic_key}'] = occ_results.get(f'{panoptic_key}', []) + [100 * value[1].item()]

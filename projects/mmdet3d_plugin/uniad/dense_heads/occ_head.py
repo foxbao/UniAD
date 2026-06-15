@@ -324,9 +324,11 @@ class OccHead(BaseModule):
         ins_seg_targets_batch  = gt_instance # [1, 5, 200, 200] [b, t, h, w] # ins targets of a batch
         
         # img_valid flag, for filtering out invalid samples in sequence when calculating loss
-        img_is_valid = gt_img_is_valid  # [1, 7]
+        img_is_valid = gt_img_is_valid  # [bs, receptive_field + n_future]
         assert img_is_valid.size(1) == self.receptive_field + self.n_future,  \
-                f"Img_is_valid can only be 7 as for loss calculation and evaluation!!! Don't change it"
+                "gt_img_is_valid must have receptive_field + n_future flags, "\
+                f"got {img_is_valid.size(1)} vs "\
+                f"{self.receptive_field + self.n_future}"
         frame_valid_mask = img_is_valid.bool()
         past_valid_mask  = frame_valid_mask[:, :self.receptive_field]
         future_frame_mask = frame_valid_mask[:, (self.receptive_field-1):]  # [1, 5]  including current frame
@@ -349,13 +351,21 @@ class OccHead(BaseModule):
             cur_gt_inds   = gt_inds_list[ind][-1]
 
             cur_matched_gt = all_matched_gt_ids[ind]  # [n_gt]
-            
-            # Re-order gt according to matched_gt_inds
-            cur_gt_inds   = cur_gt_inds[cur_matched_gt]
-            
-            # Deal matched_gt: -1, its actually background(unmatched)
-            cur_gt_inds[cur_matched_gt == -1] = -1  # Bugfixed
-            cur_gt_inds[cur_matched_gt == -2] = -2  
+
+            # Re-order gt according to matched_gt_inds.  Invalid matches use
+            # sentinel ids and must not index cur_gt_inds; this matters for
+            # empty-current-frame samples where cur_gt_inds has length 0.
+            cur_matched_gt = cur_matched_gt.to(cur_gt_inds.device)
+            matched_gt_inds = cur_gt_inds.new_full(
+                cur_matched_gt.shape, -1)
+            valid_match = (
+                (cur_matched_gt >= 0)
+                & (cur_matched_gt < cur_gt_inds.numel()))
+            if valid_match.any():
+                matched_gt_inds[valid_match] = cur_gt_inds[
+                    cur_matched_gt[valid_match]]
+            matched_gt_inds[cur_matched_gt == -2] = -2
+            cur_gt_inds = matched_gt_inds
 
             frame_mask = future_frame_mask[ind]  # [t]
 

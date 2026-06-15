@@ -575,7 +575,8 @@ class NuScenesE2EDataset(NuScenesDataset):
         # whether invalid frames is present
         # 
         has_invalid_frame = -1 in all_frames[:self.occ_only_total_frames]
-        # NOTE: This can only represent 7 frames in total as it influence evaluation
+        # Validity flags cover receptive_field past/current frames plus n_future
+        # future frames and are consumed by occ loss/evaluation.
         input_dict['occ_has_invalid_frame'] = has_invalid_frame
         input_dict['occ_img_is_valid'] = np.array(all_frames) >= 0
 

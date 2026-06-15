@@ -151,10 +151,19 @@ class MotionHeadLidar(MotionHead):
             if all_matched_idxes[0].numel() == 0:
                 outs_motion['all_matched_idxes'] = all_matched_idxes
                 return outs_motion, all_matched_idxes
-            query_label = gt_labels_3d[0][-1][all_matched_idxes[0]]
-            vehicle_mask = torch.zeros_like(query_label, dtype=torch.bool)
-            for veh_id in vehicle_id_list:
-                vehicle_mask |= query_label == veh_id
+            matched_gt = all_matched_idxes[0]
+            gt_labels = gt_labels_3d[0][-1].to(matched_gt.device)
+            valid_match = (
+                (matched_gt >= 0)
+                & (matched_gt < gt_labels.numel()))
+            vehicle_mask = torch.zeros_like(matched_gt, dtype=torch.bool)
+            if valid_match.any():
+                query_label = gt_labels[matched_gt[valid_match]]
+                valid_vehicle_mask = torch.zeros_like(
+                    query_label, dtype=torch.bool)
+                for veh_id in vehicle_id_list:
+                    valid_vehicle_mask |= query_label == veh_id
+                vehicle_mask[valid_match] = valid_vehicle_mask
             outs_motion['traj_query'] = outs_motion['traj_query'][:, :,
                                                                   vehicle_mask]
             outs_motion['track_query'] = outs_motion['track_query'][:,

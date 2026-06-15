@@ -303,7 +303,7 @@ class ClipMatcher(nn.Module):
             target_boxes = torch.cat([target_boxes, target_sdc_boxes], dim=0)
             target_obj_ids = torch.cat([
                 target_obj_ids,
-                torch.zeros(1).to(target_obj_ids.device)
+                target_obj_ids.new_zeros(1)
             ], dim=0)
         mask = target_obj_ids != -1
         bbox_weights = torch.ones_like(target_boxes) * self.code_weights
