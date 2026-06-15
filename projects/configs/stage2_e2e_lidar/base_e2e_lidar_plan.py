@@ -162,5 +162,6 @@ data = dict(
               occ_receptive_field=occ_receptive_field,
               occ_n_future=occ_n_future))
 
-load_from = './projects/work_dirs/stage2_e2e_lidar/base_e2e_lidar_occ/latest.pth'
+# load_from = './projects/work_dirs/stage2_e2e_lidar/base_e2e_lidar_occ/latest.pth'
+load_from = './projects/work_dirs/stage2_e2e_lidar/base_e2e_lidar/latest.pth'
 work_dir = './projects/work_dirs/stage2_e2e_lidar/base_e2e_lidar_plan'

@@ -74,8 +74,8 @@ model = dict(
                 ffn_dropout=0.1,
                 operation_order=('cross_attn', 'norm', 'ffn', 'norm')))))
 
-# LiDAR-only stage-2 entry point: tracking plus MotionHead, without map,
-# occupancy, planning, or SDC branches.
+# LiDAR-only stage-2 entry point: tracking plus MotionHead. It keeps the
+# inherited SDC branch so MotionHead can supervise the ego/SDC trajectory.
 train_pipeline = [
     dict(
         type='LoadPointsFromFile',

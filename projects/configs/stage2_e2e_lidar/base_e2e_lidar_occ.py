@@ -119,7 +119,10 @@ train_pipeline = [
         keys=[
             'points', 'gt_bboxes_3d', 'gt_labels_3d', 'gt_inds',
             'gt_past_traj', 'gt_past_traj_mask', 'gt_fut_traj',
-            'gt_fut_traj_mask', 'gt_segmentation', 'gt_instance',
+            'gt_fut_traj_mask',
+            'gt_sdc_bbox', 'gt_sdc_label',
+            'gt_sdc_fut_traj', 'gt_sdc_fut_traj_mask',
+            'gt_segmentation', 'gt_instance',
             'gt_centerness', 'gt_offset', 'gt_flow', 'gt_backward_flow',
             'gt_occ_has_invalid_frame', 'gt_occ_img_is_valid'
         ]),
@@ -158,7 +161,10 @@ test_pipeline = [
         keys=[
             'points', 'gt_bboxes_3d', 'gt_labels_3d', 'gt_inds',
             'gt_past_traj', 'gt_past_traj_mask', 'gt_fut_traj',
-            'gt_fut_traj_mask', 'gt_segmentation', 'gt_instance',
+            'gt_fut_traj_mask',
+            'gt_sdc_bbox', 'gt_sdc_label',
+            'gt_sdc_fut_traj', 'gt_sdc_fut_traj_mask',
+            'gt_segmentation', 'gt_instance',
             'gt_centerness', 'gt_offset', 'gt_flow', 'gt_backward_flow',
             'gt_occ_has_invalid_frame', 'gt_occ_img_is_valid'
         ]),
