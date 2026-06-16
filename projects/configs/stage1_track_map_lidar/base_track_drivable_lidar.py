@@ -135,7 +135,7 @@ train_pipeline = [
         bev_size=canvas_size,
         augment_raycast_ground=True,
         keep_raycast_obstacles=False,
-        box_z_origin='center'),
+        box_z_origin='bottom'),
     dict(type='PointShuffle'),
     dict(type='DefaultFormatBundle3D', class_names=class_names),
     dict(
@@ -174,7 +174,7 @@ test_pipeline = [
         bev_size=canvas_size,
         augment_raycast_ground=True,
         keep_raycast_obstacles=False,
-        box_z_origin='center'),
+        box_z_origin='bottom'),
     dict(
         type='DefaultFormatBundle3D',
         class_names=class_names,

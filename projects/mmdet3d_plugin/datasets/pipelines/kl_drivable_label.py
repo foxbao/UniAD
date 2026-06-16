@@ -1041,7 +1041,7 @@ class GenerateKLDrivableMapLabels:
                  augment_raycast_ground: bool = True,
                  keep_raycast_obstacles: bool = False,
                  current_frame_only: bool = True,
-                 box_z_origin: str = 'center',
+                 box_z_origin: str = 'bottom',
                  raycast_occ_size: Optional[Sequence[int]] = None,
                  raycast_ground_height_threshold: float = 0.55,
                  raycast_ground_smooth_radius: int = 3,
@@ -1154,6 +1154,13 @@ class GenerateKLDrivableMapLabels:
         if arr.size == 0:
             return np.zeros((0, 7), dtype=np.float32)
         arr = arr[:, :7].copy()
+        # mmdet3d stores LiDARInstance3DBoxes bottom-centred (tensor[:, 2] is
+        # the box floor), so 'bottom' is a no-op and is the correct default
+        # here. 'center' is only for sources whose stored z is the gravity
+        # centre; using it on bottom-centred boxes double-shifts every box
+        # down by h/2. Verified empirically against in-footprint LiDAR z via
+        # tools/analysis_tools/check_kl_box_z_origin.py (residual 0.02m for
+        # 'bottom' vs 1.65m for 'center').
         if self.box_z_origin == 'center':
             arr[:, 2] -= arr[:, 5] * 0.5
         elif self.box_z_origin != 'bottom':
