@@ -992,10 +992,11 @@ class GenerateKLDrivableMapLabels:
     """Generate Pansegformer-style drivable-space labels for KL LiDAR data."""
 
     def __init__(self,
-                 map_file: str,
-                 point_cloud_range: Sequence[float],
-                 bev_size: Sequence[int],
+                 map_file: Optional[str] = None,
+                 point_cloud_range: Sequence[float] = None,
+                 bev_size: Sequence[int] = None,
                  clean_map_file: Optional[str] = None,
+                 use_map: bool = True,
                  drivable_label: int = 3,
                  include_lanes: bool = True,
                  include_roads: bool = True,
@@ -1023,22 +1024,34 @@ class GenerateKLDrivableMapLabels:
                  raycast_obstacle_box_ignore_margin: float = 0.8,
                  raycast_ego_ignore_range: Optional[Sequence[float]] = (
                      -8.0, -2.0, -2.0, 8.0, 2.0, 6.0)):
-        self.map_file = osp.expanduser(map_file)
+        self.map_file = osp.expanduser(map_file) if map_file else None
         self.clean_map_file = (
             osp.expanduser(clean_map_file) if clean_map_file else None)
         self.point_cloud_range = np.asarray(point_cloud_range,
                                             dtype=np.float32)
         self.bev_size = tuple(int(v) for v in bev_size)
+        self.use_map = bool(use_map)
         self.drivable_label = int(drivable_label)
         self.augment_raycast_ground = bool(augment_raycast_ground)
         self.keep_raycast_obstacles = bool(keep_raycast_obstacles)
         self.current_frame_only = bool(current_frame_only)
         self.box_z_origin = box_z_origin
-        if self.clean_map_file and osp.exists(self.clean_map_file):
+        # When use_map is False the navigation HD-map is dropped entirely:
+        # the drivable target is built from the LiDAR raycast ground alone.
+        # A navigation map describes route topology, not the true drivable
+        # surface, so it can mislabel the seg-head target.
+        if not self.use_map:
+            self.drivable_global = GeometryCollection()
+            self.map_stats = None
+        elif self.clean_map_file and osp.exists(self.clean_map_file):
             self.drivable_global = load_clean_drivable_geometry(
                 self.clean_map_file)
             self.map_stats = None
         else:
+            if not self.map_file:
+                raise ValueError(
+                    'map_file (or clean_map_file) is required when '
+                    'use_map=True.')
             self.drivable_global, self.map_stats = build_drivable_geometry(
                 self.map_file,
                 include_lanes=include_lanes,
@@ -1131,11 +1144,14 @@ class GenerateKLDrivableMapLabels:
             results['gt_lane_masks'] = masks
             return results
 
-        map_mask = build_map_mask(
-            self.drivable_global,
-            self._ego2global(results),
-            self.point_cloud_range,
-            self.bev_size)
+        if self.use_map:
+            map_mask = build_map_mask(
+                self.drivable_global,
+                self._ego2global(results),
+                self.point_cloud_range,
+                self.bev_size)
+        else:
+            map_mask = np.zeros(self.bev_size, dtype=np.uint8)
         final_mask = map_mask
         if self.augment_raycast_ground and 'points' in results:
             raycast = self.raycast_builder.build(
@@ -1154,7 +1170,8 @@ class GenerateKLDrivableMapLabels:
 
     def __repr__(self):
         return (
-            f'{self.__class__.__name__}(map_file={self.map_file}, '
+            f'{self.__class__.__name__}(use_map={self.use_map}, '
+            f'map_file={self.map_file}, '
             f'clean_map_file={self.clean_map_file}, '
             f'bev_size={self.bev_size}, '
             f'augment_raycast_ground={self.augment_raycast_ground})')
