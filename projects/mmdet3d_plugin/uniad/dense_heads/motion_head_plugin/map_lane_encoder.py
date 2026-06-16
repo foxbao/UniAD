@@ -230,6 +230,7 @@ class MapLaneEncoder(nn.Module):
         Returns:
             lane_query: (1, num_lanes, embed_dims)
             lane_query_pos: (1, num_lanes, embed_dims)
+            lane_valid: (1, num_lanes) bool
         """
         if isinstance(ego2global, torch.Tensor):
             e2g_np = ego2global.detach().cpu().numpy()
@@ -261,4 +262,4 @@ class MapLaneEncoder(nn.Module):
         lane_query_pos = pos2posemb2d(centroids_norm)  # (num_lanes, 256)
         lane_query_pos = lane_query_pos * valid_t[:, None].to(dtype)
 
-        return lane_query[None], lane_query_pos[None]
+        return lane_query[None], lane_query_pos[None], valid_t[None]

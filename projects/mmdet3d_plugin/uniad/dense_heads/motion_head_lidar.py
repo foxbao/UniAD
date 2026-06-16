@@ -27,11 +27,11 @@ class MotionHeadLidar(MotionHead):
     def _build_lane_query(self, track_query, outs_track):
         if self.map_lane_encoder is None:
             return (track_query.new_zeros((1, 0, self.embed_dims)),
-                    track_query.new_zeros((1, 0, self.embed_dims)))
+                    track_query.new_zeros((1, 0, self.embed_dims)), None)
         ego2global = outs_track.get('ego2global')
         if ego2global is None:
             return (track_query.new_zeros((1, 0, self.embed_dims)),
-                    track_query.new_zeros((1, 0, self.embed_dims)))
+                    track_query.new_zeros((1, 0, self.embed_dims)), None)
         return self.map_lane_encoder(
             ego2global, device=track_query.device, dtype=track_query.dtype)
 
@@ -118,7 +118,7 @@ class MotionHeadLidar(MotionHead):
                 outs_motion=outs_motion,
                 track_boxes=track_boxes)
 
-        lane_query, lane_query_pos = self._build_lane_query(
+        lane_query, lane_query_pos, lane_valid = self._build_lane_query(
             track_query, outs_track)
 
         outs_motion = self(
@@ -126,7 +126,9 @@ class MotionHeadLidar(MotionHead):
             track_query,
             lane_query,
             lane_query_pos,
-            track_boxes)
+            track_boxes,
+            lane_key_padding_mask=(
+                None if lane_valid is None else ~lane_valid))
         loss_inputs = [
             gt_bboxes_3d, gt_fut_traj, gt_fut_traj_mask, outs_motion,
             all_matched_idxes, track_boxes
@@ -219,14 +221,16 @@ class MotionHeadLidar(MotionHead):
             return [dict(traj=empty_traj.cpu(),
                          traj_scores=empty_scores.cpu())], outs_motion
 
-        lane_query, lane_query_pos = self._build_lane_query(
+        lane_query, lane_query_pos, lane_valid = self._build_lane_query(
             track_query, outs_track)
         outs_motion = self(
             bev_embed,
             track_query,
             lane_query,
             lane_query_pos,
-            track_boxes)
+            track_boxes,
+            lane_key_padding_mask=(
+                None if lane_valid is None else ~lane_valid))
         traj_results = self.get_trajs(outs_motion, track_boxes)
         _, scores, labels, _, _ = track_boxes[0]
         outs_motion['track_scores'] = scores[None, :]

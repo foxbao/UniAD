@@ -64,6 +64,7 @@ class MotionTransformerDecoder(BaseModule):
                 lane_query,
                 track_query_pos=None,
                 lane_query_pos=None,
+                lane_key_padding_mask=None,
                 track_bbox_results=None,
                 bev_embed=None,
                 reference_trajs=None,
@@ -121,7 +122,9 @@ class MotionTransformerDecoder(BaseModule):
             
             # interaction between agents and map
             map_query_embed = self.map_interaction_layers[lid](
-                query_embed, lane_query, query_pos=track_query_pos_bc, key_pos=lane_query_pos)
+                query_embed, lane_query, query_pos=track_query_pos_bc,
+                key_pos=lane_query_pos,
+                key_padding_mask=lane_key_padding_mask)
             
             # interaction between agents and bev, ie. interaction between agents and goals
             # implemented with deformable transformer
@@ -232,7 +235,8 @@ class MapInteraction(BaseModule):
                                                                   dim_feedforward=embed_dims*2,
                                                                   batch_first=batch_first)
 
-    def forward(self, query, key, query_pos=None, key_pos=None):
+    def forward(self, query, key, query_pos=None, key_pos=None,
+                key_padding_mask=None):
         '''
         x: context query (B, A, P, D) 
         query_pos: mode pos embedding (B, A, P, D)
@@ -246,7 +250,18 @@ class MapInteraction(BaseModule):
         # N, A, P, D -> N*A, P, D
         query = torch.flatten(query, start_dim=0, end_dim=1)
         mem = key.expand(B*A, -1, -1)
-        query = self.interaction_transformer(query, mem)
+        if key_padding_mask is not None:
+            key_padding_mask = key_padding_mask.to(query.device).bool()
+            if key_padding_mask.size(0) == 1 and B != 1:
+                key_padding_mask = key_padding_mask.expand(B, -1)
+            key_padding_mask = key_padding_mask[:, None, :].expand(
+                B, A, -1).reshape(B * A, -1)
+            all_masked = key_padding_mask.all(dim=1)
+            if all_masked.any():
+                key_padding_mask = key_padding_mask.clone()
+                key_padding_mask[all_masked] = False
+        query = self.interaction_transformer(
+            query, mem, memory_key_padding_mask=key_padding_mask)
         query = query.view(B, A, P, D)
         return query
 

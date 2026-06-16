@@ -214,7 +214,8 @@ class MotionHead(BaseMotionHead):
                 track_query, 
                 lane_query, 
                 lane_query_pos, 
-                track_bbox_results):
+                track_bbox_results,
+                lane_key_padding_mask=None):
         """
         Applies forward pass on the model for motion prediction using bird's eye view (BEV) embedding, track query, lane query, and track bounding box results.
 
@@ -224,6 +225,7 @@ class MotionHead(BaseMotionHead):
         lane_query (torch.Tensor): A tensor of shape (N, M_thing, D) representing the lane query.
         lane_query_pos (torch.Tensor): A tensor of shape (N, M_thing, D) representing the position of the lane query.
         track_bbox_results (List[torch.Tensor]): A list of tensors containing the tracking bounding box results for each image in the batch.
+        lane_key_padding_mask (torch.Tensor | None): Bool mask of shape (B, M), True for padded lanes.
 
         Returns:
         dict: A dictionary containing the following keys and values:
@@ -303,6 +305,7 @@ class MotionHead(BaseMotionHead):
             lane_query,  # B, M, D
             track_query_pos=track_query_pos,
             lane_query_pos=lane_query_pos,
+            lane_key_padding_mask=lane_key_padding_mask,
             track_bbox_results=track_bbox_results,
             bev_embed=bev_embed,
             reference_trajs=init_reference,
