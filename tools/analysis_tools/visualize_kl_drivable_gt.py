@@ -3,13 +3,16 @@
 
 Renders the target that ``GenerateKLDrivableMapLabels`` feeds to the
 Pansegformer seg-head, for a bounded set of frames. Each frame is a 3-panel
-strip:
+strip; every panel has its own title bar and the colours are explained by
+two legend strips along the bottom:
 
-* **A** -- final drivable GT (green) over a LiDAR point-density backdrop
-  (gray), with the ego centre marked.
-* **B** -- source decomposition: red = HD-map only, green = raycast-ground
-  only, yellow = both, blue = raycast obstacle (subtracted from the GT).
-* **C** -- the final binary target actually used for the Dice loss.
+* **A: final drivable GT + LiDAR** -- final drivable GT (green) over a
+  LiDAR point-density backdrop (gray), with the ego centre marked (red).
+* **B: where the GT comes from** -- source decomposition: red = HD-map only,
+  green = raycast-ground only, yellow = both agree, blue = raycast obstacle
+  (subtracted from the GT).
+* **C: final mask (Dice target)** -- the binary target actually used for the
+  Dice loss.
 
 Optionally muxes the frames into a ``.webm`` (libvpx-vp9, matching
 run_e2e_subset.py) for browser inspection.
@@ -72,6 +75,41 @@ def lidar_density_bev(pts, pc_range, bev_size):
 def render_frame(map_mask, ground, blocked, pts, pc_range, bev_size):
     """Build the 3-panel BGR strip for one frame."""
     h, w = bev_size
+def _titled_panel(panel, title, scale):
+    """Upscale a panel and stack a dark title bar on top of it."""
+    big = cv2.resize(panel, None, fx=scale, fy=scale,
+                     interpolation=cv2.INTER_NEAREST)
+    h, w = big.shape[:2]
+    bar = np.full((26, w, 3), 30, dtype=np.uint8)
+    cv2.putText(bar, title, (6, 18), cv2.FONT_HERSHEY_SIMPLEX,
+                0.5, (255, 255, 255), 1, cv2.LINE_AA)
+    return np.concatenate([bar, big], axis=0)
+
+
+def _legend_bar(width, items):
+    """A bottom strip of colour swatches + labels (BGR colours)."""
+    bar = np.full((34, width, 3), 30, dtype=np.uint8)
+    x = 8
+    for color, label in items:
+        cv2.rectangle(bar, (x, 9), (x + 18, 25), color, -1)
+        cv2.rectangle(bar, (x, 9), (x + 18, 25), (200, 200, 200), 1)
+        x += 24
+        (tw, _), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)
+        cv2.putText(bar, label, (x, 22), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.45, (235, 235, 235), 1, cv2.LINE_AA)
+        x += tw + 22
+    return bar
+
+
+def render_frame(map_mask, ground, blocked, pts, pc_range, bev_size,
+                 scale=3, frame_idx=None):
+    """Build the labelled 3-panel BGR strip for one frame.
+
+    Each panel carries its own title bar; a shared legend strip explaining
+    every colour is stacked along the bottom so the figure is readable
+    without consulting the docstring.
+    """
+    h, w = bev_size
     final = np.maximum(map_mask, ground).astype(np.uint8)
     final[blocked > 0] = 0
 
@@ -95,14 +133,37 @@ def render_frame(map_mask, ground, blocked, pts, pc_range, bev_size):
     panel_c = cv2.cvtColor((final * 255).astype(np.uint8),
                            cv2.COLOR_GRAY2BGR)
 
-    pad = np.full((h, 6, 3), 40, dtype=np.uint8)
-    strip = np.concatenate([panel_a, pad, panel_b, pad, panel_c], axis=1)
+    a = _titled_panel(panel_a, 'A: final drivable GT + LiDAR', scale)
+    b = _titled_panel(panel_b, 'B: where the GT comes from', scale)
+    c = _titled_panel(panel_c, 'C: final mask (Dice target)', scale)
+
+    pad = np.full((a.shape[0], 6, 3), 30, dtype=np.uint8)
+    row = np.concatenate([a, pad, b, pad, c], axis=1)
+
+    # Two legend rows: panel-A semantics, then panel-B semantics.
+    legend_a = _legend_bar(row.shape[1], [
+        ((60, 200, 60), 'drivable GT'),
+        ((120, 120, 120), 'LiDAR points'),
+        ((0, 0, 255), 'ego'),
+    ])
+    legend_b = _legend_bar(row.shape[1], [
+        ((0, 0, 255), 'HD-map only'),
+        ((0, 255, 0), 'raycast ground only'),
+        ((0, 255, 255), 'both agree'),
+        ((255, 80, 0), 'obstacle (removed)'),
+    ])
+    out = np.concatenate([row, legend_a, legend_b], axis=0)
+    if frame_idx is not None:
+        cv2.putText(out, 'frame %d' % frame_idx,
+                    (out.shape[1] - 96, 18), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.5, (180, 220, 255), 1, cv2.LINE_AA)
+
     stats = dict(
         final=int((final > 0).sum()),
         map=int(map_b.sum()),
         ray=int(ground_b.sum()),
         blocked=int((blocked > 0).sum()))
-    return strip, stats
+    return out, stats
 
 def write_webm(frame_dir, out_path, fps):
     """Mux numbered PNG frames into a VP9 webm (matches run_e2e_subset.py)."""
@@ -158,15 +219,8 @@ def main():
         raycast = gen.raycast_builder.build(pts, boxes)
         strip, stats = render_frame(
             map_mask, raycast['ground'], raycast['blocked'],
-            pts, pc_range, bev_size)
+            pts, pc_range, bev_size, scale=args.scale, frame_idx=idx)
 
-        if args.scale != 1:
-            strip = cv2.resize(strip, None, fx=args.scale, fy=args.scale,
-                               interpolation=cv2.INTER_NEAREST)
-        caption = ('A:GT/lidar  B:map(R)+ray(G)+both(Y)+blocked(Blu)  '
-                   'C:final GT   frame=%d' % idx)
-        cv2.putText(strip, caption, (8, 18), cv2.FONT_HERSHEY_SIMPLEX,
-                    0.45, (255, 255, 255), 1, cv2.LINE_AA)
         # Sequential filenames so ffmpeg sees a contiguous frame range even
         # when --stride skips dataset indices.
         cv2.imwrite(osp.join(args.out_dir, 'gt_%05d.png' % seq), strip)
