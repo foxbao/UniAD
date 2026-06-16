@@ -150,7 +150,8 @@ def _legend_bar(width, items):
 
 
 def render_frame(map_mask, ground, blocked, pts, pc_range, bev_size,
-                 scale=3, frame_idx=None):
+                 scale=3, frame_idx=None, augment_raycast_ground=True,
+                 keep_raycast_obstacles=False):
     """Build the labelled 2x2 panel figure for one frame.
 
     Panels read input -> output, left-to-right then top-to-bottom:
@@ -158,10 +159,19 @@ def render_frame(map_mask, ground, blocked, pts, pc_range, bev_size,
     B (source decomposition) | C (final Dice mask) on the bottom row.
     Each panel has its own title bar; legend strips along the bottom
     explain every colour so the figure stands on its own.
+
+    ``augment_raycast_ground`` / ``keep_raycast_obstacles`` mirror the
+    generator flags so the rendered ``final`` matches the actual training
+    target rather than assuming the default fusion.
     """
     h, w = bev_size
-    final = np.maximum(map_mask, ground).astype(np.uint8)
-    final[blocked > 0] = 0
+    # Mirror GenerateKLDrivableMapLabels.__call__ exactly.
+    if augment_raycast_ground:
+        final = np.maximum(map_mask, ground).astype(np.uint8)
+        if not keep_raycast_obstacles:
+            final[blocked > 0] = 0
+    else:
+        final = map_mask.astype(np.uint8)
 
     # Panel D: raw LiDAR coloured by height (the model's actual input).
     panel_d = lidar_height_bev(pts, pc_range, bev_size)
@@ -281,7 +291,9 @@ def main():
         raycast = gen.raycast_builder.build(pts, boxes)
         strip, stats = render_frame(
             map_mask, raycast['ground'], raycast['blocked'],
-            pts, pc_range, bev_size, scale=args.scale, frame_idx=idx)
+            pts, pc_range, bev_size, scale=args.scale, frame_idx=idx,
+            augment_raycast_ground=gen.augment_raycast_ground,
+            keep_raycast_obstacles=gen.keep_raycast_obstacles)
 
         # Sequential filenames so ffmpeg sees a contiguous frame range even
         # when --stride skips dataset indices.

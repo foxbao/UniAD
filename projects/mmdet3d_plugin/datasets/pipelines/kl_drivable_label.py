@@ -645,6 +645,12 @@ class RaycastDrivableBuilder:
 
         A single final ``np.unique`` deduplicates across all rays. Output is
         identical to the old loop (verified element-for-element).
+
+        Rays are processed in chunks (capped sample count per batch) so peak
+        memory stays bounded: a fully-populated 160x120x10 grid can otherwise
+        expand to ~9M samples, i.e. several hundred MiB of temporaries per
+        dataloader worker. Each chunk is deduped immediately and only unique
+        voxels are accumulated.
         """
         if hit_voxels.shape[0] == 0:
             return np.empty((0, 3), dtype=np.int64)
@@ -664,7 +670,36 @@ class RaycastDrivableBuilder:
         if hit_voxels.shape[0] == 0:
             return np.empty((0, 3), dtype=np.int64)
 
+        # Split rays into chunks whose cumulative sample count stays under a
+        # cap (~2M samples ≈ tens of MiB of float32/int64 temporaries). The
+        # split is on whole rays so each ray's parametrisation is unaffected.
+        sample_cap = 2_000_000
+        boundaries = np.cumsum(num_steps)
+        chunk_unique = []
+        n_rays = hit_voxels.shape[0]
+        start = 0
+        while start < n_rays:
+            base = boundaries[start - 1] if start > 0 else 0
+            # Largest end such that the chunk's samples stay under the cap;
+            # always take at least one ray even if it alone exceeds the cap.
+            end = int(np.searchsorted(boundaries, base + sample_cap,
+                                      side='right'))
+            end = max(end, start + 1)
+            uniq = self._raycast_chunk(
+                hit_voxels[start:end], deltas[start:end], num_steps[start:end])
+            if uniq.shape[0] > 0:
+                chunk_unique.append(uniq)
+            start = end
+
+        if not chunk_unique:
+            return np.empty((0, 3), dtype=np.int64)
+        return np.unique(np.concatenate(chunk_unique, axis=0), axis=0)
+
+    def _raycast_chunk(self, hit_voxels, deltas, num_steps):
+        """Vectorised free-voxel sampling for one ray chunk (see caller)."""
         total = int(num_steps.sum())
+        if total == 0:
+            return np.empty((0, 3), dtype=np.int64)
         ray = np.repeat(np.arange(hit_voxels.shape[0]), num_steps)
         ray_start = np.repeat(np.cumsum(num_steps) - num_steps, num_steps)
         step = np.arange(total, dtype=np.int64) - ray_start

@@ -111,6 +111,11 @@ def main():
 
     pipeline_cfg = cfg.data[args.split].pipeline
     gen = build_generator(find_generator(pipeline_cfg))
+    if not getattr(gen, 'use_map', True):
+        raise SystemExit(
+            'This config has use_map=False, so the HD-map mask is empty and '
+            'the map-agreement columns (iou / map_cov) are meaningless. Point '
+            'this tool at a map-enabled config (use_map=True) instead.')
     pre = steps_before_generator(pipeline_cfg)
     dataset = build_split_dataset(cfg, args.split)
 
