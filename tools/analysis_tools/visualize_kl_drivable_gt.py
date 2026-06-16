@@ -1,0 +1,189 @@
+# Copyright (c) OpenMMLab. All rights reserved.
+"""Visualize the fused KL drivable seg-head ground-truth.
+
+Renders the target that ``GenerateKLDrivableMapLabels`` feeds to the
+Pansegformer seg-head, for a bounded set of frames. Each frame is a 3-panel
+strip:
+
+* **A** -- final drivable GT (green) over a LiDAR point-density backdrop
+  (gray), with the ego centre marked.
+* **B** -- source decomposition: red = HD-map only, green = raycast-ground
+  only, yellow = both, blue = raycast obstacle (subtracted from the GT).
+* **C** -- the final binary target actually used for the Dice loss.
+
+Optionally muxes the frames into a ``.webm`` (libvpx-vp9, matching
+run_e2e_subset.py) for browser inspection.
+
+Read-only: renders images, never writes labels or touches training.
+
+Example
+-------
+    PYTHONPATH=$(pwd) python3 tools/analysis_tools/visualize_kl_drivable_gt.py \
+        projects/configs/stage1_track_map_lidar/base_track_drivable_lidar.py \
+        --split train --num-frames 40 --stride 5 \
+        --out-dir /tmp/kl_gt_vis --video /tmp/kl_gt_vis/drivable_gt.webm
+"""
+import argparse
+import os
+import os.path as osp
+import subprocess
+
+import cv2
+import numpy as np
+from mmcv import Config
+
+from projects.mmdet3d_plugin.datasets.pipelines.kl_drivable_label import (
+    build_map_mask)
+from tools.analysis_tools.check_kl_drivable_alignment import (
+    build_generator, build_split_dataset, find_generator, import_plugin,
+    steps_before_generator)
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description='Visualize fused KL drivable seg-head GT')
+    parser.add_argument('config', help='train config path')
+    parser.add_argument('--split', default='train',
+                        choices=['train', 'val', 'test'])
+    parser.add_argument('--num-frames', type=int, default=40)
+    parser.add_argument('--stride', type=int, default=5)
+    parser.add_argument('--out-dir', required=True,
+                        help='folder for rendered PNG frames')
+    parser.add_argument('--video', default=None,
+                        help='optional .webm output path')
+    parser.add_argument('--scale', type=int, default=3,
+                        help='nearest-neighbour upscale factor for legibility')
+    parser.add_argument('--fps', type=int, default=4)
+    return parser.parse_args()
+
+
+def lidar_density_bev(pts, pc_range, bev_size):
+    """Gray backdrop: clipped LiDAR point count per BEV pixel."""
+    h, w = bev_size
+    x_min, y_min, _, x_max, y_max, _ = [float(v) for v in pc_range]
+    cols = ((pts[:, 0] - x_min) / (x_max - x_min) * w).astype(int)
+    rows = ((y_max - pts[:, 1]) / (y_max - y_min) * h).astype(int)
+    ok = (cols >= 0) & (cols < w) & (rows >= 0) & (rows < h)
+    bg = np.zeros((h, w), dtype=np.uint8)
+    np.add.at(bg, (rows[ok], cols[ok]), 1)
+    return (np.clip(bg, 0, 3) * 70).astype(np.uint8)
+
+
+def render_frame(map_mask, ground, blocked, pts, pc_range, bev_size):
+    """Build the 3-panel BGR strip for one frame."""
+    h, w = bev_size
+    final = np.maximum(map_mask, ground).astype(np.uint8)
+    final[blocked > 0] = 0
+
+    # Panel A: final GT over lidar density, ego centre cross.
+    bg = lidar_density_bev(pts, pc_range, bev_size)
+    panel_a = cv2.cvtColor(bg, cv2.COLOR_GRAY2BGR)
+    panel_a[final > 0] = (60, 200, 60)
+    cv2.drawMarker(panel_a, (w // 2, h // 2), (0, 0, 255),
+                   cv2.MARKER_CROSS, 8, 1)
+
+    # Panel B: source decomposition.
+    map_b = map_mask > 0
+    ground_b = ground > 0
+    panel_b = np.zeros((h, w, 3), dtype=np.uint8)
+    panel_b[..., 2] = ((map_b & ~ground_b) * 255).astype(np.uint8)  # red
+    panel_b[..., 1] = ((ground_b & ~map_b) * 255).astype(np.uint8)  # green
+    panel_b[map_b & ground_b] = (0, 255, 255)                       # yellow
+    panel_b[blocked > 0] = (255, 80, 0)                             # blue
+
+    # Panel C: final binary target.
+    panel_c = cv2.cvtColor((final * 255).astype(np.uint8),
+                           cv2.COLOR_GRAY2BGR)
+
+    pad = np.full((h, 6, 3), 40, dtype=np.uint8)
+    strip = np.concatenate([panel_a, pad, panel_b, pad, panel_c], axis=1)
+    stats = dict(
+        final=int((final > 0).sum()),
+        map=int(map_b.sum()),
+        ray=int(ground_b.sum()),
+        blocked=int((blocked > 0).sum()))
+    return strip, stats
+
+def write_webm(frame_dir, out_path, fps):
+    """Mux numbered PNG frames into a VP9 webm (matches run_e2e_subset.py)."""
+    if osp.splitext(out_path)[1].lower() != '.webm':
+        raise ValueError('--video must end in .webm')
+    out_parent = osp.dirname(out_path)
+    if out_parent:
+        os.makedirs(out_parent, exist_ok=True)
+    # Frames are already even-sized after the integer upscale; still guard
+    # the encoder with a trunc-to-even scale filter.
+    cmd = [
+        'ffmpeg', '-y',
+        '-framerate', str(fps),
+        '-i', osp.join(frame_dir, 'gt_%05d.png'),
+        '-vf', 'scale=trunc(iw/2)*2:trunc(ih/2)*2',
+        '-c:v', 'libvpx-vp9', '-crf', '32', '-b:v', '0',
+        '-pix_fmt', 'yuv420p',
+        out_path,
+    ]
+    subprocess.run(cmd, check=True)
+
+
+def main():
+    args = parse_args()
+    cfg = Config.fromfile(args.config)
+    import_plugin(cfg)
+
+    pipeline_cfg = cfg.data[args.split].pipeline
+    gen = build_generator(find_generator(pipeline_cfg))
+    pre = steps_before_generator(pipeline_cfg)
+    dataset = build_split_dataset(cfg, args.split)
+
+    num_total = len(dataset.data_infos)
+    indices = list(range(0, num_total, args.stride))[:args.num_frames]
+    os.makedirs(args.out_dir, exist_ok=True)
+
+    bev_size = gen.bev_size
+    pc_range = gen.point_cloud_range
+    seq = 0
+    for idx in indices:
+        info = dataset.get_data_info(idx)
+        if info is None:
+            continue
+        dataset.pre_pipeline(info)
+        results = pre(info)
+        if results is None or 'points' not in results:
+            continue
+
+        pts = gen._points_numpy(results['points'])
+        boxes = gen._boxes_numpy(results.get('gt_bboxes_3d'))
+        map_mask = build_map_mask(
+            gen.drivable_global, gen._ego2global(results), pc_range, bev_size)
+        raycast = gen.raycast_builder.build(pts, boxes)
+        strip, stats = render_frame(
+            map_mask, raycast['ground'], raycast['blocked'],
+            pts, pc_range, bev_size)
+
+        if args.scale != 1:
+            strip = cv2.resize(strip, None, fx=args.scale, fy=args.scale,
+                               interpolation=cv2.INTER_NEAREST)
+        caption = ('A:GT/lidar  B:map(R)+ray(G)+both(Y)+blocked(Blu)  '
+                   'C:final GT   frame=%d' % idx)
+        cv2.putText(strip, caption, (8, 18), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.45, (255, 255, 255), 1, cv2.LINE_AA)
+        # Sequential filenames so ffmpeg sees a contiguous frame range even
+        # when --stride skips dataset indices.
+        cv2.imwrite(osp.join(args.out_dir, 'gt_%05d.png' % seq), strip)
+        seq += 1
+        print('frame %5d: final=%d px (map=%d ray=%d blocked=%d)'
+              % (idx, stats['final'], stats['map'], stats['ray'],
+                 stats['blocked']))
+
+    if seq == 0:
+        print('No usable frames; nothing rendered.')
+        return
+    print('rendered %d frames to %s' % (seq, args.out_dir))
+
+    if args.video:
+        write_webm(args.out_dir, args.video, args.fps)
+        print('video saved to %s' % args.video)
+
+
+if __name__ == '__main__':
+    main()
