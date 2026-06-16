@@ -98,6 +98,31 @@ def lidar_height_bev(pts, pc_range, bev_size):
     return panel
 
 
+def _draw_height_colorbar(panel, z_min, z_max):
+    """Overlay a small vertical JET colorbar (height key) inside a panel.
+
+    Drawn directly on panel D so the low/high height ramp is scoped to the
+    point cloud it describes, instead of leaking into the shared legend.
+    """
+    h, w = panel.shape[:2]
+    bar_h = int(h * 0.5)
+    bar_w = 10
+    x0 = w - bar_w - 8
+    y0 = int(h * 0.25)
+    ramp = np.linspace(255, 0, bar_h).astype(np.uint8).reshape(-1, 1)
+    ramp = cv2.applyColorMap(ramp, cv2.COLORMAP_JET)
+    panel[y0:y0 + bar_h, x0:x0 + bar_w] = ramp
+    cv2.rectangle(panel, (x0, y0), (x0 + bar_w, y0 + bar_h),
+                  (200, 200, 200), 1)
+    cv2.putText(panel, 'high', (x0 - 34, y0 + 10),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (235, 235, 235), 1,
+                cv2.LINE_AA)
+    cv2.putText(panel, 'low', (x0 - 30, y0 + bar_h),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (235, 235, 235), 1,
+                cv2.LINE_AA)
+    return panel
+
+
 def _titled_panel(panel, title, scale):
     """Upscale a panel and stack a dark title bar on top of it."""
     big = cv2.resize(panel, None, fx=scale, fy=scale,
@@ -164,6 +189,8 @@ def render_frame(map_mask, ground, blocked, pts, pc_range, bev_size,
                            cv2.COLOR_GRAY2BGR)
 
     d = _titled_panel(panel_d, 'D: raw LiDAR (colour = height)', scale)
+    # Height key lives inside D, scoped to the panel it describes.
+    _draw_height_colorbar(d, pc_range[2], pc_range[5])
     a = _titled_panel(panel_a, 'A: final drivable GT + LiDAR', scale)
     b = _titled_panel(panel_b, 'B: where the GT comes from', scale)
     c = _titled_panel(panel_c, 'C: final mask (Dice target)', scale)
@@ -174,11 +201,9 @@ def render_frame(map_mask, ground, blocked, pts, pc_range, bev_size,
     vpad = np.full((6, top.shape[1], 3), 30, dtype=np.uint8)
     grid = np.concatenate([top, vpad, bottom], axis=0)
 
-    # Legend rows: D/A semantics, then B semantics.
+    # Legend rows: A semantics, then B semantics. (D's height ramp is shown
+    # by the in-panel colorbar, not here, since it applies only to panel D.)
     legend_da = _legend_bar(grid.shape[1], [
-        ((0, 0, 255), 'low'),
-        ((0, 255, 255), 'mid height'),
-        ((0, 0, 128), 'high (LiDAR z)'),
         ((60, 200, 60), 'drivable GT'),
         ((120, 120, 120), 'LiDAR density'),
         ((255, 255, 255), 'ego'),
