@@ -2,10 +2,12 @@
 """Visualize the fused KL drivable seg-head ground-truth.
 
 Renders the target that ``GenerateKLDrivableMapLabels`` feeds to the
-Pansegformer seg-head, for a bounded set of frames. Each frame is a 3-panel
-strip; every panel has its own title bar and the colours are explained by
-two legend strips along the bottom:
+Pansegformer seg-head, for a bounded set of frames. Each frame is a 2x2
+grid; every panel has its own title bar and the colours are explained by
+two legend strips along the bottom. Panels read input -> output:
 
+* **D: raw LiDAR (colour = height)** -- the raw point cloud coloured by z
+  via a JET colormap (top-left); the model's actual input.
 * **A: final drivable GT + LiDAR** -- final drivable GT (green) over a
   LiDAR point-density backdrop (gray), with the ego centre marked (red).
 * **B: where the GT comes from** -- source decomposition: red = HD-map only,
@@ -72,9 +74,30 @@ def lidar_density_bev(pts, pc_range, bev_size):
     return (np.clip(bg, 0, 3) * 70).astype(np.uint8)
 
 
-def render_frame(map_mask, ground, blocked, pts, pc_range, bev_size):
-    """Build the 3-panel BGR strip for one frame."""
+def lidar_height_bev(pts, pc_range, bev_size):
+    """BGR panel of raw LiDAR coloured by height (z), JET colormap.
+
+    Higher points are warmer; the topmost point per pixel wins so tall
+    structures (stacks, gantry) stand out over ground. This is a richer
+    view of the raw input than the gray density backdrop in panel A.
+    """
     h, w = bev_size
+    x_min, y_min, z_min, x_max, y_max, z_max = [float(v) for v in pc_range]
+    cols = ((pts[:, 0] - x_min) / (x_max - x_min) * w).astype(int)
+    rows = ((y_max - pts[:, 1]) / (y_max - y_min) * h).astype(int)
+    ok = (cols >= 0) & (cols < w) & (rows >= 0) & (rows < h)
+    cols, rows, z = cols[ok], rows[ok], pts[ok, 2]
+    # Keep the highest point per pixel so foreground structure is visible.
+    order = np.argsort(z)
+    cols, rows, z = cols[order], rows[order], z[order]
+    z_norm = np.clip((z - z_min) / max(z_max - z_min, 1e-6), 0, 1)
+    color = cv2.applyColorMap((z_norm * 255).astype(np.uint8),
+                              cv2.COLORMAP_JET).reshape(-1, 3)
+    panel = np.zeros((h, w, 3), dtype=np.uint8)
+    panel[rows, cols] = color
+    return panel
+
+
 def _titled_panel(panel, title, scale):
     """Upscale a panel and stack a dark title bar on top of it."""
     big = cv2.resize(panel, None, fx=scale, fy=scale,
@@ -103,15 +126,22 @@ def _legend_bar(width, items):
 
 def render_frame(map_mask, ground, blocked, pts, pc_range, bev_size,
                  scale=3, frame_idx=None):
-    """Build the labelled 3-panel BGR strip for one frame.
+    """Build the labelled 2x2 panel figure for one frame.
 
-    Each panel carries its own title bar; a shared legend strip explaining
-    every colour is stacked along the bottom so the figure is readable
-    without consulting the docstring.
+    Panels read input -> output, left-to-right then top-to-bottom:
+    D (raw LiDAR by height) | A (final GT on density) on the top row,
+    B (source decomposition) | C (final Dice mask) on the bottom row.
+    Each panel has its own title bar; legend strips along the bottom
+    explain every colour so the figure stands on its own.
     """
     h, w = bev_size
     final = np.maximum(map_mask, ground).astype(np.uint8)
     final[blocked > 0] = 0
+
+    # Panel D: raw LiDAR coloured by height (the model's actual input).
+    panel_d = lidar_height_bev(pts, pc_range, bev_size)
+    cv2.drawMarker(panel_d, (w // 2, h // 2), (255, 255, 255),
+                   cv2.MARKER_CROSS, 8, 1)
 
     # Panel A: final GT over lidar density, ego centre cross.
     bg = lidar_density_bev(pts, pc_range, bev_size)
@@ -133,26 +163,33 @@ def render_frame(map_mask, ground, blocked, pts, pc_range, bev_size,
     panel_c = cv2.cvtColor((final * 255).astype(np.uint8),
                            cv2.COLOR_GRAY2BGR)
 
+    d = _titled_panel(panel_d, 'D: raw LiDAR (colour = height)', scale)
     a = _titled_panel(panel_a, 'A: final drivable GT + LiDAR', scale)
     b = _titled_panel(panel_b, 'B: where the GT comes from', scale)
     c = _titled_panel(panel_c, 'C: final mask (Dice target)', scale)
 
-    pad = np.full((a.shape[0], 6, 3), 30, dtype=np.uint8)
-    row = np.concatenate([a, pad, b, pad, c], axis=1)
+    hpad = np.full((d.shape[0], 6, 3), 30, dtype=np.uint8)
+    top = np.concatenate([d, hpad, a], axis=1)
+    bottom = np.concatenate([b, hpad, c], axis=1)
+    vpad = np.full((6, top.shape[1], 3), 30, dtype=np.uint8)
+    grid = np.concatenate([top, vpad, bottom], axis=0)
 
-    # Two legend rows: panel-A semantics, then panel-B semantics.
-    legend_a = _legend_bar(row.shape[1], [
+    # Legend rows: D/A semantics, then B semantics.
+    legend_da = _legend_bar(grid.shape[1], [
+        ((0, 0, 255), 'low'),
+        ((0, 255, 255), 'mid height'),
+        ((0, 0, 128), 'high (LiDAR z)'),
         ((60, 200, 60), 'drivable GT'),
-        ((120, 120, 120), 'LiDAR points'),
-        ((0, 0, 255), 'ego'),
+        ((120, 120, 120), 'LiDAR density'),
+        ((255, 255, 255), 'ego'),
     ])
-    legend_b = _legend_bar(row.shape[1], [
+    legend_b = _legend_bar(grid.shape[1], [
         ((0, 0, 255), 'HD-map only'),
         ((0, 255, 0), 'raycast ground only'),
         ((0, 255, 255), 'both agree'),
         ((255, 80, 0), 'obstacle (removed)'),
     ])
-    out = np.concatenate([row, legend_a, legend_b], axis=0)
+    out = np.concatenate([grid, legend_da, legend_b], axis=0)
     if frame_idx is not None:
         cv2.putText(out, 'frame %d' % frame_idx,
                     (out.shape[1] - 96, 18), cv2.FONT_HERSHEY_SIMPLEX,
