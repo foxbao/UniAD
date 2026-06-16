@@ -130,8 +130,7 @@ train_pipeline = [
     dict(type='ObjectNameFilterTrack', classes=class_names),
     dict(
         type='GenerateKLDrivableMapLabels',
-        map_file='data/kl_8/map/base_map.txt',
-        clean_map_file='data/kl_8/map/base_map_drivable_clean.pkl',
+        use_map=False,
         point_cloud_range=point_cloud_range,
         bev_size=canvas_size,
         augment_raycast_ground=True,
@@ -170,8 +169,7 @@ test_pipeline = [
     dict(type='PointsRangeFilter', point_cloud_range=point_cloud_range),
     dict(
         type='GenerateKLDrivableMapLabels',
-        map_file='data/kl_8/map/base_map.txt',
-        clean_map_file='data/kl_8/map/base_map_drivable_clean.pkl',
+        use_map=False,
         point_cloud_range=point_cloud_range,
         bev_size=canvas_size,
         augment_raycast_ground=True,
