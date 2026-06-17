@@ -96,6 +96,43 @@ def _build_occ_eval_ranges(dataset, occ_tensor):
     }
 
 
+def _detach_to_cpu(obj):
+    if torch.is_tensor(obj):
+        return obj.detach().cpu()
+    if hasattr(obj, 'tensor') and hasattr(obj, 'to'):
+        return obj.to('cpu')
+    if isinstance(obj, dict):
+        return {k: _detach_to_cpu(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_detach_to_cpu(v) for v in obj]
+    if isinstance(obj, tuple):
+        return tuple(_detach_to_cpu(v) for v in obj)
+    return obj
+
+
+def _strip_eval_intermediates(item):
+    """Remove per-frame GPU intermediates that are not used by metrics."""
+    item.pop('occ', None)
+    item.pop('planning', None)
+    item.pop('map', None)
+    item.pop('args_tuple', None)
+    pts_bbox = item.get('pts_bbox', None)
+    if isinstance(pts_bbox, dict):
+        for key in [
+                'bev_embed', 'bev_pos', 'prev_bev',
+                'track_query_embeddings', 'track_query_matched_idxes',
+                'track_bbox_results', 'sdc_embedding',
+                'sdc_track_bbox_results', 'map', 'args_tuple',
+                'score_list', 'lane', 'lane_score', 'stuff_score_list',
+                'panoptic', 'segm'
+        ]:
+            pts_bbox.pop(key, None)
+        item['pts_bbox'] = _detach_to_cpu(pts_bbox)
+    if 'ret_iou' in item:
+        item['ret_iou'] = _detach_to_cpu(item['ret_iou'])
+    return item
+
+
 def custom_multi_gpu_test(model, data_loader, tmpdir=None, gpu_collect=False):
     """Test model with multiple gpus.
     This method tests model with multiple gpus and collects the results
@@ -143,6 +180,7 @@ def custom_multi_gpu_test(model, data_loader, tmpdir=None, gpu_collect=False):
     time.sleep(2)  # This line can prevent deadlock problem in some cases.
     have_mask = False
     num_occ = 0
+    plot_mode = os.environ.get('ENABLE_PLOT_MODE', None) is not None
     for i, data in enumerate(data_loader):
         with torch.no_grad():
             forward_model, data = _scatter_data_for_eval(model, data)
@@ -190,16 +228,24 @@ def custom_multi_gpu_test(model, data_loader, tmpdir=None, gpu_collect=False):
                                 ..., y_limits, x_limits].contiguous())
 
             # Pop out unnecessary occ results, avoid appending it to cpu when collect_results_cpu
-            if os.environ.get('ENABLE_PLOT_MODE', None) is None:
-                result[0].pop('occ', None)
-                result[0].pop('planning', None)
+            result_items = [result] if isinstance(result, dict) else result
+            if not plot_mode:
+                for item in result_items:
+                    if not isinstance(item, dict):
+                        continue
+                    _strip_eval_intermediates(item)
             else:
-                for k in ['seg_gt', 'ins_seg_gt', 'pred_ins_sigmoid', 'seg_out', 'ins_seg_out']:
-                    if k in result[0]['occ']:
-                        result[0]['occ'][k] = result[0]['occ'][k].detach().cpu()
-                for k in ['bbox', 'segm', 'labels', 'panoptic', 'drivable', 'score_list', 'lane', 'lane_score', 'stuff_score_list']:
-                    if k in result[0]['pts_bbox'] and isinstance(result[0]['pts_bbox'][k], torch.Tensor):
-                        result[0]['pts_bbox'][k] = result[0]['pts_bbox'][k].detach().cpu()
+                for item in result_items:
+                    if not isinstance(item, dict):
+                        continue
+                    if 'occ' in item:
+                        item['occ'] = _detach_to_cpu(item['occ'])
+                    if 'planning' in item:
+                        item['planning'] = _detach_to_cpu(item['planning'])
+                    if 'map' in item:
+                        item['map'] = _detach_to_cpu(item['map'])
+                    if 'pts_bbox' in item:
+                        item['pts_bbox'] = _detach_to_cpu(item['pts_bbox'])
 
             # encode mask results
             if isinstance(result, dict):

@@ -30,17 +30,7 @@ model = dict(
         canvas_size=canvas_size,
         pc_range=point_cloud_range,
         eval_drivable_only=True,
-        # Drivable-only: skip the dead things branch in the training loss path
-        # (Hungarian matching + things_mask_head + per-layer things losses).
-        # stuff/drivable path is independent of the things queries, so this
-        # changes no drivable gradient. Default False elsewhere -> the 5 shared
-        # configs that build PansegformerHead are unaffected.
-        train_drivable_only=True,
-        # stuff path does not use the things-decoder queries at all, so the
-        # query count only sizes the (now loss-gated) things decoder. Shrink it
-        # from 600 to a tiny value to drop dead decoder compute. Provably no
-        # effect on drivable IoU.
-        num_query=30,
+        num_query=600,
         num_classes=4,
         num_things_classes=3,
         num_stuff_classes=1,

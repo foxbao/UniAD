@@ -51,6 +51,8 @@ class PansegformerHead(SegDETRHead):
             quality_threshold_stuff=0.25,
             overlap_threshold_things=0.4,
             overlap_threshold_stuff=0.2,
+            eval_drivable_only=False,
+            train_drivable_only=False,
             thing_transformer_head=dict(
                 type='TransformerHead',  # mask decoder for things
                 d_model=256,
@@ -86,6 +88,13 @@ class PansegformerHead(SegDETRHead):
         self.quality_threshold_stuff = quality_threshold_stuff
         self.overlap_threshold_things = overlap_threshold_things
         self.overlap_threshold_stuff = overlap_threshold_stuff
+        self.eval_drivable_only = eval_drivable_only
+        # When True, the training loss path skips the (dead, things_ratio=0)
+        # things branch entirely: no Hungarian matching, no things_mask_head,
+        # no per-layer things losses. Only the stuff/drivable path runs. Has no
+        # effect on the eval path (see eval_drivable_only). Default False so the
+        # shared PansegformerHead configs keep full panoptic behaviour.
+        self.train_drivable_only = train_drivable_only
         self.fp16_enabled = False
 
         if self.as_two_stage:
@@ -346,6 +355,27 @@ class PansegformerHead(SegDETRHead):
 
             gt_stuff_labels_list.append(gt_labels_list[i][stuff_selected])
             gt_stuff_masks_list.append(gt_masks_list[i][stuff_selected])
+
+        # Drivable-only: the things branch carries no GT (things_ratio==0), so
+        # skip the L-1 layer things Hungarian matching and emit only stuff loss
+        # keys. loss_single_panoptic runs stuff-only (no things_mask_head, no
+        # things matching). stuff_ratio is forced to 1.0.
+        if self.train_drivable_only:
+            (losses_masks_stuff_f, loss_mask_stuff_list_f,
+             loss_cls_stuff_list_f, stuff_ratio) = self.loss_single_panoptic(
+                all_cls_scores[-1], all_bbox_preds[-1], args_tuple, reference,
+                gt_things_bboxes_list, gt_things_lables_list,
+                gt_things_masks_list,
+                (gt_stuff_labels_list, gt_stuff_masks_list), img_metas,
+                gt_bboxes_ignore)
+            loss_dict = dict()
+            loss_dict['loss_mask_stuff'] = losses_masks_stuff_f * stuff_ratio
+            for i in range(len(loss_mask_stuff_list_f)):
+                loss_dict[f'd{i}.loss_mask_stuff_f'] = \
+                    loss_mask_stuff_list_f[i] * stuff_ratio
+                loss_dict[f'd{i}.loss_cls_stuff_f'] = \
+                    loss_cls_stuff_list_f[i] * stuff_ratio
+            return loss_dict
 
         num_dec_layers = len(all_cls_scores)
         all_gt_bboxes_list = [
@@ -702,6 +732,9 @@ class PansegformerHead(SegDETRHead):
         """
         num_imgs = cls_scores.size(0)
         gt_stuff_labels_list, gt_stuff_masks_list = gt_panoptic_list
+        if self.train_drivable_only:
+            return self._loss_single_panoptic_stuff(
+                args_tuple, gt_stuff_labels_list, gt_stuff_masks_list)
         cls_scores_list = [cls_scores[i] for i in range(num_imgs)]
         bbox_preds_list = [bbox_preds[i] for i in range(num_imgs)]
         loss_cls, loss_iou, loss_bbox, pos_inds_mask_list, num_total_pos_thing = self.get_filter_results_and_loss(
@@ -1001,7 +1034,124 @@ class PansegformerHead(SegDETRHead):
                 num_total_pos_stuff + num_total_pos_thing)
 
         return loss_cls, loss_bbox, loss_iou, loss_mask_things, loss_mask_stuff, loss_mask_things_list, loss_mask_stuff_list, loss_iou_list, loss_bbox_list, loss_cls_thing_list, loss_cls_stuff_list, things_ratio, stuff_ratio
-    
+
+    def _loss_single_panoptic_stuff(self, args_tuple, gt_stuff_labels_list,
+                                    gt_stuff_masks_list):
+        """Stuff/drivable-only loss: runs stuff_mask_head only, no things
+        matching / things_mask_head. Mirrors the stuff branch of
+        loss_single_panoptic. Returns (loss_mask_stuff, loss_mask_stuff_list,
+        loss_cls_stuff_list, stuff_ratio=1.0)."""
+        memory, memory_mask, _, query, _, _, hw_lvl = args_tuple
+        BS = query.shape[0]
+        stuff_query, stuff_query_pos = torch.split(self.stuff_query.weight,
+                                                   self.embed_dims, dim=1)
+        stuff_query = stuff_query.unsqueeze(0).expand(BS, -1, -1)
+        stuff_query_pos = stuff_query_pos.unsqueeze(0).expand(BS, -1, -1)
+
+        mask_stuff, mask_inter_stuff, query_inter_stuff = self.stuff_mask_head(
+            memory, memory_mask, None, stuff_query, None, stuff_query_pos,
+            hw_lvl=hw_lvl)
+        mask_stuff = mask_stuff.squeeze(-1)
+        mask_inter_stuff = torch.stack(mask_inter_stuff, 0).squeeze(-1)
+
+        mask_preds_stuff = []
+        mask_preds_inter_stuff = [[] for _ in range(self.num_dec_stuff)]
+        cls_stuff_preds = [[] for _ in range(self.num_dec_stuff)]
+        for i in range(BS):
+            mask_preds_stuff.append(mask_stuff[i].reshape(-1, *hw_lvl[0]))
+            for j in range(self.num_dec_stuff):
+                mask_preds_inter_stuff[j].append(
+                    mask_inter_stuff[j][i].reshape(-1, *hw_lvl[0]))
+                query_stuff = query_inter_stuff[j]
+                s1, s2, s3 = query_stuff.shape
+                cls_stuff_preds[j].append(self.cls_stuff_branches[j](
+                    query_stuff.reshape(s1 * s2, s3)))
+        mask_preds_stuff = torch.cat(mask_preds_stuff, 0)
+        mask_preds_inter_stuff = [
+            torch.cat(each, 0) for each in mask_preds_inter_stuff
+        ]
+        cls_stuff_preds = [torch.cat(each, 0) for each in cls_stuff_preds]
+
+        return self._stuff_losses(mask_preds_stuff, mask_preds_inter_stuff,
+                                  cls_stuff_preds, gt_stuff_labels_list,
+                                  gt_stuff_masks_list, BS)
+
+    def _stuff_losses(self, mask_preds_stuff, mask_preds_inter_stuff,
+                      cls_stuff_preds, gt_stuff_labels_list,
+                      gt_stuff_masks_list, BS):
+        """Build stuff GT and compute stuff mask + cls losses. Mirrors the
+        stuff portion of loss_single_panoptic exactly."""
+        device = mask_preds_stuff.device
+        mask_stuff_gt = []
+        mask_weight_stuff = []
+        stuff_labels = []
+        num_total_pos_stuff = 0
+        for i in range(BS):
+            num_total_pos_stuff += len(gt_stuff_labels_list[i])
+            select_stuff_index = gt_stuff_labels_list[i] - \
+                self.num_things_classes
+            mask_weight_i_stuff = torch.zeros([self.num_stuff_classes])
+            mask_weight_i_stuff[select_stuff_index] = 1
+            stuff_masks = torch.zeros(
+                (self.num_stuff_classes, *gt_stuff_masks_list[i].shape[-2:]),
+                device=gt_stuff_masks_list[i].device).to(torch.bool)
+            stuff_masks[select_stuff_index] = gt_stuff_masks_list[i].to(
+                torch.bool)
+            mask_stuff_gt.append(stuff_masks)
+            stuff_labels.append(1 - mask_weight_i_stuff)
+            mask_weight_stuff.append(mask_weight_i_stuff)
+
+        mask_weight_stuff = torch.cat(mask_weight_stuff, 0).to(device)
+        stuff_labels = torch.cat(stuff_labels, 0).to(device)
+        mask_stuff_gt = torch.cat(mask_stuff_gt, 0).to(torch.float)
+
+        num_total_pos_stuff = mask_preds_stuff.new_tensor([num_total_pos_stuff])
+        num_total_pos_stuff = torch.clamp(reduce_mean(num_total_pos_stuff),
+                                          min=1).item()
+
+        if mask_preds_stuff.shape[0] == 0:
+            loss_mask_stuff = (0 * mask_preds_stuff).sum()
+        else:
+            mask_preds = F.interpolate(mask_preds_stuff.unsqueeze(0),
+                                       scale_factor=2.0,
+                                       mode='bilinear').squeeze(0)
+            mask_targets_stuff = F.interpolate(mask_stuff_gt.unsqueeze(0),
+                                               size=mask_preds.shape[-2:],
+                                               mode='bilinear').squeeze(0)
+            loss_mask_stuff = self.loss_mask(mask_preds, mask_targets_stuff,
+                                             mask_weight_stuff,
+                                             avg_factor=num_total_pos_stuff)
+
+        loss_mask_stuff_list = []
+        for j in range(len(mask_preds_inter_stuff)):
+            mask_preds_this_level = mask_preds_inter_stuff[j]
+            if mask_preds_this_level.shape[0] == 0:
+                loss_mask_j = (0 * mask_preds_this_level).sum()
+            else:
+                mask_preds_this_level = F.interpolate(
+                    mask_preds_this_level.unsqueeze(0), scale_factor=2.0,
+                    mode='bilinear').squeeze(0)
+                loss_mask_j = self.loss_mask(mask_preds_this_level,
+                                             mask_targets_stuff,
+                                             mask_weight_stuff,
+                                             avg_factor=num_total_pos_stuff)
+            loss_mask_stuff_list.append(loss_mask_j)
+
+        loss_cls_stuff_list = []
+        for j in range(len(mask_preds_inter_stuff)):
+            cls_scores = cls_stuff_preds[j]
+            if cls_scores.shape[0] == 0:
+                loss_cls_stuff_j = cls_stuff_preds[j].sum() * 0
+            else:
+                loss_cls_stuff_j = self.loss_cls(
+                    cls_stuff_preds[j], stuff_labels.to(torch.long),
+                    avg_factor=num_total_pos_stuff) * 2
+            loss_cls_stuff_list.append(loss_cls_stuff_j)
+
+        stuff_ratio = 1.0
+        return loss_mask_stuff, loss_mask_stuff_list, loss_cls_stuff_list, \
+            stuff_ratio
+
     def forward_test(self,
                     pts_feats=None,
                     gt_lane_labels=None,
@@ -1011,31 +1161,42 @@ class PansegformerHead(SegDETRHead):
         bbox_list = [dict() for i in range(len(img_metas))]
 
         pred_seg_dict = self(pts_feats)
-        results = self.get_bboxes(pred_seg_dict['outputs_classes'],
-                                           pred_seg_dict['outputs_coords'],
-                                           pred_seg_dict['enc_outputs_class'],
-                                           pred_seg_dict['enc_outputs_coord'],
-                                           pred_seg_dict['args_tuple'],
-                                           pred_seg_dict['reference'],
-                                           img_metas,
-                                           rescale=rescale)
+        if self.eval_drivable_only:
+            results = self.get_drivable_bboxes(
+                pred_seg_dict['args_tuple'], img_metas, rescale=rescale)
+        else:
+            results = self.get_bboxes(pred_seg_dict['outputs_classes'],
+                                               pred_seg_dict['outputs_coords'],
+                                               pred_seg_dict['enc_outputs_class'],
+                                               pred_seg_dict['enc_outputs_coord'],
+                                               pred_seg_dict['args_tuple'],
+                                               pred_seg_dict['reference'],
+                                               img_metas,
+                                               rescale=rescale)
 
         with torch.no_grad():
             drivable_pred = results[0]['drivable']
             drivable_gt = gt_lane_masks[0][0, -1]
             drivable_iou, drivable_intersection, drivable_union = IOU(drivable_pred.view(1, -1), drivable_gt.view(1, -1))
 
-            lane_pred = results[0]['lane']
-            lanes_pred = (results[0]['lane'].sum(0) > 0).int()
-            lanes_gt = (gt_lane_masks[0][0][:-1].sum(0) > 0).int()
-            lanes_iou, lanes_intersection, lanes_union = IOU(lanes_pred.view(1, -1), lanes_gt.view(1, -1))
+            if self.eval_drivable_only:
+                zero = drivable_intersection.new_zeros(())
+                lanes_iou, lanes_intersection, lanes_union = zero, zero, zero
+                divider_iou, divider_intersection, divider_union = zero, zero, zero
+                crossing_iou, crossing_intersection, crossing_union = zero, zero, zero
+                contour_iou, contour_intersection, contour_union = zero, zero, zero
+            else:
+                lane_pred = results[0]['lane']
+                lanes_pred = (results[0]['lane'].sum(0) > 0).int()
+                lanes_gt = (gt_lane_masks[0][0][:-1].sum(0) > 0).int()
+                lanes_iou, lanes_intersection, lanes_union = IOU(lanes_pred.view(1, -1), lanes_gt.view(1, -1))
 
-            divider_gt = (gt_lane_masks[0][0][gt_lane_labels[0][0] == 0].sum(0) > 0).int()
-            crossing_gt = (gt_lane_masks[0][0][gt_lane_labels[0][0] == 1].sum(0) > 0).int()
-            contour_gt = (gt_lane_masks[0][0][gt_lane_labels[0][0] == 2].sum(0) > 0).int()
-            divider_iou, divider_intersection, divider_union = IOU(lane_pred[0].view(1, -1), divider_gt.view(1, -1))
-            crossing_iou, crossing_intersection, crossing_union = IOU(lane_pred[1].view(1, -1), crossing_gt.view(1, -1))
-            contour_iou, contour_intersection, contour_union = IOU(lane_pred[2].view(1, -1), contour_gt.view(1, -1))
+                divider_gt = (gt_lane_masks[0][0][gt_lane_labels[0][0] == 0].sum(0) > 0).int()
+                crossing_gt = (gt_lane_masks[0][0][gt_lane_labels[0][0] == 1].sum(0) > 0).int()
+                contour_gt = (gt_lane_masks[0][0][gt_lane_labels[0][0] == 2].sum(0) > 0).int()
+                divider_iou, divider_intersection, divider_union = IOU(lane_pred[0].view(1, -1), divider_gt.view(1, -1))
+                crossing_iou, crossing_intersection, crossing_union = IOU(lane_pred[1].view(1, -1), crossing_gt.view(1, -1))
+                contour_iou, contour_intersection, contour_union = IOU(lane_pred[2].view(1, -1), contour_gt.view(1, -1))
 
 
             ret_iou = {'drivable_intersection': drivable_intersection,
@@ -1307,5 +1468,66 @@ class PansegformerHead(SegDETRHead):
                 'lane': lane_list[i],
                 'lane_score': lane_score_list[i],
                 'stuff_score_list' : stuff_score_list[i],
+            })
+        return results
+
+    def get_drivable_bboxes(self, args_tuple, img_metas, rescale=False):
+        """Decode only the stuff/drivable mask for drivable-only evaluation."""
+        memory, memory_mask, memory_pos, query, _, query_pos, hw_lvl = args_tuple
+
+        results = []
+        for img_id in range(len(img_metas)):
+            i = img_id
+            ori_shape = (self.canvas_size[0], self.canvas_size[1], 3)
+            stuff_query = self.stuff_query.weight[None, :, :self.embed_dims]
+            stuff_query_pos = self.stuff_query.weight[None, :,
+                                                      self.embed_dims:]
+
+            mask_stuff, mask_inter_stuff, query_inter_stuff = self.stuff_mask_head(
+                memory[i:i + 1],
+                memory_mask[i:i + 1],
+                None,
+                stuff_query,
+                None,
+                stuff_query_pos,
+                hw_lvl=hw_lvl)
+
+            attn_map = mask_stuff.squeeze(-1)
+            mask_pred = attn_map.reshape(-1, *hw_lvl[0])
+            mask_pred = F.interpolate(mask_pred.unsqueeze(0),
+                                      size=ori_shape[:2],
+                                      mode='bilinear').squeeze(0)
+
+            height, width = mask_pred.shape[-2:]
+            drivable = mask_pred[-1] > 0.5
+            lane = torch.zeros(
+                (self.num_things_classes, height, width),
+                dtype=torch.long,
+                device=mask_pred.device)
+            lane_score = torch.zeros(
+                (self.num_things_classes, height, width),
+                dtype=mask_pred.dtype,
+                device=mask_pred.device)
+            bbox = mask_pred.new_zeros((0, 5))
+            labels = torch.zeros((0,), dtype=torch.long, device=mask_pred.device)
+            seg = torch.zeros(
+                (0, height, width), dtype=torch.bool, device=mask_pred.device)
+            file_name = img_metas[img_id]['pts_filename'].split('/')[-1].split('.')[0]
+            panoptic = (
+                torch.zeros((height, width, 2), dtype=torch.long).cpu().numpy(),
+                file_name,
+                ori_shape)
+
+            results.append({
+                'bbox': bbox,
+                'segm': seg,
+                'labels': labels,
+                'panoptic': panoptic,
+                'drivable': drivable,
+                'score_list': mask_pred,
+                'lane': lane,
+                'lane_score': lane_score,
+                'stuff_score_list': self.cls_stuff_branches[-1](
+                    query_inter_stuff[-1]).sigmoid().reshape(-1),
             })
         return results
