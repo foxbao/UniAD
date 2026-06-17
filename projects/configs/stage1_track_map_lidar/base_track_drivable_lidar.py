@@ -30,7 +30,14 @@ model = dict(
         canvas_size=canvas_size,
         pc_range=point_cloud_range,
         eval_drivable_only=True,
-        num_query=600,
+        # Drivable is a single stuff-class mask; the things detection branch
+        # gets no GT (things_ratio=0) and runs dead. num_query only feeds that
+        # branch (stuff uses an independent stuff_query of size num_stuff_
+        # classes), so shrinking it from the original 600 cuts ~5/6 of the
+        # dead things-decoder cost with zero effect on the drivable output.
+        # NOTE: changing this changes query_embedding's shape -> cannot
+        # resume/finetune from a 600-query checkpoint; train from scratch.
+        num_query=100,
         num_classes=4,
         num_things_classes=3,
         num_stuff_classes=1,
