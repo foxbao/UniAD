@@ -1,13 +1,5 @@
 _base_ = ['./base_track_lidar.py']
 
-# Drivable-only training with the dedicated LidarDrivableHead. Same compute that
-# produces the ~0.78 baseline (deformable BEV encoder + stuff SegMaskHead +
-# stuff query/cls), with the dead things branch (decoder, query_embedding,
-# cls/reg branches, things_mask_head, Hungarian assigners, focal/bbox/iou
-# losses) physically removed. Parallel to base_track_drivable_lidar_panseg.py
-# (the original PansegformerHead variant, kept for A/B comparison); both inherit
-# base_track_lidar.py directly and carry their own seg_head + pipeline.
-
 _dim_ = 256
 _pos_dim_ = _dim_ // 2
 _ffn_dim_ = _dim_ * 2
@@ -18,6 +10,9 @@ _feed_dim_ = _ffn_dim_
 _dim_half_ = _pos_dim_
 canvas_size = (bev_h_, bev_w_)
 
+# Inherits class_names / label_mapping / point_cloud_range / dataset_type /
+# queue_length / past_steps / fut_steps / train_gt_iou_threshold /
+# file_client_args from base_track_lidar.py.
 class_names = [
     'Pedestrian', 'Car', 'IGV-Full', 'Truck', 'Trailer-Empty',
     'Trailer-Full', 'IGV-Empty', 'Crane', 'OtherVehicle', 'Cone',
@@ -29,19 +24,32 @@ file_client_args = dict(backend='disk')
 model = dict(
     task_loss_weight=dict(track=1.0, map=1.0),
     seg_head=dict(
-        type='LidarDrivableHead',
+        type='PansegformerHead',
         bev_h=bev_h_,
         bev_w=bev_w_,
         canvas_size=canvas_size,
         pc_range=point_cloud_range,
-        in_channels=_dim_,
-        embed_dims=_dim_,
-        num_stuff_classes=1,
-        stuff_label_offset=3,
         eval_drivable_only=True,
+        # Drivable-only: skip the dead things branch in the training loss path
+        # (Hungarian matching + things_mask_head + per-layer things losses).
+        # stuff/drivable path is independent of the things queries, so this
+        # changes no drivable gradient. Default False elsewhere -> the 5 shared
+        # configs that build PansegformerHead are unaffected.
+        train_drivable_only=True,
+        # stuff path does not use the things-decoder queries at all, so the
+        # query count only sizes the (now loss-gated) things decoder. Shrink it
+        # from 600 to a tiny value to drop dead decoder compute. Provably no
+        # effect on drivable IoU.
+        num_query=30,
+        num_classes=4,
+        num_things_classes=3,
+        num_stuff_classes=1,
+        in_channels=_dim_,
+        sync_cls_avg_factor=True,
+        as_two_stage=False,
+        with_box_refine=True,
         transformer=dict(
-            type='SegDeformableEncoder',
-            num_feature_levels=_num_levels_,
+            type='SegDeformableTransformer',
             encoder=dict(
                 type='DetrTransformerEncoder',
                 num_layers=6,
@@ -53,25 +61,67 @@ model = dict(
                         num_levels=_num_levels_),
                     feedforward_channels=_feed_dim_,
                     ffn_dropout=0.1,
-                    operation_order=('self_attn', 'norm', 'ffn', 'norm')))),
+                    operation_order=('self_attn', 'norm', 'ffn', 'norm'))),
+            decoder=dict(
+                type='DeformableDetrTransformerDecoder',
+                num_layers=6,
+                return_intermediate=True,
+                transformerlayers=dict(
+                    type='DetrTransformerDecoderLayer',
+                    attn_cfgs=[
+                        dict(
+                            type='MultiheadAttention',
+                            embed_dims=_dim_,
+                            num_heads=8,
+                            dropout=0.1),
+                        dict(
+                            type='MultiScaleDeformableAttention',
+                            embed_dims=_dim_,
+                            num_levels=_num_levels_)
+                    ],
+                    feedforward_channels=_feed_dim_,
+                    ffn_dropout=0.1,
+                    operation_order=('self_attn', 'norm', 'cross_attn',
+                                     'norm', 'ffn', 'norm')))),
         positional_encoding=dict(
             type='SinePositionalEncoding',
             num_feats=_dim_half_,
             normalize=True,
             offset=-0.5),
+        loss_cls=dict(
+            type='FocalLoss',
+            use_sigmoid=True,
+            gamma=2.0,
+            alpha=0.25,
+            loss_weight=2.0),
+        loss_bbox=dict(type='L1Loss', loss_weight=5.0),
+        loss_iou=dict(type='GIoULoss', loss_weight=2.0),
+        loss_mask=dict(type='DiceLoss', loss_weight=2.0),
+        thing_transformer_head=dict(
+            type='SegMaskHead',
+            d_model=_dim_,
+            nhead=8,
+            num_decoder_layers=4),
         stuff_transformer_head=dict(
             type='SegMaskHead',
             d_model=_dim_,
             nhead=8,
             num_decoder_layers=6,
             self_attn=True),
-        loss_mask=dict(type='DiceLoss', loss_weight=2.0),
-        loss_cls=dict(
-            type='FocalLoss',
-            use_sigmoid=True,
-            gamma=2.0,
-            alpha=0.25,
-            loss_weight=2.0)))
+        train_cfg=dict(
+            assigner=dict(
+                type='HungarianAssigner',
+                cls_cost=dict(type='FocalLossCost', weight=2.0),
+                reg_cost=dict(type='BBoxL1Cost', weight=5.0, box_format='xywh'),
+                iou_cost=dict(type='IoUCost', iou_mode='giou', weight=2.0)),
+            assigner_with_mask=dict(
+                type='HungarianAssigner_multi_info',
+                cls_cost=dict(type='FocalLossCost', weight=2.0),
+                reg_cost=dict(type='BBoxL1Cost', weight=5.0, box_format='xywh'),
+                iou_cost=dict(type='IoUCost', iou_mode='giou', weight=2.0),
+                mask_cost=dict(type='DiceCost', weight=2.0)),
+            sampler=dict(type='PseudoSampler'),
+            sampler_with_mask=dict(type='PseudoSampler_segformer'))))
 
 train_pipeline = [
     dict(
@@ -155,4 +205,4 @@ data = dict(
         pipeline=test_pipeline,
         point_cloud_range=point_cloud_range))
 
-work_dir = './projects/work_dirs/stage1_track_map_lidar/base_track_drivable_lidar'
+work_dir = './projects/work_dirs/stage1_track_map_lidar/base_track_drivable_lidar_panseg'
