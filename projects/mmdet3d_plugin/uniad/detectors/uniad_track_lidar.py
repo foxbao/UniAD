@@ -472,7 +472,7 @@ class UniADTrackLidar(MVXTwoStageDetector):
             if bev_embed.shape[0] < bev_embed.shape[1]:
                 return bev_embed.permute(1, 0, 2).contiguous()
             return bev_embed
-        raise ValueError('PansegformerHead expects BEV shape [HW, B, C], '
+        raise ValueError('seg_head expects BEV shape [HW, B, C], '
                          '[B, HW, C], or [B, C, H, W], got '
                          f'{tuple(bev_embed.shape)}.')
 

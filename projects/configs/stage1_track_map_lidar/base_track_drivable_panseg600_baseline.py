@@ -195,4 +195,4 @@ data = dict(
         pipeline=test_pipeline,
         point_cloud_range=point_cloud_range))
 
-work_dir = './projects/work_dirs/stage1_track_map_lidar/base_track_drivable_lidar'
+work_dir = './projects/work_dirs/stage1_track_map_lidar/base_track_drivable_panseg600_baseline'
