@@ -2,22 +2,22 @@
 # LidarDrivableHead: a drivable-only segmentation head for the KL LiDAR project.
 #
 # It is a faithful *subset* of PansegformerHead: it keeps the exact compute that
-# produces the 0.78 drivable IoU baseline -- the deformable BEV encoder, the
-# stuff SegMaskHead, the stuff query and the stuff classification branch -- and
-# physically removes the entire things (object-detection) machinery that ran
-# dead (things_ratio==0) under the drivable-only task: the transformer decoder,
-# query_embedding, cls/reg branches, things_mask_head, the Hungarian assigners
-# and the focal/bbox/iou losses + get_bboxes decode.
+# produces the drivable IoU baseline -- the deformable BEV encoder, the stuff
+# SegMaskHead and the stuff query -- and physically removes the entire things
+# (object-detection) machinery that ran dead (things_ratio==0) under the
+# drivable-only task: the transformer decoder, query_embedding, cls/reg
+# branches, things_mask_head, the Hungarian assigners and the focal/bbox/iou
+# losses + get_bboxes decode. The single-class stuff classification head was
+# also pruned (a no-op with one stuff class).
 #
 # This does NOT touch PansegformerHead, which the 5 panoptic configs still use.
 # ---------------------------------------------------------------------------
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from mmcv.cnn import Linear
 from mmcv.cnn.bricks.transformer import (build_positional_encoding,
                                          build_transformer_layer_sequence)
-from mmcv.runner import BaseModule, force_fp32
+from mmcv.runner import BaseModule
 from mmcv.cnn.bricks.transformer import MultiScaleDeformableAttention
 from torch.nn.init import normal_
 
@@ -25,7 +25,7 @@ from mmdet.models.builder import HEADS, build_loss
 from mmdet.models.utils.builder import TRANSFORMER
 from mmdet.core import reduce_mean
 
-from .seg_head_plugin import IOU, SegMaskHead  # noqa: F401 (registered)
+from .seg_head_plugin import IOU  # noqa: F401 (registers seg_head_plugin)
 
 
 @TRANSFORMER.register_module()
@@ -92,7 +92,7 @@ class SegDeformableEncoder(BaseModule):
         spatial_shapes = []
         for lvl, (feat, mask, pos_embed) in enumerate(
                 zip(mlvl_feats, mlvl_masks, mlvl_pos_embeds)):
-            bs, c, h, w = feat.shape
+            bs, _, h, w = feat.shape
             spatial_shapes.append((h, w))
             feat = feat.flatten(2).transpose(1, 2)
             mask = mask.flatten(1)
@@ -139,7 +139,6 @@ class LidarDrivableHead(BaseModule):
     """
 
     def __init__(self,
-                 *args,
                  bev_h,
                  bev_w,
                  canvas_size,
@@ -152,8 +151,6 @@ class LidarDrivableHead(BaseModule):
                  positional_encoding=None,
                  stuff_transformer_head=None,
                  loss_mask=dict(type='DiceLoss', loss_weight=2.0),
-                 train_cfg=None,
-                 test_cfg=dict(max_per_img=100),
                  eval_drivable_only=True,
                  init_cfg=None,
                  **kwargs):
@@ -168,7 +165,6 @@ class LidarDrivableHead(BaseModule):
         self.stuff_label_offset = stuff_label_offset
         self.num_dec_stuff = stuff_transformer_head['num_decoder_layers']
         self.eval_drivable_only = eval_drivable_only
-        self.test_cfg = test_cfg
         self.fp16_enabled = False
 
         self.positional_encoding = build_positional_encoding(
@@ -179,16 +175,9 @@ class LidarDrivableHead(BaseModule):
         self._init_layers()
 
     def _init_layers(self):
-        # BEV positional query, exactly as PansegformerHead (non-two-stage).
-        self.bev_embedding = nn.Embedding(self.bev_h * self.bev_w,
-                                          self.embed_dims)
         # stuff query: split into (query, query_pos) of embed_dims each.
         self.stuff_query = nn.Embedding(self.num_stuff_classes,
                                         self.embed_dims * 2)
-        if self.in_channels != self.embed_dims:
-            self.input_proj = Linear(self.in_channels, self.embed_dims)
-        else:
-            self.input_proj = None
 
     def init_weights(self):
         self.encoder.init_weights()
@@ -232,10 +221,10 @@ class LidarDrivableHead(BaseModule):
         return losses, pred_seg_dict
 
     def loss(self, args_tuple, gt_labels_list, gt_masks_list):
-        """Stuff-only loss. Mirrors the verified stuff path of
-        PansegformerHead.loss_single_panoptic (drivable == single stuff class).
+        """Stuff-only loss, mirroring the verified stuff mask path of
+        PansegformerHead (drivable == single stuff class).
 
-        gt_labels_list[i] holds the drivable label (== num stuff offset); the
+        gt_labels_list[i] holds the drivable label (== stuff_label_offset); the
         stuff GT mask is gt_masks_list[i]. Emits loss keys identical to the
         PansegformerHead drivable-only path so the detector's
         loss_weighted_and_prefixed(..., 'map') is unchanged."""
@@ -336,7 +325,7 @@ class LidarDrivableHead(BaseModule):
             ori_shape = (self.canvas_size[0], self.canvas_size[1], 3)
             stuff_query = self.stuff_query.weight[None, :, :self.embed_dims]
             stuff_query_pos = self.stuff_query.weight[None, :, self.embed_dims:]
-            mask_stuff, mask_inter_stuff, _ = \
+            mask_stuff, _, _ = \
                 self.stuff_mask_head(memory[i:i + 1], memory_mask[i:i + 1],
                                      None, stuff_query, None, stuff_query_pos,
                                      hw_lvl=hw_lvl)
