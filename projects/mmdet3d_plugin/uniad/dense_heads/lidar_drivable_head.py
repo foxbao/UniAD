@@ -11,11 +11,10 @@
 #
 # This does NOT touch PansegformerHead, which the 5 panoptic configs still use.
 # ---------------------------------------------------------------------------
-import copy
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from mmcv.cnn import Linear, xavier_init
+from mmcv.cnn import Linear
 from mmcv.cnn.bricks.transformer import (build_positional_encoding,
                                          build_transformer_layer_sequence)
 from mmcv.runner import BaseModule, force_fp32
@@ -153,8 +152,6 @@ class LidarDrivableHead(BaseModule):
                  positional_encoding=None,
                  stuff_transformer_head=None,
                  loss_mask=dict(type='DiceLoss', loss_weight=2.0),
-                 loss_cls=dict(type='FocalLoss', use_sigmoid=True, gamma=2.0,
-                               alpha=0.25, loss_weight=2.0),
                  train_cfg=None,
                  test_cfg=dict(max_per_img=100),
                  eval_drivable_only=True,
@@ -179,7 +176,6 @@ class LidarDrivableHead(BaseModule):
         self.encoder = TRANSFORMER.build(transformer)
         self.stuff_mask_head = TRANSFORMER.build(stuff_transformer_head)
         self.loss_mask = build_loss(loss_mask)
-        self.loss_cls = build_loss(loss_cls)
         self._init_layers()
 
     def _init_layers(self):
@@ -189,9 +185,6 @@ class LidarDrivableHead(BaseModule):
         # stuff query: split into (query, query_pos) of embed_dims each.
         self.stuff_query = nn.Embedding(self.num_stuff_classes,
                                         self.embed_dims * 2)
-        fc_cls_stuff = Linear(self.embed_dims, 1)
-        self.cls_stuff_branches = nn.ModuleList(
-            [copy.deepcopy(fc_cls_stuff) for _ in range(self.num_dec_stuff)])
         if self.in_channels != self.embed_dims:
             self.input_proj = Linear(self.in_channels, self.embed_dims)
         else:
@@ -199,9 +192,6 @@ class LidarDrivableHead(BaseModule):
 
     def init_weights(self):
         self.encoder.init_weights()
-        for p in self.cls_stuff_branches.parameters():
-            if p.dim() > 1:
-                nn.init.xavier_uniform_(p)
 
     def forward(self, bev_feat):
         """bev_feat: [H*W, bs, C] (as fed by UniADTrackLidar._bev_for_seg_head).
@@ -256,7 +246,7 @@ class LidarDrivableHead(BaseModule):
         stuff_query = stuff_query.unsqueeze(0).expand(BS, -1, -1)
         stuff_query_pos = stuff_query_pos.unsqueeze(0).expand(BS, -1, -1)
 
-        mask_stuff, mask_inter_stuff, query_inter_stuff = self.stuff_mask_head(
+        mask_stuff, mask_inter_stuff, _ = self.stuff_mask_head(
             memory, memory_mask, None, stuff_query, None, stuff_query_pos,
             hw_lvl=hw_lvl)
         mask_stuff = mask_stuff.squeeze(-1)
@@ -264,35 +254,28 @@ class LidarDrivableHead(BaseModule):
 
         mask_preds_stuff = []
         mask_preds_inter_stuff = [[] for _ in range(self.num_dec_stuff)]
-        cls_stuff_preds = [[] for _ in range(self.num_dec_stuff)]
         for i in range(BS):
             mask_preds_stuff.append(mask_stuff[i].reshape(-1, *hw_lvl[0]))
             for j in range(self.num_dec_stuff):
                 mask_preds_inter_stuff[j].append(
                     mask_inter_stuff[j][i].reshape(-1, *hw_lvl[0]))
-                query_stuff = query_inter_stuff[j]
-                s1, s2, s3 = query_stuff.shape
-                cls_stuff_preds[j].append(self.cls_stuff_branches[j](
-                    query_stuff.reshape(s1 * s2, s3)))
         mask_preds_stuff = torch.cat(mask_preds_stuff, 0)
         mask_preds_inter_stuff = [
             torch.cat(each, 0) for each in mask_preds_inter_stuff
         ]
-        cls_stuff_preds = [torch.cat(each, 0) for each in cls_stuff_preds]
 
         loss_dict = self._stuff_losses(mask_preds_stuff, mask_preds_inter_stuff,
-                                       cls_stuff_preds, gt_labels_list,
-                                       gt_masks_list, BS)
+                                       gt_labels_list, gt_masks_list, BS)
         return loss_dict
 
     def _stuff_losses(self, mask_preds_stuff, mask_preds_inter_stuff,
-                      cls_stuff_preds, gt_stuff_labels_list,
-                      gt_stuff_masks_list, BS):
-        """Build stuff GT + compute mask/cls losses. Verbatim from the verified
-        PansegformerHead stuff path. Returns a loss dict with the same keys as
-        the PansegformerHead drivable-only path."""
+                      gt_stuff_labels_list, gt_stuff_masks_list, BS):
+        """Build stuff GT + compute mask losses. Mirrors the mask path of the
+        verified PansegformerHead stuff branch (the cls_stuff head was pruned:
+        with a single stuff class its FocalLoss is a no-op, logged 0.0000).
+        Returns a loss dict with the mask keys of the drivable-only path."""
         device = mask_preds_stuff.device
-        mask_stuff_gt, mask_weight_stuff, stuff_labels = [], [], []
+        mask_stuff_gt, mask_weight_stuff = [], []
         num_total_pos_stuff = 0
         for i in range(BS):
             num_total_pos_stuff += len(gt_stuff_labels_list[i])
@@ -306,11 +289,9 @@ class LidarDrivableHead(BaseModule):
             stuff_masks[select_stuff_index] = gt_stuff_masks_list[i].to(
                 torch.bool)
             mask_stuff_gt.append(stuff_masks)
-            stuff_labels.append(1 - mask_weight_i_stuff)
             mask_weight_stuff.append(mask_weight_i_stuff)
 
         mask_weight_stuff = torch.cat(mask_weight_stuff, 0).to(device)
-        stuff_labels = torch.cat(stuff_labels, 0).to(device)
         mask_stuff_gt = torch.cat(mask_stuff_gt, 0).to(torch.float)
         num_total_pos_stuff = mask_preds_stuff.new_tensor([num_total_pos_stuff])
         num_total_pos_stuff = torch.clamp(reduce_mean(num_total_pos_stuff),
@@ -329,7 +310,7 @@ class LidarDrivableHead(BaseModule):
                                              mask_weight_stuff,
                                              avg_factor=num_total_pos_stuff)
 
-        loss_mask_stuff_list, loss_cls_stuff_list = [], []
+        loss_mask_stuff_list = []
         for j in range(len(mask_preds_inter_stuff)):
             mp = mask_preds_inter_stuff[j]
             if mp.shape[0] == 0:
@@ -340,18 +321,10 @@ class LidarDrivableHead(BaseModule):
                 loss_mask_stuff_list.append(self.loss_mask(
                     mp, mask_targets_stuff, mask_weight_stuff,
                     avg_factor=num_total_pos_stuff))
-            cs = cls_stuff_preds[j]
-            if cs.shape[0] == 0:
-                loss_cls_stuff_list.append(cs.sum() * 0)
-            else:
-                loss_cls_stuff_list.append(self.loss_cls(
-                    cs, stuff_labels.to(torch.long),
-                    avg_factor=num_total_pos_stuff) * 2)
 
         loss_dict = {'loss_mask_stuff': loss_mask_stuff}
         for i in range(len(loss_mask_stuff_list)):
             loss_dict[f'd{i}.loss_mask_stuff_f'] = loss_mask_stuff_list[i]
-            loss_dict[f'd{i}.loss_cls_stuff_f'] = loss_cls_stuff_list[i]
         return loss_dict
 
     def get_drivable_bboxes(self, args_tuple, img_metas, rescale=False):
@@ -363,7 +336,7 @@ class LidarDrivableHead(BaseModule):
             ori_shape = (self.canvas_size[0], self.canvas_size[1], 3)
             stuff_query = self.stuff_query.weight[None, :, :self.embed_dims]
             stuff_query_pos = self.stuff_query.weight[None, :, self.embed_dims:]
-            mask_stuff, mask_inter_stuff, query_inter_stuff = \
+            mask_stuff, mask_inter_stuff, _ = \
                 self.stuff_mask_head(memory[i:i + 1], memory_mask[i:i + 1],
                                      None, stuff_query, None, stuff_query_pos,
                                      hw_lvl=hw_lvl)
@@ -376,8 +349,6 @@ class LidarDrivableHead(BaseModule):
             results.append({
                 'drivable': drivable,
                 'score_list': mask_pred,
-                'stuff_score_list': self.cls_stuff_branches[-1](
-                    query_inter_stuff[-1]).sigmoid().reshape(-1),
             })
         return results
 

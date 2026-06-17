@@ -65,13 +65,7 @@ model = dict(
             nhead=8,
             num_decoder_layers=6,
             self_attn=True),
-        loss_mask=dict(type='DiceLoss', loss_weight=2.0),
-        loss_cls=dict(
-            type='FocalLoss',
-            use_sigmoid=True,
-            gamma=2.0,
-            alpha=0.25,
-            loss_weight=2.0)))
+        loss_mask=dict(type='DiceLoss', loss_weight=2.0)))
 
 train_pipeline = [
     dict(
