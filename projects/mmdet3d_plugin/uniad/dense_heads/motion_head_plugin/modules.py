@@ -253,7 +253,11 @@ class MapInteraction(BaseModule):
         if key_padding_mask is not None:
             key_padding_mask = key_padding_mask.to(query.device).bool()
             if key_padding_mask.dim() == 3:
-                # Per-agent mask (B, A, M): one row per agent, no expand.
+                # LiDAR-only path: per-agent mask (B, A, M), one row per agent
+                # -> (B*A, M), no expand. Camera never reaches here -- camera
+                # MotionHead passes lane_key_padding_mask=None (motion_head.py
+                # default, never overridden), so key_padding_mask is None and
+                # this whole block is skipped.
                 key_padding_mask = key_padding_mask.reshape(B * A, -1)
             else:
                 # Global mask (B, M) shared across agents -> (B*A, M).

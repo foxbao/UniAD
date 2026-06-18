@@ -301,6 +301,15 @@ class MotionHead(BaseMotionHead):
         outputs_traj_scores = []
         outputs_trajs = []
 
+        # === LiDAR-ONLY PATH (camera MotionHead never enters this block) ===
+        # The camera MotionHead has no `map_local_k` attribute (only
+        # MotionHeadLidar.__init__ sets it) and never passes `lane_centroids`,
+        # so `map_local_k` is None and the guard short-circuits -- the camera
+        # runtime executes the exact same instructions as before this block
+        # existed. This shared-class branch is intentional (avoids ~320 lines
+        # of duplicated forward() that would diverge from upstream); it is
+        # inert for camera by construction, not by luck.
+        #
         # MTR-style local map collection: when map_local_k is set and lane
         # centroids are available, restrict each agent to its K-nearest valid
         # lanes (a per-agent (B, A, M) padding mask) instead of the shared
