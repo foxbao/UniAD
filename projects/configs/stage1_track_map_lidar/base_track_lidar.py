@@ -17,6 +17,9 @@ class_names = [
     'Trailer-Full', 'IGV-Empty', 'Crane', 'OtherVehicle', 'Cone',
     'ContainerForklift', 'Forklift', 'WheelCrane',
 ]
+# Maps the 15 raw dataset label ids -> the 13 training class indices above
+# (indexed by raw id). Identity for raw 0..11; the three tail ids are remapped:
+# raw 12 & 13 collapse into 8 (OtherVehicle), raw 14 -> 12 (WheelCrane).
 label_mapping = [
     0, 1, 2, 3, 4,
     5, 6, 7, 8, 9,
@@ -39,11 +42,15 @@ _ffn_dim_ = _dim_ * 2
 _num_levels_ = 1
 bev_h_ = 120
 bev_w_ = 160
+# Number of track queries. Shared by model.num_query, pts_bbox_head.num_query
+# and loss_cfg.sdc_query_index (the SDC query is appended at index == num_query),
+# so they must stay in lockstep -- keep this single source of truth.
+_num_query_ = 600
 
 model = dict(
     type='UniADTrackLidar',
     point_cloud_range=point_cloud_range,
-    num_query=600,
+    num_query=_num_query_,
     embed_dims=_dim_,
     video_test_mode=True,
     return_query_feats=True,
@@ -105,7 +112,7 @@ model = dict(
                       1.0, 1.0, 1.0, 0.2, 0.2],
         loss_past_traj_weight=0.0,
         with_sdc=True,
-        sdc_query_index=600,
+        sdc_query_index=_num_query_,
         assigner=dict(
             type='HungarianAssigner3DTrack',
             cls_cost=dict(type='FocalLossCost', weight=2.0),
@@ -122,7 +129,7 @@ model = dict(
         type='BEVFormerLidarTrackHead',
         in_channels=_dim_,
         num_classes=num_classes,
-        num_query=600,
+        num_query=_num_query_,
         embed_dims=_dim_,
         code_size=10,
         with_box_refine=True,
