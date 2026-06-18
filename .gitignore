@@ -154,3 +154,7 @@ core.*
 # Local deployment/golden dump artifacts
 dumped_inputs/
 onnx/
+
+# Local config backups (e.g. base_e2e_lidar.py.track_only_backup)
+*.track_only_backup
+*.py.*backup
