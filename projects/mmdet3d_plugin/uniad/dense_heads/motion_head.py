@@ -209,13 +209,14 @@ class MotionHead(BaseMotionHead):
         return traj_results, outs_motion
 
     @auto_fp16(apply_to=('bev_embed', 'track_query', 'lane_query', 'lane_query_pos', 'lane_query_embed', 'prev_bev'))
-    def forward(self, 
-                bev_embed, 
-                track_query, 
-                lane_query, 
-                lane_query_pos, 
+    def forward(self,
+                bev_embed,
+                track_query,
+                lane_query,
+                lane_query_pos,
                 track_bbox_results,
-                lane_key_padding_mask=None):
+                lane_key_padding_mask=None,
+                lane_centroids=None):
         """
         Applies forward pass on the model for motion prediction using bird's eye view (BEV) embedding, track query, lane query, and track bounding box results.
 
@@ -299,6 +300,32 @@ class MotionHead(BaseMotionHead):
 
         outputs_traj_scores = []
         outputs_trajs = []
+
+        # MTR-style local map collection: when map_local_k is set and lane
+        # centroids are available, restrict each agent to its K-nearest valid
+        # lanes (a per-agent (B, A, M) padding mask) instead of the shared
+        # global lane set. Distances are computed in the normalized BEV frame
+        # so agent centers (reference_points_track, already normalized) and
+        # lane centroids share one consistent space.
+        map_local_k = getattr(self, 'map_local_k', None)
+        if (map_local_k is not None and lane_centroids is not None
+                and lane_query.size(1) > 0):
+            agent_xy = reference_points_track.to(device)  # (B, A, 2) in [0,1]
+            lane_xy = norm_points(
+                lane_centroids.to(device), self.pc_range)  # (B, M, 2)
+            dist = torch.cdist(agent_xy, lane_xy)  # (B, A, M)
+            if lane_key_padding_mask is not None:
+                invalid = lane_key_padding_mask.to(device).bool()
+                if invalid.dim() == 2:
+                    invalid = invalid[:, None, :]  # (B, 1, M)
+                dist = dist.masked_fill(invalid, float('inf'))
+            k = min(map_local_k, lane_xy.size(1))
+            keep_idx = dist.topk(k, dim=-1, largest=False).indices  # (B, A, k)
+            keep = torch.zeros_like(dist, dtype=torch.bool)
+            keep.scatter_(-1, keep_idx, True)
+            # also drop lanes that are infinitely far (all-invalid padding)
+            keep = keep & torch.isfinite(dist)
+            lane_key_padding_mask = ~keep  # (B, A, M), True = blocked
 
         inter_states, inter_references = self.motionformer(
             track_query,  # B, A_track, D

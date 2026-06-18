@@ -16,24 +16,30 @@ class MotionHeadLidar(MotionHead):
     (UniADMotionLidar); this head is a pure consumer that reads lane_query
     from the outs_map dict, mirroring how camera UniAD's MotionHead consumes
     the seg head's outs_seg.
+
+    map_local_k: if set, each agent attends only its K-nearest valid lanes
+    (MTR-style local map collection) instead of the global lane set. None
+    (default) keeps the global behavior.
     """
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args, map_local_k=None, **kwargs):
         super().__init__(*args, **kwargs)
+        self.map_local_k = map_local_k
 
     def _lane_inputs(self, track_query, outs_map):
         """Read lane_query from the detector-built outs_map dict.
 
         Falls back to empty lane tensors (the shapes MotionFormer already
-        tolerates) when no HD-map lane prior is available.
+        tolerates) when no HD-map lane prior is available. Returns
+        (lane_query, lane_query_pos, lane_valid, lane_centroids).
         """
         outs_map = outs_map or {}
         lane_query = outs_map.get('lane_query')
         if lane_query is None:
             return (track_query.new_zeros((1, 0, self.embed_dims)),
-                    track_query.new_zeros((1, 0, self.embed_dims)), None)
+                    track_query.new_zeros((1, 0, self.embed_dims)), None, None)
         return (lane_query, outs_map['lane_query_pos'],
-                outs_map['lane_valid'])
+                outs_map['lane_valid'], outs_map.get('lane_centroids'))
 
     def _load_anchors(self, anchor_info_path):
         super()._load_anchors(anchor_info_path)
@@ -119,8 +125,8 @@ class MotionHeadLidar(MotionHead):
                 outs_motion=outs_motion,
                 track_boxes=track_boxes)
 
-        lane_query, lane_query_pos, lane_valid = self._lane_inputs(
-            track_query, outs_map)
+        lane_query, lane_query_pos, lane_valid, lane_centroids = \
+            self._lane_inputs(track_query, outs_map)
         outs_motion = self(
             bev_embed,
             track_query,
@@ -128,7 +134,8 @@ class MotionHeadLidar(MotionHead):
             lane_query_pos,
             track_boxes,
             lane_key_padding_mask=(
-                None if lane_valid is None else ~lane_valid))
+                None if lane_valid is None else ~lane_valid),
+            lane_centroids=lane_centroids)
         loss_inputs = [
             gt_bboxes_3d, gt_fut_traj, gt_fut_traj_mask, outs_motion,
             all_matched_idxes, track_boxes
@@ -222,8 +229,8 @@ class MotionHeadLidar(MotionHead):
             return [dict(traj=empty_traj.cpu(),
                          traj_scores=empty_scores.cpu())], outs_motion
 
-        lane_query, lane_query_pos, lane_valid = self._lane_inputs(
-            track_query, outs_map)
+        lane_query, lane_query_pos, lane_valid, lane_centroids = \
+            self._lane_inputs(track_query, outs_map)
         outs_motion = self(
             bev_embed,
             track_query,
@@ -231,7 +238,8 @@ class MotionHeadLidar(MotionHead):
             lane_query_pos,
             track_boxes,
             lane_key_padding_mask=(
-                None if lane_valid is None else ~lane_valid))
+                None if lane_valid is None else ~lane_valid),
+            lane_centroids=lane_centroids)
         traj_results = self.get_trajs(outs_motion, track_boxes)
         _, scores, labels, _, _ = track_boxes[0]
         outs_motion['track_scores'] = scores[None, :]

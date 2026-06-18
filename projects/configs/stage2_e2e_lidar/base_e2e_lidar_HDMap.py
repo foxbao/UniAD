@@ -23,7 +23,10 @@ model = dict(
         map_path='data/kl_8/map/base_map.txt',
         num_lanes=64,
         num_points_per_lane=20,
-    ))
+    ),
+    # MTR-style local map collection: each agent attends only its K-nearest
+    # valid lanes instead of the global lane set. Unset = global behavior.
+    motion_head=dict(map_local_k=32))
 
 data = dict(samples_per_gpu=1)
 

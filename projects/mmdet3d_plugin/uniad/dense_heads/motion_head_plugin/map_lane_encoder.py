@@ -241,6 +241,9 @@ class MapLaneEncoder(nn.Module):
             lane_query: (1, num_lanes, embed_dims)
             lane_query_pos: (1, num_lanes, embed_dims)
             lane_valid: (1, num_lanes) bool
+            lane_centroids: (1, num_lanes, 2) ego-metric lane midpoints
+                (zero for invalid lanes); used for per-agent local map
+                attention (MTR-style K-nearest lane selection).
         """
         if isinstance(ego2global, torch.Tensor):
             e2g_np = ego2global.detach().cpu().numpy()
@@ -272,4 +275,9 @@ class MapLaneEncoder(nn.Module):
         lane_query_pos = pos2posemb2d(centroids_norm)  # (num_lanes, 256)
         lane_query_pos = lane_query_pos * valid_t[:, None].to(dtype)
 
-        return lane_query[None], lane_query_pos[None], valid_t[None]
+        # Ego-metric centroids, zeroed for invalid lanes, for K-nearest
+        # per-agent lane selection downstream.
+        lane_centroids = centroids_t * valid_t[:, None].to(dtype)
+
+        return (lane_query[None], lane_query_pos[None], valid_t[None],
+                lane_centroids[None])

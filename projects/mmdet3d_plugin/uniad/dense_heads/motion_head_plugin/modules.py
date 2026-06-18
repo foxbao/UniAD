@@ -252,10 +252,15 @@ class MapInteraction(BaseModule):
         mem = key.expand(B*A, -1, -1)
         if key_padding_mask is not None:
             key_padding_mask = key_padding_mask.to(query.device).bool()
-            if key_padding_mask.size(0) == 1 and B != 1:
-                key_padding_mask = key_padding_mask.expand(B, -1)
-            key_padding_mask = key_padding_mask[:, None, :].expand(
-                B, A, -1).reshape(B * A, -1)
+            if key_padding_mask.dim() == 3:
+                # Per-agent mask (B, A, M): one row per agent, no expand.
+                key_padding_mask = key_padding_mask.reshape(B * A, -1)
+            else:
+                # Global mask (B, M) shared across agents -> (B*A, M).
+                if key_padding_mask.size(0) == 1 and B != 1:
+                    key_padding_mask = key_padding_mask.expand(B, -1)
+                key_padding_mask = key_padding_mask[:, None, :].expand(
+                    B, A, -1).reshape(B * A, -1)
             all_masked = key_padding_mask.all(dim=1)
             if all_masked.any():
                 key_padding_mask = key_padding_mask.clone()

@@ -46,11 +46,13 @@ class UniADMotionLidar(UniADTrackLidar):
         uniform (it falls back to empty lane tensors).
         """
         if self.map_lane_encoder is None or ego2global is None:
-            return dict(lane_query=None, lane_query_pos=None, lane_valid=None)
-        lane_query, lane_query_pos, lane_valid = self.map_lane_encoder(
-            ego2global, device=bev_embed.device, dtype=bev_embed.dtype)
+            return dict(lane_query=None, lane_query_pos=None, lane_valid=None,
+                        lane_centroids=None)
+        lane_query, lane_query_pos, lane_valid, lane_centroids = \
+            self.map_lane_encoder(
+                ego2global, device=bev_embed.device, dtype=bev_embed.dtype)
         return dict(lane_query=lane_query, lane_query_pos=lane_query_pos,
-                    lane_valid=lane_valid)
+                    lane_valid=lane_valid, lane_centroids=lane_centroids)
 
     @property
     def with_motion_head(self):
