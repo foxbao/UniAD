@@ -112,6 +112,19 @@ train_pipeline = [
     dict(type='PointsRangeFilter', point_cloud_range=point_cloud_range),
     dict(type='ObjectRangeFilterTrack', point_cloud_range=point_cloud_range),
     dict(type='ObjectNameFilterTrack', classes=class_names),
+    # Keep the drivable seg-head GT alongside the occ GT so the inherited
+    # LidarDrivableHead trains end-to-end (matches the camera base_e2e, which
+    # collects gt_lane_* and gt_segmentation in the same pipeline). LoadAnnotations3D_E2E
+    # already supplies the bboxes GenerateKLDrivableMapLabels needs. Params
+    # mirror base_track_drivable_lidar.
+    dict(
+        type='GenerateKLDrivableMapLabels',
+        use_map=False,
+        point_cloud_range=point_cloud_range,
+        bev_size=(bev_h_, bev_w_),
+        augment_raycast_ground=True,
+        keep_raycast_obstacles=False,
+        box_z_origin='bottom'),
     dict(type='PointShuffle'),
     dict(type='DefaultFormatBundle3D', class_names=class_names),
     dict(
@@ -122,6 +135,7 @@ train_pipeline = [
             'gt_fut_traj_mask',
             'gt_sdc_bbox', 'gt_sdc_label',
             'gt_sdc_fut_traj', 'gt_sdc_fut_traj_mask',
+            'gt_lane_labels', 'gt_lane_bboxes', 'gt_lane_masks',
             'gt_segmentation', 'gt_instance',
             'gt_centerness', 'gt_offset', 'gt_flow', 'gt_backward_flow',
             'gt_occ_has_invalid_frame', 'gt_occ_img_is_valid'
@@ -154,6 +168,14 @@ test_pipeline = [
     dict(type='ObjectRangeFilterTrack', point_cloud_range=point_cloud_range),
     dict(type='ObjectNameFilterTrack', classes=class_names),
     dict(
+        type='GenerateKLDrivableMapLabels',
+        use_map=False,
+        point_cloud_range=point_cloud_range,
+        bev_size=(bev_h_, bev_w_),
+        augment_raycast_ground=True,
+        keep_raycast_obstacles=False,
+        box_z_origin='bottom'),
+    dict(
         type='DefaultFormatBundle3D',
         class_names=class_names),
     dict(
@@ -164,6 +186,7 @@ test_pipeline = [
             'gt_fut_traj_mask',
             'gt_sdc_bbox', 'gt_sdc_label',
             'gt_sdc_fut_traj', 'gt_sdc_fut_traj_mask',
+            'gt_lane_labels', 'gt_lane_bboxes', 'gt_lane_masks',
             'gt_segmentation', 'gt_instance',
             'gt_centerness', 'gt_offset', 'gt_flow', 'gt_backward_flow',
             'gt_occ_has_invalid_frame', 'gt_occ_img_is_valid'
