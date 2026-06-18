@@ -23,6 +23,7 @@ model = dict(
     task_loss_weight=dict(track=1.0, map=1.0, motion=1.0),
     freeze_lidar_backbone=True,
     freeze_bev_encoder=True,
+    loss_cfg=dict(loss_past_traj_weight=1.0),
     motion_head=dict(
         type='MotionHeadLidar',
         bev_h=bev_h_,
