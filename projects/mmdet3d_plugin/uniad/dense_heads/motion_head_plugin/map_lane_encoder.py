@@ -24,7 +24,17 @@ class HDMapParser:
     def __init__(self, map_path: str, num_points_per_lane: int = 20):
         self.map_path = map_path
         self.num_points_per_lane = num_points_per_lane
+        if not os.path.exists(map_path):
+            raise FileNotFoundError(
+                f'HD map file not found: {map_path}. The lane encoder cannot '
+                'build lane_query without it.')
         self.lanes = self._load_or_parse()
+        if not self.lanes:
+            raise ValueError(
+                f'HD map {map_path} parsed to 0 lanes. Check the file format '
+                '(expected protobuf-text with `lane {{ central_curve ... }}` '
+                'blocks); otherwise the encoder silently emits all-invalid '
+                'lanes and MapLaneEncoder degrades to a no-op.')
 
     def _cache_path(self) -> str:
         return self.map_path + '.parsed.npz'
