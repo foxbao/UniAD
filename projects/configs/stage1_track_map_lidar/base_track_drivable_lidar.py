@@ -27,6 +27,14 @@ point_cloud_range = [-64.0, -48.0, -2.0, 64.0, 48.0, 6.0]
 file_client_args = dict(backend='disk')
 
 model = dict(
+    # 'map' is UniAD's upstream task name for the seg-head branch; it is the
+    # prefix the detector stamps on the seg loss (logs as map.loss_mask_stuff).
+    # Here that branch is drivable-only (LidarDrivableHead, a DiceLoss on the
+    # drivable stuff mask), NOT an HD-map task: the drivable GT comes from LiDAR
+    # geometry + raycast ground, not from a map. Distinct from the stage-2
+    # map_lane_encoder, which IS a real surveyed HD-map prior. The key is kept
+    # as 'map' to stay aligned with upstream and avoid breaking historical
+    # loss curves / the prefix<->task_loss_weight contract.
     task_loss_weight=dict(track=1.0, map=1.0),
     seg_head=dict(
         type='LidarDrivableHead',
