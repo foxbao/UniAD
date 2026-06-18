@@ -1,8 +1,11 @@
 _base_ = ['./base_e2e_lidar_occ.py']
 
 # Planning consumes the current frame plus planning_steps future frames
-# (collision loss uses indices [1:planning_steps+1]). Bump occ_n_future
-# from 4 to 6 so GenerateOccFlowLabels emits enough future boxes.
+# (collision loss uses indices [1:planning_steps+1]). Bump the DATASET's
+# occ_n_future from 4 to 6 so GenerateOccFlowLabels emits enough future
+# boxes for planning. The OccHead itself keeps n_future=4 (inherited): the
+# dataset produces max(occ, plan) future frames, occ uses the first 4,
+# planning uses all 6. This mirrors occ_n_future_max in the camera base_e2e.
 occ_n_future = 6
 occ_receptive_field = 3
 planning_steps = 6
@@ -23,7 +26,8 @@ occflow_grid_conf = {
 # differentiable loss only.
 model = dict(
     type='UniADMotionLidar',
-    task_loss_weight=dict(track=1.0, motion=1.0, occ=1.0, planning=1.0),
+    task_loss_weight=dict(track=1.0, map=1.0, motion=1.0, occ=1.0,
+                          planning=1.0),
     planning_head=dict(
         type='PlanningHeadSingleMode',
         bev_h=bev_h_,
@@ -75,6 +79,17 @@ train_pipeline = [
              'Trailer-Full', 'IGV-Empty', 'Crane', 'OtherVehicle', 'Cone',
              'ContainerForklift', 'Forklift', 'WheelCrane',
          ]),
+    # Keep the drivable seg-head GT so the inherited LidarDrivableHead trains
+    # end-to-end (matches base_e2e_lidar_occ and the camera base_e2e). Without
+    # gt_lane_*, the seg branch is skipped and the head becomes dead weight.
+    dict(
+        type='GenerateKLDrivableMapLabels',
+        use_map=False,
+        point_cloud_range=point_cloud_range,
+        bev_size=(bev_h_, bev_w_),
+        augment_raycast_ground=True,
+        keep_raycast_obstacles=False,
+        box_z_origin='bottom'),
     dict(type='PointShuffle'),
     dict(type='DefaultFormatBundle3D',
          class_names=[
@@ -90,6 +105,7 @@ train_pipeline = [
             'gt_fut_traj_mask',
             'gt_sdc_bbox', 'gt_sdc_label',
             'gt_sdc_fut_traj', 'gt_sdc_fut_traj_mask',
+            'gt_lane_labels', 'gt_lane_bboxes', 'gt_lane_masks',
             'sdc_planning', 'sdc_planning_mask', 'command',
             'gt_future_boxes', 'gt_future_labels',
             'gt_segmentation', 'gt_instance',
@@ -128,6 +144,14 @@ test_pipeline = [
              'Trailer-Full', 'IGV-Empty', 'Crane', 'OtherVehicle', 'Cone',
              'ContainerForklift', 'Forklift', 'WheelCrane',
          ]),
+    dict(
+        type='GenerateKLDrivableMapLabels',
+        use_map=False,
+        point_cloud_range=point_cloud_range,
+        bev_size=(bev_h_, bev_w_),
+        augment_raycast_ground=True,
+        keep_raycast_obstacles=False,
+        box_z_origin='bottom'),
     dict(type='DefaultFormatBundle3D',
          class_names=[
              'Pedestrian', 'Car', 'IGV-Full', 'Truck', 'Trailer-Empty',
@@ -142,6 +166,7 @@ test_pipeline = [
             'gt_fut_traj_mask',
             'gt_sdc_bbox', 'gt_sdc_label',
             'gt_sdc_fut_traj', 'gt_sdc_fut_traj_mask',
+            'gt_lane_labels', 'gt_lane_bboxes', 'gt_lane_masks',
             'sdc_planning', 'sdc_planning_mask', 'command',
             'gt_future_boxes', 'gt_future_labels',
             'gt_segmentation', 'gt_instance',
