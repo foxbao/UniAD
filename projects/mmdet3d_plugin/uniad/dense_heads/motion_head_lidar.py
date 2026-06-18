@@ -2,7 +2,6 @@ import torch
 from mmdet.models import HEADS
 
 from .motion_head import MotionHead
-from .motion_head_plugin.map_lane_encoder import MapLaneEncoder
 
 
 @HEADS.register_module()
@@ -12,28 +11,29 @@ class MotionHeadLidar(MotionHead):
     It keeps UniAD's trajectory decoder/loss, but trains only on active
     object track queries.  SDC and map lane queries are intentionally omitted
     for the first LiDAR motion stage.
+
+    The HD-map lane prior is built and owned by the detector
+    (UniADMotionLidar); this head is a pure consumer that reads lane_query
+    from the outs_map dict, mirroring how camera UniAD's MotionHead consumes
+    the seg head's outs_seg.
     """
 
-    def __init__(self, *args, map_lane_encoder=None, **kwargs):
+    def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        if map_lane_encoder is not None:
-            self.map_lane_encoder = MapLaneEncoder(
-                pc_range=self.pc_range,
-                embed_dims=self.embed_dims,
-                **map_lane_encoder)
-        else:
-            self.map_lane_encoder = None
 
-    def _build_lane_query(self, track_query, outs_track):
-        if self.map_lane_encoder is None:
+    def _lane_inputs(self, track_query, outs_map):
+        """Read lane_query from the detector-built outs_map dict.
+
+        Falls back to empty lane tensors (the shapes MotionFormer already
+        tolerates) when no HD-map lane prior is available.
+        """
+        outs_map = outs_map or {}
+        lane_query = outs_map.get('lane_query')
+        if lane_query is None:
             return (track_query.new_zeros((1, 0, self.embed_dims)),
                     track_query.new_zeros((1, 0, self.embed_dims)), None)
-        ego2global = outs_track.get('ego2global')
-        if ego2global is None:
-            return (track_query.new_zeros((1, 0, self.embed_dims)),
-                    track_query.new_zeros((1, 0, self.embed_dims)), None)
-        return self.map_lane_encoder(
-            ego2global, device=track_query.device, dtype=track_query.dtype)
+        return (lane_query, outs_map['lane_query_pos'],
+                outs_map['lane_valid'])
 
     def _load_anchors(self, anchor_info_path):
         super()._load_anchors(anchor_info_path)
@@ -51,7 +51,8 @@ class MotionHeadLidar(MotionHead):
                       gt_sdc_fut_traj=None,
                       gt_sdc_fut_traj_mask=None,
                       outs_track=None,
-                      outs_seg=None):
+                      outs_seg=None,
+                      outs_map=None):
         outs_track = outs_track or {}
         track_query = outs_track['track_query_embeddings'][None, None, ...]
         all_matched_idxes = [outs_track['track_query_matched_idxes']]
@@ -118,9 +119,8 @@ class MotionHeadLidar(MotionHead):
                 outs_motion=outs_motion,
                 track_boxes=track_boxes)
 
-        lane_query, lane_query_pos, lane_valid = self._build_lane_query(
-            track_query, outs_track)
-
+        lane_query, lane_query_pos, lane_valid = self._lane_inputs(
+            track_query, outs_map)
         outs_motion = self(
             bev_embed,
             track_query,
@@ -184,7 +184,8 @@ class MotionHeadLidar(MotionHead):
             outs_motion=outs_motion,
             track_boxes=track_boxes)
 
-    def forward_test(self, bev_embed, outs_track=None, outs_seg=None):
+    def forward_test(self, bev_embed, outs_track=None, outs_seg=None,
+                     outs_map=None):
         """LiDAR-only motion prediction for online tracking results."""
         outs_track = outs_track or {}
         track_query = outs_track['track_query_embeddings'][None, None, ...]
@@ -221,8 +222,8 @@ class MotionHeadLidar(MotionHead):
             return [dict(traj=empty_traj.cpu(),
                          traj_scores=empty_scores.cpu())], outs_motion
 
-        lane_query, lane_query_pos, lane_valid = self._build_lane_query(
-            track_query, outs_track)
+        lane_query, lane_query_pos, lane_valid = self._lane_inputs(
+            track_query, outs_map)
         outs_motion = self(
             bev_embed,
             track_query,

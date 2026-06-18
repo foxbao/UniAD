@@ -2,6 +2,7 @@ import torch
 from mmcv.runner import auto_fp16
 from mmdet.models import DETECTORS, build_head
 
+from ..dense_heads.motion_head_plugin.map_lane_encoder import MapLaneEncoder
 from .uniad_track_lidar import UniADTrackLidar
 
 
@@ -14,6 +15,7 @@ class UniADMotionLidar(UniADTrackLidar):
                  occ_head=None,
                  planning_head=None,
                  task_loss_weight=None,
+                 map_lane_encoder=None,
                  **kwargs):
         super().__init__(**kwargs)
         self.motion_head = build_head(motion_head) if motion_head else None
@@ -22,6 +24,33 @@ class UniADMotionLidar(UniADTrackLidar):
             build_head(planning_head) if planning_head else None)
         self.task_loss_weight = task_loss_weight or dict(
             track=1.0, motion=1.0, occ=1.0, planning=1.0)
+
+        # HD-map lane prior. It is a detector-level module (an external survey
+        # input, not a perception output), encoding surveyed lanes into
+        # lane_query that MotionFormer's MapInteraction consumes via outs_map.
+        # Dims are sourced from the motion head so they always match.
+        self.map_lane_encoder = None
+        if map_lane_encoder is not None:
+            assert self.motion_head is not None, (
+                'map_lane_encoder requires a motion_head to consume lane_query')
+            self.map_lane_encoder = MapLaneEncoder(
+                pc_range=self.motion_head.pc_range,
+                embed_dims=self.motion_head.embed_dims,
+                **map_lane_encoder)
+
+    def _build_outs_map(self, bev_embed, ego2global):
+        """Encode HD-map lanes for the current frame into an outs_map dict.
+
+        Returns lane_query=None when no encoder is configured or no
+        ego2global is available, so the motion head's consumer path stays
+        uniform (it falls back to empty lane tensors).
+        """
+        if self.map_lane_encoder is None or ego2global is None:
+            return dict(lane_query=None, lane_query_pos=None, lane_valid=None)
+        lane_query, lane_query_pos, lane_valid = self.map_lane_encoder(
+            ego2global, device=bev_embed.device, dtype=bev_embed.dtype)
+        return dict(lane_query=lane_query, lane_query_pos=lane_query_pos,
+                    lane_valid=lane_valid)
 
     @property
     def with_motion_head(self):
@@ -208,7 +237,9 @@ class UniADMotionLidar(UniADTrackLidar):
                 gt_sdc_fut_traj=gt_sdc_fut_traj,
                 gt_sdc_fut_traj_mask=gt_sdc_fut_traj_mask,
                 outs_track=outs_track,
-                outs_seg=outs_seg)
+                outs_seg=outs_seg,
+                outs_map=self._build_outs_map(
+                    bev_embed, outs_track.get('ego2global')))
             outs_motion = ret_dict_motion['outs_motion']
             outs_motion['bev_pos'] = outs_track.get('bev_pos')
             losses.update(
@@ -279,7 +310,8 @@ class UniADMotionLidar(UniADTrackLidar):
             result['ego2global'] = torch.as_tensor(
                 e2g, device=bev_embed.device, dtype=torch.float32)
         result_motion, outs_motion = self.motion_head.forward_test(
-            bev_embed, outs_track=result)
+            bev_embed, outs_track=result,
+            outs_map=self._build_outs_map(bev_embed, result.get('ego2global')))
         result.update(result_motion[0])
 
         if self.with_occ_head and kwargs.get('gt_segmentation') is not None:
