@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 from mmdet.core.bbox import build_bbox_coder
-from mmdet.models import DETECTORS, build_loss
+from mmdet.models import DETECTORS, build_head, build_loss
 from mmdet.models.utils.transformer import inverse_sigmoid
 from third_party.uniad_mmdet3d.models.detectors.mvx_two_stage import (
     MVXTwoStageDetector)
@@ -605,3 +605,77 @@ class UniADTrackLidarTRT(MVXTwoStageDetector):
 
     def forward(self, *args, **kwargs):
         return self.forward_track_lidar_trt(*args, **kwargs)
+
+
+@DETECTORS.register_module()
+class UniADTrackDrivableLidarTRT(UniADTrackLidarTRT):
+    """Track TRT boundary with an additional drivable-mask head.
+
+    The sparse encoder and LiDAR BEV encoder/track decoder stay identical to
+    ``UniADTrackLidarTRT``.  This subclass only converts the exported
+    ``bev_embed`` back to the segmentation-head convention and appends the
+    drivable score map as a dense-engine output.
+    """
+
+    def __init__(self, seg_head=None, **kwargs):
+        super().__init__(**kwargs)
+        if seg_head is None:
+            raise ValueError('UniADTrackDrivableLidarTRT requires seg_head.')
+        self.seg_head = build_head(seg_head)
+
+    @staticmethod
+    def _bev_for_seg_head(bev_embed):
+        if bev_embed.dim() == 3:
+            return bev_embed
+        if bev_embed.dim() != 4:
+            raise ValueError('seg_head expects BEV shape [B, C, H, W] or '
+                             f'[HW, B, C], got {tuple(bev_embed.shape)}.')
+        batch_size, channels, bev_h, bev_w = bev_embed.shape
+        return bev_embed.permute(2, 3, 0, 1).reshape(
+            bev_h * bev_w, batch_size, channels).contiguous()
+
+    def forward_track_drivable_lidar_trt(
+        self,
+        prev_track_intances0,
+        prev_track_intances1,
+        prev_track_intances2,
+        prev_track_intances3,
+        prev_track_intances4,
+        prev_track_intances5,
+        prev_track_intances6,
+        prev_track_intances7,
+        prev_track_intances8,
+        prev_track_intances9,
+        prev_track_intances10,
+        prev_track_intances11,
+        prev_track_intances12,
+        prev_track_intances13,
+        prev_timestamp,
+        prev_l2g_r_mat,
+        prev_l2g_t,
+        prev_bev,
+        lidar_bev,
+        shift,
+        timestamp,
+        l2g_r_mat,
+        l2g_t,
+        use_prev_bev,
+        max_obj_id,
+    ):
+        track_outputs = super().forward_track_lidar_trt(
+            prev_track_intances0, prev_track_intances1,
+            prev_track_intances2, prev_track_intances3,
+            prev_track_intances4, prev_track_intances5,
+            prev_track_intances6, prev_track_intances7,
+            prev_track_intances8, prev_track_intances9,
+            prev_track_intances10, prev_track_intances11,
+            prev_track_intances12, prev_track_intances13, prev_timestamp,
+            prev_l2g_r_mat, prev_l2g_t, prev_bev, lidar_bev, shift,
+            timestamp, l2g_r_mat, l2g_t, use_prev_bev, max_obj_id)
+        bev_embed = track_outputs[14]
+        drivable_score = self.seg_head.forward_test_trt(
+            self._bev_for_seg_head(bev_embed))
+        return track_outputs + (drivable_score, )
+
+    def forward(self, *args, **kwargs):
+        return self.forward_track_drivable_lidar_trt(*args, **kwargs)
