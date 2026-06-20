@@ -8,23 +8,45 @@ from .motion_head import MotionHead
 class MotionHeadLidar(MotionHead):
     """LiDAR-only MotionHead variant.
 
-    It keeps UniAD's trajectory decoder/loss, but trains only on active
-    object track queries.  SDC and map lane queries are intentionally omitted
-    for the first LiDAR motion stage.
+    It keeps UniAD's trajectory decoder/loss, trains object track queries, and
+    appends the SDC query when SDC supervision is available.
 
     The HD-map lane prior is built and owned by the detector
     (UniADMotionLidar); this head is a pure consumer that reads lane_query
     from the outs_map dict, mirroring how camera UniAD's MotionHead consumes
     the seg head's outs_seg.
 
-    map_local_k: if set, each agent attends only its K-nearest valid lanes
-    (MTR-style local map collection) instead of the global lane set. None
-    (default) keeps the global behavior.
+    map_local_k: if set, each map-enabled agent attends only its K-nearest
+    valid lanes (MTR-style local map collection) instead of the global lane
+    set. None (default) keeps the global behavior.
+    map_agent_scope:
+        all: every agent may attend to the map.
+        sdc_only: only the appended SDC query may attend to the map.
+        none: all agents use the no-map branch.
     """
 
-    def __init__(self, *args, map_local_k=None, **kwargs):
+    def __init__(self, *args, map_local_k=None, map_agent_scope='all',
+                 **kwargs):
         super().__init__(*args, **kwargs)
+        if map_agent_scope not in ('all', 'sdc_only', 'none'):
+            raise ValueError(
+                'map_agent_scope must be one of all/sdc_only/none, got '
+                f'{map_agent_scope}')
         self.map_local_k = map_local_k
+        self.map_agent_scope = map_agent_scope
+
+    def _map_agent_mask(self, track_query, with_sdc):
+        """Return a bool (B, A) mask for agents allowed to attend map lanes."""
+        if self.map_agent_scope == 'all':
+            return None
+        batch_size, num_agents = track_query.shape[0], track_query.shape[2]
+        mask = torch.zeros(
+            (batch_size, num_agents),
+            dtype=torch.bool,
+            device=track_query.device)
+        if self.map_agent_scope == 'sdc_only' and with_sdc and num_agents > 0:
+            mask[:, -1] = True
+        return mask
 
     def _lane_inputs(self, track_query, outs_map):
         """Read lane_query from the detector-built outs_map dict.
@@ -135,7 +157,8 @@ class MotionHeadLidar(MotionHead):
             track_boxes,
             lane_key_padding_mask=(
                 None if lane_valid is None else ~lane_valid),
-            lane_centroids=lane_centroids)
+            lane_centroids=lane_centroids,
+            map_agent_mask=self._map_agent_mask(track_query, with_sdc))
         loss_inputs = [
             gt_bboxes_3d, gt_fut_traj, gt_fut_traj_mask, outs_motion,
             all_matched_idxes, track_boxes
@@ -239,7 +262,8 @@ class MotionHeadLidar(MotionHead):
             track_boxes,
             lane_key_padding_mask=(
                 None if lane_valid is None else ~lane_valid),
-            lane_centroids=lane_centroids)
+            lane_centroids=lane_centroids,
+            map_agent_mask=self._map_agent_mask(track_query, with_sdc))
         traj_results = self.get_trajs(outs_motion, track_boxes)
         _, scores, labels, _, _ = track_boxes[0]
         outs_motion['track_scores'] = scores[None, :]

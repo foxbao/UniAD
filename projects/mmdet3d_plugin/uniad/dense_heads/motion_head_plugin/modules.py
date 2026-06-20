@@ -25,11 +25,20 @@ class MotionTransformerDecoder(BaseModule):
             `LN`.
     """
 
-    def __init__(self, pc_range=None, embed_dims=256, transformerlayers=None, num_layers=3, **kwargs):
+    def __init__(self, pc_range=None, embed_dims=256, transformerlayers=None,
+                 num_layers=3, map_gate_init=None, **kwargs):
         super(MotionTransformerDecoder, self).__init__()
         self.pc_range = pc_range
         self.embed_dims = embed_dims
         self.num_layers = num_layers
+        self.map_gate_layers = None
+        if map_gate_init is not None:
+            self.map_gate_layers = nn.ModuleList([
+                nn.Linear(self.embed_dims, 1) for _ in range(self.num_layers)
+            ])
+            for layer in self.map_gate_layers:
+                nn.init.zeros_(layer.weight)
+                nn.init.constant_(layer.bias, float(map_gate_init))
         self.intention_interaction_layers = IntentionInteraction()
         self.track_agent_interaction_layers = nn.ModuleList(
             [TrackAgentInteraction() for i in range(self.num_layers)])
@@ -65,6 +74,7 @@ class MotionTransformerDecoder(BaseModule):
                 track_query_pos=None,
                 lane_query_pos=None,
                 lane_key_padding_mask=None,
+                map_agent_mask=None,
                 track_bbox_results=None,
                 bev_embed=None,
                 reference_trajs=None,
@@ -125,6 +135,39 @@ class MotionTransformerDecoder(BaseModule):
                 query_embed, lane_query, query_pos=track_query_pos_bc,
                 key_pos=lane_query_pos,
                 key_padding_mask=lane_key_padding_mask)
+
+            needs_no_map_branch = (
+                map_agent_mask is not None or self.map_gate_layers is not None)
+            no_map_query_embed = None
+            if needs_no_map_branch:
+                # Empty-lane MapInteraction is the established LiDAR no-map
+                # behavior. Blend from it so navigation lanes are a learned
+                # weak prior, not a hard constraint on every actor.
+                no_map_query_embed = self.map_interaction_layers[lid](
+                    query_embed, lane_query[:, :0],
+                    query_pos=track_query_pos_bc,
+                    key_pos=lane_query_pos[:, :0]
+                    if lane_query_pos is not None else None,
+                    key_padding_mask=None)
+
+            if self.map_gate_layers is not None:
+                map_gate = torch.sigmoid(self.map_gate_layers[lid](
+                    query_embed))
+                map_query_embed = (
+                    no_map_query_embed
+                    + map_gate * (map_query_embed - no_map_query_embed))
+
+            if map_agent_mask is not None:
+                map_agent_mask = map_agent_mask.to(
+                    map_query_embed.device).bool()
+                if map_agent_mask.dim() != 2:
+                    raise ValueError(
+                        'map_agent_mask must have shape (B, A), got '
+                        f'{tuple(map_agent_mask.shape)}')
+                map_query_embed = torch.where(
+                    map_agent_mask[:, :, None, None],
+                    map_query_embed,
+                    no_map_query_embed)
             
             # interaction between agents and bev, ie. interaction between agents and goals
             # implemented with deformable transformer
