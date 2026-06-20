@@ -139,6 +139,7 @@ class UniADTrackLidar(MVXTwoStageDetector):
         self.timestamp = None
         self.l2g_t = None
         self.l2g_r_mat = None
+        self.test_frame_token = None
         self._test_prev_bev = None
         self._test_scene_token = None
 
@@ -712,6 +713,25 @@ class UniADTrackLidar(MVXTwoStageDetector):
             device=device)
         return ego2global[:3, :3], ego2global[:3, 3], timestamp
 
+    def _is_new_test_clip(self, meta, scene_token, timestamp):
+        if self.test_track_instances is None:
+            return True
+        if scene_token != self.scene_token:
+            return True
+
+        prev_token = meta.get('prev', None)
+        if prev_token == '':
+            return True
+        if prev_token is not None:
+            if self.test_frame_token is not None and prev_token != self.test_frame_token:
+                return True
+
+        if self.timestamp is not None:
+            time_gap = torch.abs(timestamp - self.timestamp)
+            if bool((time_gap > 1.0).detach().cpu().item()):
+                return True
+        return False
+
     def velo_update(self, ref_pts, velocity, l2g_r1, l2g_t1, l2g_r2, l2g_t2,
                     time_delta):
         time_delta = torch.nan_to_num(
@@ -1186,14 +1206,18 @@ class UniADTrackLidar(MVXTwoStageDetector):
             next(self.parameters()).device
         l2g_r2, l2g_t2, timestamp = self._meta_pose(meta, device)
         scene_token = meta.get('scene_token', '')
-        is_new_scene = (
-            self.test_track_instances is None
-            or scene_token != self.scene_token)
-        if is_new_scene:
+        frame_token = meta.get('token', None)
+        is_new_clip = self._is_new_test_clip(meta, scene_token, timestamp)
+        if is_new_clip:
             self.track_base.clear()
             track_instances = self._generate_empty_tracks()
             l2g_r1, l2g_t1, time_delta = None, None, None
-            if not has_queue_meta:
+            self._test_prev_bev = None
+            self._test_scene_token = scene_token
+            if has_queue_meta:
+                prev_bev = self.obtain_history_bev(history_points, img_metas)
+                prev_bev = self.valid_prev_bev(prev_bev, current_meta)
+            else:
                 prev_bev = None
             torch.cuda.empty_cache()
         else:
@@ -1217,6 +1241,7 @@ class UniADTrackLidar(MVXTwoStageDetector):
             frame_res['track_instances'])
         self._test_prev_bev = frame_res['bev_embed'].detach().clone()
         self.scene_token = scene_token
+        self.test_frame_token = frame_token
         self.timestamp = timestamp
         self.l2g_r_mat = l2g_r2
         self.l2g_t = l2g_t2

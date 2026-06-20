@@ -139,8 +139,8 @@ class KlDataset(Custom3DDataset):
             file_name=pts_filename,
             token=info.get('token', str(sample_idx)),
             scene_token=info.get('scene_token', ''),
-            prev=info.get('prev', ''),
-            next=info.get('next', ''),
+            prev=info.get('prev', None),
+            next=info.get('next', None),
             timestamp=float(info.get('timestamp', 0.0)),
             ego2global=np.asarray(
                 info.get('ego2global', np.eye(4)), dtype=np.float64))
@@ -1767,9 +1767,12 @@ class KlBEVFormerDataset(KlDataset):
     def _extract_raw_meta(self, raw_index):
         info = self.data_infos[raw_index]
         return dict(
+            sample_idx=info.get('sample_idx', raw_index),
             scene_token=info.get('scene_token', ''),
             ego2global=np.asarray(info.get('ego2global', np.eye(4)),
                                   dtype=np.float64),
+            prev=info.get('prev', None),
+            next=info.get('next', None),
             timestamp=float(info.get('timestamp', 0.0)),
             token=info.get('token', ''))
 
@@ -2043,8 +2046,11 @@ class KlTrackDataset(KlBEVFormerDataset):
         for idx, (frame, meta) in enumerate(zip(queue, raw_meta)):
             frame_meta = copy.deepcopy(self._dc_data(frame['img_metas']))
             frame_meta.update(
+                sample_idx=meta.get('sample_idx', frame_meta.get('sample_idx')),
                 scene_token=meta.get('scene_token', ''),
                 token=meta.get('token', ''),
+                prev=meta.get('prev', None),
+                next=meta.get('next', None),
                 timestamp=float(meta.get('timestamp', 0.0)))
             ego2global = np.asarray(meta['ego2global'], dtype=np.float64)
             frame_meta['ego2global'] = ego2global.copy()
