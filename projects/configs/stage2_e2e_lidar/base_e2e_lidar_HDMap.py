@@ -1,13 +1,10 @@
 _base_ = ['./base_e2e_lidar.py']
 
 # Ablation config for the HD-map lane prior: base_e2e_lidar (track + drivable +
-# motion) PLUS map_lane_encoder, and nothing else. It deliberately inherits
-# base_e2e_lidar -- NOT _plan -- so the only variable vs the base_e2e_lidar
-# control is map_lane_encoder. occ_head / planning_head are intentionally left
-# out: they are orthogonal to the lane prior (which only feeds MotionFormer),
-# and including them would mix occ/plan noise into the motion-gain measurement.
-# Both this config and base_e2e_lidar load_from the SAME stage-1 drivable
-# checkpoint, so experiment and control start from identical weights.
+# motion) PLUS map_lane_encoder. This is the original "hard map prior" variant:
+# all agents may attend to nearby map lanes, and map_local_k=32 restricts each
+# agent to its K-nearest valid lanes. Keep this file unchanged as the direct
+# map-prior ablation baseline.
 #
 # map_lane_encoder is a detector-level module (UniADMotionLidar) -- it is an
 # external survey input, not a perception output, so it lives beside the heads
@@ -26,7 +23,15 @@ model = dict(
     ),
     # MTR-style local map collection: each agent attends only its K-nearest
     # valid lanes instead of the global lane set. Unset = global behavior.
-    motion_head=dict(map_local_k=32))
+    # Turn-aware motion anchors (tools/generate_kl_motion_anchors.py): the
+    # original kmeans anchors were all straight (max ~13deg heading change)
+    # because straight samples dominate; this pkl up-weights turning samples so
+    # the 6 vehicle modes cover real turns (~58-76deg). Overridden only here so
+    # it is a clean ablation axis vs the base_e2e_lidar control (which keeps the
+    # original anchors).
+    motion_head=dict(
+        map_local_k=32,
+        anchor_info_path='data/others/motion_anchor_infos_kl_turnaware.pkl'))
 
 data = dict(samples_per_gpu=1)
 
