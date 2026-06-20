@@ -29,15 +29,19 @@ import numpy as np
 from sklearn.cluster import KMeans
 
 
-# Mirrors the original pkl (do not change without retraining: the head maps
-# class id -> group via these lists).
+# Mirrors the pkl schema consumed by the motion head (head maps FINAL class id
+# -> group via these lists; ids are post label_mapping, 0..12). Cone (id 9) is
+# its own group: it is ~99.5% static (median future displacement 0.11m), so
+# pooling it with moving vehicles or pedestrians pollutes those anchors. A
+# dedicated group gives it near-zero "stay put" anchors.
 GROUPED_CLASSES = [
     ['Pedestrian'],
     ['Car', 'IGV-Full', 'Truck', 'Trailer-Empty', 'Trailer-Full',
      'IGV-Empty', 'Crane', 'OtherVehicle', 'ContainerForklift',
      'Forklift', 'WheelCrane'],
+    ['Cone'],
 ]
-CLASS_LIST = [[0], [1, 2, 3, 4, 5, 6, 7, 8, 10, 11, 12]]
+CLASS_LIST = [[0], [1, 2, 3, 4, 5, 6, 7, 8, 10, 11, 12], [9]]
 
 
 def rot_2d(angle):

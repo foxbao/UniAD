@@ -26,12 +26,17 @@ model = dict(
     # Turn-aware motion anchors (tools/generate_kl_motion_anchors.py): the
     # original kmeans anchors were all straight (max ~13deg heading change)
     # because straight samples dominate; this pkl up-weights turning samples so
-    # the 6 vehicle modes cover real turns (~58-76deg). Overridden only here so
-    # it is a clean ablation axis vs the base_e2e_lidar control (which keeps the
-    # original anchors).
+    # the vehicle modes cover real turns (~58-76deg).
+    # Cone (final class id 9) is split into its OWN anchor group: it is ~99.5%
+    # static, and was previously falling back to the pedestrian group (it was
+    # absent from group_id_list, and MotionHead defaults unlisted classes to
+    # group 0). The 3-group pkl + group_id_list below give it dedicated
+    # near-static anchors and stop it polluting the pedestrian anchors.
+    # group_id_list / anchor pkl must agree on group count (here 3).
     motion_head=dict(
         map_local_k=32,
-        anchor_info_path='data/others/motion_anchor_infos_kl_turnaware.pkl'))
+        group_id_list=[[0], [1, 2, 3, 4, 5, 6, 7, 8, 10, 11, 12], [9]],
+        anchor_info_path='data/others/motion_anchor_infos_kl_turnaware_3grp.pkl'))
 
 data = dict(samples_per_gpu=1)
 
