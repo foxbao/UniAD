@@ -15,23 +15,19 @@
 生成中文场景 summary 作为监督；训练一个挂在 UniAD **LiDAR query** 上的小 LLM（Qwen2.5-0.5B），
 让它**推理时仅凭 LiDAR query** 就能说出图像老师才看得到的语义。推理零图像依赖，不动现有 LiDAR 链路。
 
-## 0.1.1 术语（C1/C2 是历史简称，下文沿用）
-
-- **C1 = 几何事实生成**：脚本 `gen_geo_facts.py`，从 GT 几何算出每帧 `info['geo_facts']`
-  （方位/距离/运动/冲突/作业门控等）。产物 pkl 后缀 `_geo`。
-- **C2 = VLM caption 生成**：脚本 `gen_vlm_caption.py`，VLM 看图 + 读 geo_facts → 中文 summary。
-  产物 JSON sidecar `*_vlmcap_summaries.json`、合并后 pkl 后缀 `_vlmcap`。
-- 早期代号 C1/C2 仍在正文用作简称；文件/字段名已统一为 geo_facts / vlm_caption。
+数据流两步走：**几何事实生成**（`gen_geo_facts.py`，从 GT 算出 `info['geo_facts']`，产物 pkl 后缀 `_geo`）
+→ **VLM caption 生成**（`gen_vlm_caption.py`，VLM 看图 + 读 geo_facts 出中文 summary，
+sidecar `*_vlmcap_summaries.json`、合并后 pkl 后缀 `_vlmcap`）。
 
 ## 0.2 环境矩阵（关键：两套 env，因 numpy/torch 不兼容必须分开）
 
 | env | torch | numpy | transformers | 用途 |
 |-----|-------|-------|--------------|------|
-| `uniad_train` | 1.12.1+cu116 | 1.22.4 | 无 | 训练主环境；跑 C1 几何生成、子集抽样、读写 KL pkl |
-| `qwen_vl`（本方案新建） | 2.6.0+cu124 | 2.2.6 | 4.57.6 | 仅跑 C2 的 Qwen2.5-VL 离线推理 |
+| `uniad_train` | 1.12.1+cu116 | 1.22.4 | 无 | 训练主环境；跑 几何事实生成、子集抽样、读写 KL pkl |
+| `qwen_vl`（本方案新建） | 2.6.0+cu124 | 2.2.6 | 4.57.6 | 仅跑 VLM caption 的 Qwen2.5-VL 离线推理 |
 
 ⚠️ **numpy 跨版本陷阱**：qwen_vl(numpy2.x) 直接 pickle 重写 KL pkl 后，uniad_train(numpy1.x)
-会因 `No module named numpy._core` **读不了**。因此 C2 的产物通过 **token→summary 的 JSON sidecar**
+会因 `No module named numpy._core` **读不了**。因此 VLM caption 的产物通过 **token→summary 的 JSON sidecar**
 交接，绝不让 qwen_vl 重写训练要读的 pkl。
 
 qwen_vl 重建方法：
@@ -74,7 +70,7 @@ python tools/data_converter/add_cam_sync.py \
 # 命中率: train 98.58% / val 98.19%（<50ms）; 缺帧标 valid=False
 ```
 
-**Step 2 — C1 几何事实**（env: uniad_train）
+**Step 2 — 几何事实生成**（env: uniad_train）
 `gen_geo_facts.py`：从 GT 算每帧 `info['geo_facts']`（per-agent: range/bearing/motion/heading/
 load/conflict+ttc/activity_gate；scene: agents_of_interest/ego_advice/congestion/crane_status），
 并 dump 静止时长 / 吊机距离分布（用于定 activity 阈值）。
@@ -86,14 +82,14 @@ python tools/data_converter/gen_geo_facts.py \
 
 **Step 3 —（可选）分层子集**（env: uniad_train）
 `make_subset.py`：稀有场景（queue/conflict/activity_gate）全保留 + 普通帧补足到 --size，
-固定 seed 可复现。用于快速迭代 C2 / LLMBridgeHead。
+固定 seed 可复现。用于快速迭代 VLM caption / LLMBridgeHead。
 ```bash
 python tools/data_converter/make_subset.py \
   --pkl-path data/kl_8/kl_infos_val_with_cam_geo.pkl \
   --out-path data/kl_8/kl_infos_val_sub1k_geo.pkl --size 1500
 ```
 
-**Step 4 — C2 Qwen2.5-VL summary**（env: qwen_vl）
+**Step 4 — VLM caption 生成**（env: qwen_vl）
 `gen_vlm_caption.py`：读 geo_facts + 渲染中文事实约束文本 + 前视图 → VLM → 一句中文 summary。
 **关键产物是 JSON sidecar**（`*_summaries.json`，token→summary），pkl 输出可丢 /tmp。
 ```bash
@@ -127,7 +123,7 @@ python tools/data_converter/merge_summaries.py \
 
 - **Step 1~5 流水线已全跑通**（val 1500 子集）：产物 `data/kl_8/kl_infos_val_sub1k_vlmcap.pkl`
   （1466/1500 带 summary，uniad_train 可读）。
-- **C2 全量未跑**：目前只在 val 1500 子集验证；train 43981 帧全量约 18h（可多卡并行）。
+- **VLM caption 全量未跑**：目前只在 val 1500 子集验证；train 43981 帧全量约 18h（可多卡并行）。
   train 侧需先跑 Step1(add_cam_sync)+Step2(gen_geo_facts) 得到 `kl_infos_train_with_cam_geo.pkl`。
 - **LLMBridgeHead 未落地**：第 7 步，挂在 `UniADMotionLidar` 上、消费 `outs_motion['track_query']`。
   早期写过骨架已回退（git）；现数据已就绪，可开始重做。
@@ -141,7 +137,7 @@ python tools/data_converter/merge_summaries.py \
     mmcv.ops 验证 OK、训练链路完好。后续装包注意别再动 torch（用 --no-deps 或避开 accelerate 升级）。
 - 文件清单（本方案新增）：
   `tools/data_converter/{add_cam_sync,gen_geo_facts,make_subset,gen_vlm_caption,merge_summaries}.py`、
-  `tools/run_vlm_caption_train_7gpu.sh`（7 卡并行 C2）、
+  `tools/run_vlm_caption_train_7gpu.sh`（7 卡并行 VLM caption）、
   `projects/mmdet3d_plugin/uniad/dense_heads/llm_bridge_head.py`、
   `projects/configs/stage2_e2e_lidar/base_e2e_lidar_occ_llm.py`、本文档。
 
@@ -183,7 +179,7 @@ base_track_lidar  →  base_track_drivable_lidar  →  base_e2e_lidar  →  base
 3. **语言条件 Planning**。PlanningHead 现吃离散 `command`；换成 LLM 把自然语言调度指令编码成 planning 条件向量。港口调度本就是文本，业务价值最高。
 4. **离线 LLM 数据/诊断**。VLM 自动场景描述、长尾挖掘、失败帧可读诊断。不进推理图，工程风险最低。
 
-## 3. 选定方向 1：query → LLM，跨模态蒸馏（C2 老师 + 纯 LiDAR 推理）
+## 3. 选定方向 1：query → LLM，跨模态蒸馏（VLM 老师 + 纯 LiDAR 推理）
 
 ### 3.0 定调（2026-06-19 讨论确定）
 
@@ -219,7 +215,7 @@ base_track_lidar  →  base_track_drivable_lidar  →  base_e2e_lidar  →  base
 - 最近邻时间 gap：全 train 43981 帧，**median 35.8ms、p95 45.5ms**，
   这 ~33ms 是固定的传感器触发相位差，不是漂移。
 - 容差定 **50ms**：98.58% 帧命中；放宽到 500ms 也只到 99.71%
-  （剩 ~1.4%≈625 帧是相机整段丢帧，gap 几百 ms~4.5s，放宽也救不回 ⇒ 直接标"无图"，C2 跳过）。
+  （剩 ~1.4%≈625 帧是相机整段丢帧，gap 几百 ms~4.5s，放宽也救不回 ⇒ 直接标"无图"，VLM 跳过）。
 - ⇒ 同步脚本很轻：按 `scene_token` 定位目录 + 时间戳最近邻 + 50ms 阈值。
 - **决策**：先只用 **front** 单视角（VLM 算力省 6 倍，先验证价值再扩环视）。
 - **VLM 老师**：Qwen2.5-VL（中文/工业场景友好）；本地 8×RTX4090(24G)，7B 单卡可跑，本地批量离线。
@@ -244,15 +240,15 @@ motion traj_query             ├─► Projector (MLP, 256 → d_llm) ─► [N
 - **token 数**：agent 数不定，截断/padding 到 `max_agents`，截断要 log。
 
 
-### 3.2 监督数据：C1 几何模板 + C2 图像 VLM（互补）
+### 3.2 监督数据：几何模板 + VLM 图像（互补）
 
 | 路线 | 来源 | 内容 | 前置成本 |
 |------|------|------|----------|
-| **C1 几何模板** | 现有 GT 框/轨迹合成 | 确定性事实：方位/距离、运动状态、ego×agent 轨迹冲突/让行、是否在可行驶区 | 低，直接可做 |
-| **C2 图像 VLM**（主线） | Qwen2.5-VL 看 front 图 | 作业状态、满载/空载（粗）、吊机工作/空闲 | 中，需先做图像↔LiDAR 同步（已验证轻量） |
+| **几何模板** | 现有 GT 框/轨迹合成 | 确定性事实：方位/距离、运动状态、ego×agent 轨迹冲突/让行、是否在可行驶区 | 低，直接可做 |
+| **VLM 图像**（主线） | Qwen2.5-VL 看 front 图 | 作业状态、满载/空载（粗）、吊机工作/空闲 | 中，需先做图像↔LiDAR 同步（已验证轻量） |
 
-- 最终监督 = C1 精确空间/冲突事实 ⊕ C2 场景语义，合并成每帧的 caption。
-- C2 生成时让 VLM 同时吃 C1 的结构化事实文本作为 prompt 约束，减少幻觉、对齐到 ego 视角。
+- 最终监督 = 几何精确空间/冲突事实 ⊕ VLM 场景语义，合并成每帧的 caption。
+- VLM caption 生成时让模型同时吃几何步骤的结构化事实文本作为 prompt 约束，减少幻觉、对齐到 ego 视角。
 - ⚠️ 警惕"念 query"：监督价值在 **跨 agent / 跨时间 / 跨模态** 的推理（冲突、意图、作业状态），
   而非"有 3 台 IGV"这种感知头已给的清单。
 
@@ -264,36 +260,36 @@ motion traj_query             ├─► Projector (MLP, 256 → d_llm) ─► [N
 
 | 语义 | 推理依据 | 来源 |
 |------|----------|------|
-| 物体类别清单 | 类别已在 track | C1（仅 caption 底料，非增值） |
-| 空间布局（方位/距离/区域） | box 中心 + ego | C1 |
-| 运动状态（静止/行驶/速度档） | track 速度/轨迹 | C1 |
-| 朝向 / 转向意图 | 朝向 + fut_traj 曲率 | C1 |
-| 满载 / 空载（**粗粒度**：有箱/空载/NA） | IGV/Trailer 已分 Full/Empty + 箱体高度 | C1+C2 |
-| **轨迹冲突 / 让行关系** | ego fut × agent fut 相交 | C1（核心增值） |
-| **作业 vs 通行 状态** | C1 几何门控（久静止+贴吊机/在作业区）→ C2 才允许标装卸 | C1 门控 + C2 |
-| 吊机工作 / 空闲 | Crane 静止 + 下方 IGV/Trailer 停靠 | C1+C2 |
-| 拥堵 / 排队 | 多 agent 低速聚集 | C1 |
-| 是否阻塞 ego 路径 | agent 落在 ego fut 走廊内 | C1 |
+| 物体类别清单 | 类别已在 track | 几何（仅 caption 底料，非增值） |
+| 空间布局（方位/距离/区域） | box 中心 + ego | 几何 |
+| 运动状态（静止/行驶/速度档） | track 速度/轨迹 | 几何 |
+| 朝向 / 转向意图 | 朝向 + fut_traj 曲率 | 几何 |
+| 满载 / 空载（**粗粒度**：有箱/空载/NA） | IGV/Trailer 已分 Full/Empty + 箱体高度 | 几何+VLM |
+| **轨迹冲突 / 让行关系** | ego fut × agent fut 相交 | 几何（核心增值） |
+| **作业 vs 通行 状态** | 几何门控（久静止+贴吊机/在作业区）→ VLM 才允许标装卸 | 几何门控+VLM |
+| 吊机工作 / 空闲 | Crane 静止 + 下方 IGV/Trailer 停靠 | 几何+VLM |
+| 拥堵 / 排队 | 多 agent 低速聚集 | 几何 |
+| 是否阻塞 ego 路径 | agent 落在 ego fut 走廊内 | 几何 |
 
 **❌ 不教**（图像独有 / LiDAR 无望，学了=幻觉）：颜色、箱号文字、吊具锁扣/灯光等精细部件、
 人的姿态/反光衣、地面标线内容、天气/光照、品牌型号、堆叠层数/具体 TEU（细粒度载货）。
 
-**两条灰线裁决**：① 作业状态——教，但 C1 几何门控在先，无几何依据不标。
+**两条灰线裁决**：① 作业状态——教，但 几何门控在先，无几何依据不标。
 ② 载货——只教粗粒度（有箱/空载/NA），不教层数。
 
 #### 3.2.2 Caption schema 与生成策略（2026-06-19 锁定）
 
 - **训练目标**：仅 **scene-level `summary`** 自由文本（一句/几句中文）。
   per-agent 结构化字段暂不作为输出目标（将来要 grounding 再加）。
-- **生成方式 (a)**：C1 模板拼几何事实 → Qwen2.5-VL 看 front 图 **改写润色 + 补作业/载货语义** →
-  自然中文 summary。VLM 只负责"看图补语义 + 说人话"，几何事实由 C1 保证准确，防幻觉。
-- **scene-level 字段**（C1 先算，作为 VLM 的 prompt 约束 + summary 的事实底料）：
+- **生成方式 (a)**：几何模板拼几何事实 → Qwen2.5-VL 看 front 图 **改写润色 + 补作业/载货语义** →
+  自然中文 summary。VLM 只负责"看图补语义 + 说人话"，几何事实由几何步骤保证准确，防幻觉。
+- **scene-level 字段**（几何步骤先算，作为 VLM 的 prompt 约束 + summary 的事实底料）：
   `agents_of_interest`（对 ego 最相关的 id）、`ego_advice`（keep/yield/slow/stop，由冲突导出）、
   `congestion`、`crane_status`、以及每个关键 agent 的 pos/motion/heading/load/conflict。
 - **作业状态门控阈值**：**不预设，数据驱动**。
   - 门控只做"宽松预筛"——挡掉几何上绝无可能作业的 agent（如高速行驶中），
-    最终"是否装卸"由 C2 看图裁决。故门控应**故意放松**。
-  - C1 生成器先 **dump 分布**（每个 agent 的静止时长、与最近 Crane 的距离），
+    最终"是否装卸"由 VLM 看图裁决。故门控应**故意放松**。
+  - 几何生成器先 **dump 分布**（每个 agent 的静止时长、与最近 Crane 的距离），
     看真实直方图再定阈值；阈值写成 config 可调参数，不写死。
   - 宽松默认（待数据校准）：静止 >2s 且距最近 Crane <30m ⇒ "允许"标作业。
 
@@ -306,7 +302,7 @@ motion traj_query             ├─► Projector (MLP, 256 → d_llm) ─► [N
   `track_bbox_results`/`track_query_embeddings` 的 cleanup **之前** 调用）。
 - config：新建 `base_e2e_lidar_occ_llm.py` 继承 `base_e2e_lidar_occ`，加 `llm_head` 与
   `task_loss_weight['llm']`；pipeline Collect 增加 `gt_caption`。
-- 数据：图像同步脚本（补相机路径）+ C1 模板生成 + C2 VLM 生成，产出每帧 caption，存入 pkl/sidecar。
+- 数据：图像同步脚本（补相机路径）+ 几何模板生成 + VLM caption 生成，产出每帧 caption，存入 pkl/sidecar。
 
 ### 3.4 训练策略
 
@@ -317,15 +313,15 @@ motion traj_query             ├─► Projector (MLP, 256 → d_llm) ─► [N
 ### 3.5 待定 / 风险
 
 - **图像↔LiDAR 同步质量**：时间最近邻 + 标定，需抽检对齐误差；港口低速，容差相对宽松。
-- **C2 老师质量/成本**：大 VLM 选型、是否本地可跑、生成 ~5191 帧×6 视角的算力与时间。
-- **幻觉**：VLM 对港口专有物体（IGV/吊具）可能识别不准；用 C1 事实约束 + 抽检。
+- **VLM 老师质量/成本**：大 VLM 选型、是否本地可跑、生成 ~5191 帧×6 视角的算力与时间。
+- **幻觉**：VLM 对港口专有物体（IGV/吊具）可能识别不准；用几何事实约束 + 抽检。
 - **部署**：推理纯 LiDAR，LLM 分支默认不上车；若要上车再议量化。
 - **token 数**：agent 数不定，截断/padding。
 
 ## 4. 下一步
 
 1. ✅ LLM 底座：Qwen2.5-0.5B（d_llm=896）。
-2. ✅ 方案定调：C2 图像 VLM 老师 + 纯 LiDAR 推理（跨模态蒸馏）；C1 几何模板互补。
+2. ✅ 方案定调：VLM 图像 老师 + 纯 LiDAR 推理（跨模态蒸馏）；几何模板互补。
 3. ✅ token 边界 + caption schema（scene-level summary，生成方式 a）锁定。
 4. ✅ **图像↔LiDAR 同步脚本**：`tools/data_converter/add_cam_sync.py`（后处理，模仿 add_sdc）。
    - 复用 converter 的 `CAM_NAME_MAP` / `make_sync_entry` 约定，写进 `info['sync_info']['cameras']`。
@@ -336,21 +332,21 @@ motion traj_query             ├─► Projector (MLP, 256 → d_llm) ─► [N
    - 默认 front、容差 0.05s（对齐建库 cfg 的 `camera_max_diff`）；`--views` 可扩环视。
    - **已运行**（uniad_train conda 环境，mmcv 1.5.0），保留副本不覆盖原 pkl：
      `data/kl_8/kl_infos_{train,val}_with_cam.pkl`（train 98.58% / val 98.19% 命中）。
-     原 pkl 不动，C1/C2/LLM config 显式指向 `_with_cam.pkl`；现有 LiDAR 训练不受影响。
-5. ✅ **C1 几何生成器**：`tools/data_converter/gen_geo_facts.py`（后处理，写 `info['geo_facts']`）。
+     原 pkl 不动，几何/VLM/LLM config 显式指向 `_with_cam.pkl`；现有 LiDAR 训练不受影响。
+5. ✅ **几何事实生成器**：`tools/data_converter/gen_geo_facts.py`（后处理，写 `info['geo_facts']`）。
    - 已验证 fut_traj 约定（相对自身当前位置的累积位移，LiDAR 帧）；冲突 = agent/ego 未来绝对轨迹最近距离。
    - per-agent：range/bearing(8扇区)/motion/heading/load(粗)/conflict+ttc/activity_gate；
      scene：agents_of_interest/ego_advice/congestion/crane_status。
    - **分布已 dump，activity 阈值数据化锁定**（val 83152 agent-instance）：
      `static_dur` 上限 3.5s（past traj 7 步），p50=1.0s；`crane_dist` p50=66m、p75=107m（多数 agent 远离吊机）。
-     ⇒ 门控 `static≥2s & crane≤30m`：通过率 **3.0%**（宽松预筛但不滥发，C2 看图终判）。
+     ⇒ 门控 `static≥2s & crane≤30m`：通过率 **3.0%**（宽松预筛但不滥发，VLM 看图终判）。
    - conflict=True 0.5%、ego_advice keep94%/yield4.8%/slow1%（合理）。
    - **congestion 修正**：原"30m内≥3 非移动"误把停车场当排队(66%)；
      改为"只数 moving_slow 且 ≥4"，降到 **1.5%**（真·缓行队列）。
    - 副本：`data/kl_8/kl_infos_{train,val}_with_cam_geo.pkl`（val 已跑；train 待跑）。
-6. ▶ C2：Qwen2.5-VL prompt 设计 + 批量生成 summary（吃 geo_facts 约束 + front 图）。
+6. ▶ VLM caption：Qwen2.5-VL prompt 设计 + 批量生成 summary（吃 geo_facts 约束 + front 图）。
    - **环境**：新建独立 conda env `qwen_vl`（torch 2.6+cu124 / transformers 4.57.6 /
-     qwen-vl-utils / torchvision 0.21），与 uniad_train(torch1.12) 隔离；C2 是离线数据生成，不进训练/推理。
+     qwen-vl-utils / torchvision 0.21），与 uniad_train(torch1.12) 隔离；VLM caption 是离线数据生成，不进训练/推理。
    - **模型**：Qwen2.5-VL-7B-Instruct，modelscope 下载到 `/mnt/disk1/models/`
      （⚠️ 系统盘 `/` 仅剩 46G，模型必须放 disk1，勿进 `~/.cache`）。单卡 24G 可跑。
    - **脚本**：`tools/data_converter/gen_vlm_caption.py`（后处理，写 `geo_facts['summary']`）。
@@ -362,7 +358,7 @@ motion traj_query             ├─► Projector (MLP, 256 → d_llm) ─► [N
    - 待模型下载完 → 单帧实测 VLM 输出质量 → 抽样调 prompt → 批量生成。
      - ✅ 模型已下载（16G，5 分片）；单帧实测通过：VLM 遵守几何事实、补出"吊机空闲/可能在作业"
        等图像语义，与 activity_gate 联动正确；summary 风格定为**简洁**（抓重点+图像语义，不复述清单）。
-     - ✅ C2 脚本去 mmcv 依赖（改 pickle 读写），可在纯净 qwen_vl 环境跑。
+     - ✅ VLM caption 脚本去 mmcv 依赖（改 pickle 读写），可在纯净 qwen_vl 环境跑。
      - **子集策略**：`tools/data_converter/make_subset.py` 分层抽样——稀有场景（queue/conflict/
        activity_gate）全保留 + 普通帧补足。val 子集 1500 帧（1123 稀有 + 377 普通），
        `data/kl_8/kl_infos_val_sub1k_geo.pkl`，先在子集上跑通 LLMBridgeHead 再放大。
@@ -372,12 +368,12 @@ motion traj_query             ├─► Projector (MLP, 256 → d_llm) ─► [N
        **CONFLICT 初版退化成套话"前方有障碍物请减速"**（297 条几乎重复）。
      - ✅ 修 prompt：强令冲突场景必须点明目标(方位+类别)+TTC+建议，禁用"障碍物"泛称，加 few-shot。
        30 帧 conflict 重测通过：summary 具体化，TTC 越小建议从减速→让行，逻辑正确。
-     - ⚠️ **C1 conflict 定义修正（2026-06-19，港口场景特性）**：初版 conflict=轨迹最近距离<4m，
+     - ⚠️ **几何 conflict 定义修正（2026-06-19，港口场景特性）**：初版 conflict=轨迹最近距离<4m，
        导致冲突目标多为**静止锥桶**，VLM 输出"向锥桶让行"的过度反应。
        **根因（用户澄清）**：港口锥桶用于路边圈定**禁入区**，不是路中央紧急避让物，ego 贴边正常驶过。
-       **已修**：C1 把 Cone(cls=9) 加入 `_NO_CONFLICT_IDS`，conflict 计算跳过。
+       **已修**：几何步骤把 Cone(cls=9) 加入 `_NO_CONFLICT_IDS`，conflict 计算跳过。
        效果：conflict 帧 5.8%→1.6%，冲突目标变为行人(70)/空载IGV(26) 等真·动态目标，锥桶清零。
-     - ✅ numpy 跨版本交接：C2 改为额外导出 `*_summaries.json`（token→summary），
+     - ✅ numpy 跨版本交接：VLM caption 改为额外导出 `*_summaries.json`（token→summary），
        训练侧只读 JSON 合并，避免 qwen_vl(numpy2.x) 重写 pkl 致 uniad_train(numpy1.x) 读不了。
 7. ✅ `LLMBridgeHead` + config + smoke test（2026-06-22 跑通）。
    - 新建 `dense_heads/llm_bridge_head.py`（`LLMBridgeHead`）：projector(256→896)+spatial_pe(3→896)
@@ -393,6 +389,6 @@ motion traj_query             ├─► Projector (MLP, 256 → d_llm) ─► [N
      train/val 指向 `kl_infos_val_sub1k_vlmcap.pkl`，load_from 改 stage-1 ckpt（stage-2 ckpt 不存在）。
    - smoke 通过：caption 正确注入，llm.loss_llm≈5.2~5.7（有限），120 个 loss key（track/motion/
      occ/llm 共存不冲突），backward OK。
-8. ▶ 正式训练：train 全量 C2（被中断在 7.6%，需重跑，~9h）→ 全量训练 + val 评估。
+8. ▶ 正式训练：train 全量 VLM caption（被中断在 7.6%，需重跑，~9h）→ 全量训练 + val 评估。
    训练命令：`./tools/uniad_dist_train.sh projects/configs/stage2_e2e_lidar/base_e2e_lidar_occ_llm.py <GPUS>`
    （注意：当前 config 指向 val 子集；正式训练需把 train ann_file 换成 train 全量 c2 pkl）。
