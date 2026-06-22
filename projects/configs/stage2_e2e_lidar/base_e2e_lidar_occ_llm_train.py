@@ -8,14 +8,15 @@ _base_ = ['./base_e2e_lidar_occ_llm.py']
 #
 # Prerequisites (see documents/llm_integration_plan.md 4.3-A):
 #   - data/kl_8/kl_infos_train_vlmcap.pkl  (7-gpu caption -> merge_summaries)
-#   - data/kl_8/kl_infos_val_sub6cam_vlmcap.pkl  (already generated)
+#   - data/kl_8/kl_infos_val_sub6cam_v3_vlmcap.pkl  (6-cam, gate cleaned, v3)
 # Both must carry geo_facts.summary. train pkl is built from the 6-cam
-# kl_infos_train_with_cam_geo.pkl (redone 2026-06-22).
+# kl_infos_train_with_cam_geo.pkl (redone 2026-06-22, gate excludes
+# pedestrian/car/cone).
 
 data = dict(
     train=dict(ann_file='kl_infos_train_vlmcap.pkl'),
-    val=dict(ann_file='kl_infos_val_sub6cam_vlmcap.pkl'),
-    test=dict(ann_file='kl_infos_val_sub6cam_vlmcap.pkl'))
+    val=dict(ann_file='kl_infos_val_sub6cam_v3_vlmcap.pkl'),
+    test=dict(ann_file='kl_infos_val_sub6cam_v3_vlmcap.pkl'))
 
 # The smoke config starts from the stage-1 drivable ckpt (a shortcut to test
 # the llm forward/loss). For full training we want the trained stage-2 occ
