@@ -376,8 +376,20 @@ motion traj_query             ├─► Projector (MLP, 256 → d_llm) ─► [N
    ```
    注意：当前 config 的 train/val 都指向 val 子集（smoke 用）；正式训练须先做 (3)。
 
-**B. 评估指标**：当前只有 loss，需加 caption 质量度量（BLEU / 关键语义命中率），
-   以及 `forward_test` 生成质量的抽检流程。
+**B. 评估指标**（已落地 `tools/analysis_tools/eval_llm_caption.py`）：
+   规则解析 caption → 关键语义命中率（conflict 类别/方位、TTC 桶、ego_advice、activity、幻觉），
+   主对 geo_facts。baseline：`template`（几何直出，floor）/`teacher`（VLM summary，蒸馏上限）
+   已可跑；`model`/`shuffle`/`noquery` 待训练出 checkpoint 后接（forward_test 逐帧）。
+   - 已测基准（val 1500）：template 几何字段 100%、activity 0%（符合预期）；
+     **teacher: conflict_cls 75% / advice 85% / activity 仅 15.6% / 幻觉 2%**。
+   - ⚠️ **关键发现**：作业状态(activity)是方案核心卖点（图像独有语义），但 **VLM 老师本身
+     只在 15.6% 的该标帧里说了作业** —— 老师没教够，学生无从学。同 conflict 退化一类问题：
+     VLM prompt 对作业状态引导不足。**正式训练前应先改 prompt 提升 activity 召回**（见 C）。
+   - `shuffle` 对照（query 配错帧）是证伪试金石：若打乱后命中不掉 = LLM 没真用 LiDAR query。
 
-**C. 可选优化**（非阻塞）：扩环视（front→6 路）提升老师质量；conflict 语义进一步精修；
-   显存/多卡 DDP 在全量数据上的完整验证（smoke 只跑了 3 个 iter）。
+**C. 优先改进**：
+   - **(高) 提升 VLM activity 召回**：改 gen_vlm_caption prompt，对 `activity_gate=True` 帧
+     强制 VLM 明确判断"装卸中/等待/空闲"（类比 conflict 修复加 few-shot），重测 teacher activity。
+   - (中) 显式特征入 head：当前只喂 track_query+box center；可拼 class logits / bbox 尺寸/yaw /
+     velocity / conflict-advice 结构特征，提升可控性（评注第 2 条，训练后迭代）。
+   - (低) 扩环视（front→6 路）提升老师质量；多卡 DDP 全量完整验证（smoke 只跑 3 iter）。
