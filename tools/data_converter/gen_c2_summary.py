@@ -142,12 +142,18 @@ def _resolve_img(info, data_root):
 
 def gen_c2_to_pkl(pkl_path, model_path, out_path=None, in_place=False,
                   data_root='', device='cuda:0', limit=0,
-                  max_new_tokens=96, dry_run=False):
+                  max_new_tokens=96, dry_run=False,
+                  num_shards=1, shard_id=0):
     with open(pkl_path, 'rb') as f:
         data = pickle.load(f)
     infos = (data['data_list'] if isinstance(data, dict) and 'data_list' in data
              else data['infos'] if isinstance(data, dict) and 'infos' in data
              else data)
+    # Data-parallel sharding: strided split keeps shards balanced and
+    # non-overlapping. Each shard writes its own JSON sidecar; merge_summaries
+    # can ingest several sidecars (they are disjoint token->summary maps).
+    if num_shards > 1:
+        infos = infos[shard_id::num_shards]
     model = processor = None
     if not dry_run:
         model, processor = _load_model(model_path, device)
@@ -178,19 +184,26 @@ def gen_c2_to_pkl(pkl_path, model_path, out_path=None, in_place=False,
         summaries[token] = facts['summary']
         n_done += 1
 
-    print(f'[{osp.basename(pkl_path)}] summaries={n_done} skipped={n_skip}')
+    print(f'[{osp.basename(pkl_path)}] summaries={n_done} skipped={n_skip}'
+          + (f' (shard {shard_id}/{num_shards})' if num_shards > 1 else ''))
     if not dry_run:
-        _write(data, pkl_path, out_path, in_place, summaries)
+        _write(data, pkl_path, out_path, in_place, summaries,
+               num_shards=num_shards, shard_id=shard_id)
     return data
 
 
-def _write(data, pkl_path, out_path, in_place, summaries):
-    """Write the pkl, plus a token->summary JSON sidecar.
+def _write(data, pkl_path, out_path, in_place, summaries,
+           num_shards=1, shard_id=0):
+    """Write a token->summary JSON sidecar (+ the pkl when not sharding).
 
     The JSON sidecar is the numpy-version-safe handoff: C2 runs under numpy
     2.x (qwen_vl env) but training reads under numpy 1.x (uniad_train), and a
     full pkl re-pickle would re-serialize numpy arrays into the 2.x format
     that 1.x cannot load. The merge step reads only this JSON.
+
+    In shard mode each process holds only its slice of infos, so dumping the
+    pkl would be wrong/wasteful -- we write a shard-suffixed JSON only and let
+    merge_summaries ingest all shards.
     """
     if in_place:
         dst = pkl_path
@@ -199,9 +212,16 @@ def _write(data, pkl_path, out_path, in_place, summaries):
     else:
         root, ext = osp.splitext(pkl_path)
         dst = f'{root}_c2{ext}'
+    json_base = osp.splitext(dst)[0] + '_summaries'
+    if num_shards > 1:
+        json_dst = f'{json_base}.shard{shard_id}of{num_shards}.json'
+        with open(json_dst, 'w', encoding='utf-8') as f:
+            json.dump(summaries, f, ensure_ascii=False, indent=1)
+        print(f'  -> wrote {json_dst} ({len(summaries)} entries)')
+        return
     with open(dst, 'wb') as f:
         pickle.dump(data, f)
-    json_dst = osp.splitext(dst)[0] + '_summaries.json'
+    json_dst = json_base + '.json'
     with open(json_dst, 'w', encoding='utf-8') as f:
         json.dump(summaries, f, ensure_ascii=False, indent=1)
     print(f'  -> wrote {dst}')
@@ -224,6 +244,10 @@ def main():
     parser.add_argument('--max-new-tokens', type=int, default=96)
     parser.add_argument('--dry-run', action='store_true',
                         help='Render prompts only; do not load the model.')
+    parser.add_argument('--num-shards', type=int, default=1,
+                        help='Data-parallel shards (one process/GPU each).')
+    parser.add_argument('--shard-id', type=int, default=0,
+                        help='This process shard index in [0, num_shards).')
     args = parser.parse_args()
     if args.out_path is not None and len(args.pkl_path) != 1:
         raise ValueError('--out-path can only be used with one --pkl-path.')
@@ -232,7 +256,8 @@ def main():
             pkl_path, args.model_path, out_path=args.out_path,
             in_place=args.in_place, data_root=args.data_root,
             device=args.device, limit=args.limit,
-            max_new_tokens=args.max_new_tokens, dry_run=args.dry_run)
+            max_new_tokens=args.max_new_tokens, dry_run=args.dry_run,
+            num_shards=args.num_shards, shard_id=args.shard_id)
 
 
 if __name__ == '__main__':

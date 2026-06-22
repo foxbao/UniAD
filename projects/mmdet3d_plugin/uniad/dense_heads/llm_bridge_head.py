@@ -183,9 +183,15 @@ class LLMBridgeHead(BaseModule):
             centres = self._agent_centres(outs_track)
             obj_tok = self._object_tokens(agent_query, centres, device)
             inputs_embeds = torch.cat([prompt_emb, obj_tok.unsqueeze(0)], dim=1)
+        # In inputs_embeds mode the model can't infer the mask, and pad==eos
+        # here, so pass an explicit all-ones mask + ids for reliable decoding.
+        attn = torch.ones(
+            inputs_embeds.shape[:2], dtype=torch.long, device=device)
         gen = self._llm.generate(
-            inputs_embeds=inputs_embeds, max_new_tokens=max_new_tokens,
-            do_sample=False)
+            inputs_embeds=inputs_embeds, attention_mask=attn,
+            max_new_tokens=max_new_tokens, do_sample=False,
+            pad_token_id=self.tokenizer.pad_token_id,
+            eos_token_id=self.tokenizer.eos_token_id)
         return self.tokenizer.batch_decode(
             gen, skip_special_tokens=True)[0].strip()
 

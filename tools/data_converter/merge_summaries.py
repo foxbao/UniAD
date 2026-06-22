@@ -27,8 +27,15 @@ def _infos(data):
 def merge(pkl_path, json_path, out_path=None, in_place=False):
     with open(pkl_path, 'rb') as f:
         data = pickle.load(f)
-    with open(json_path, 'r', encoding='utf-8') as f:
-        summaries = json.load(f)
+    # json_path may be one path or several (e.g. one per C2 shard); shards are
+    # disjoint token->summary maps, so a plain update merges them.
+    if isinstance(json_path, str):
+        json_path = [json_path]
+    summaries = {}
+    for jp in json_path:
+        with open(jp, 'r', encoding='utf-8') as f:
+            summaries.update(json.load(f))
+    print(f'loaded {len(summaries)} summaries from {len(json_path)} sidecar(s)')
     infos = _infos(data)
 
     n_set = n_miss = 0
@@ -65,8 +72,9 @@ def main():
     p.add_argument('--pkl-path', required=True,
                    help='The c1 pkl (numpy-1.x written, e.g. *_with_cam_c1.pkl '
                         'or a subset).')
-    p.add_argument('--json-path', required=True,
-                   help='C2 sidecar, *_summaries.json.')
+    p.add_argument('--json-path', required=True, nargs='+',
+                   help='C2 sidecar(s), *_summaries.json. Pass several '
+                        '(or a shell glob) to merge all C2 shards at once.')
     p.add_argument('--out-path', default=None)
     p.add_argument('--in-place', action='store_true')
     args = p.parse_args()
