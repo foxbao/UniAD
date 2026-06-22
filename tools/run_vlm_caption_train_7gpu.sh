@@ -16,12 +16,18 @@ GPUS=(1 2 3 4 5 6 7)   # leave GPU0 free
 
 for i in "${!GPUS[@]}"; do
     g=${GPUS[$i]}
-    CUDA_VISIBLE_DEVICES=$g nohup python tools/data_converter/gen_vlm_caption.py \
+    # Stagger launches: 7 procs each loading a 16GB model at the exact same
+    # instant spiked allocator pressure and OOM'd. A few seconds apart lets
+    # each finish its load before the next starts. expandable_segments curbs
+    # fragmentation (the OOM error explicitly recommended it).
+    CUDA_VISIBLE_DEVICES=$g PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+        nohup python tools/data_converter/gen_vlm_caption.py \
         --pkl-path $PKL --model-path $MODEL --device cuda:0 \
         --out-path /tmp/train_vlmcap.pkl \
         --num-shards $N --shard-id $i \
         > /tmp/vlmcap_shard${i}.log 2>&1 &
     echo "shard $i -> GPU $g (pid $!)"
+    sleep 8
 done
 echo "launched $N shards. watch: tail -f /tmp/vlmcap_shard0.log"
 echo "when all done, merge with:"
