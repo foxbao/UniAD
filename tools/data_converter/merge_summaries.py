@@ -1,11 +1,11 @@
 #!/usr/bin/env python
-"""Step 5: merge C2 summaries (JSON sidecar) back into a KL c1 pkl.
+"""Step 5: merge VLM-caption summaries (JSON sidecar) back into a KL geo-facts pkl.
 
-This runs in the TRAINING env (uniad_train, numpy 1.x). C2 (gen_c2_summary.py)
+This runs in the TRAINING env (uniad_train, numpy 1.x). VLM caption (gen_vlm_caption.py)
 runs under qwen_vl (numpy 2.x) and emits a token->summary JSON sidecar instead
 of rewriting the pkl, because a numpy-2.x pickle of the pkl cannot be loaded by
 numpy 1.x. Here we read that JSON and write summary into
-info['c1_facts']['summary'], producing a pkl the training stack can load.
+info['geo_facts']['summary'], producing a pkl the training stack can load.
 
 See documents/llm_integration_plan.md (0.4 Step 5).
 """
@@ -27,7 +27,7 @@ def _infos(data):
 def merge(pkl_path, json_path, out_path=None, in_place=False):
     with open(pkl_path, 'rb') as f:
         data = pickle.load(f)
-    # json_path may be one path or several (e.g. one per C2 shard); shards are
+    # json_path may be one path or several (e.g. one per VLM-caption shard); shards are
     # disjoint token->summary maps, so a plain update merges them.
     if isinstance(json_path, str):
         json_path = [json_path]
@@ -40,7 +40,7 @@ def merge(pkl_path, json_path, out_path=None, in_place=False):
 
     n_set = n_miss = 0
     for info in infos:
-        facts = info.get('c1_facts')
+        facts = info.get('geo_facts')
         if facts is None:
             continue
         token = info.get('token')
@@ -60,7 +60,7 @@ def merge(pkl_path, json_path, out_path=None, in_place=False):
         dst = out_path
     else:
         root, ext = osp.splitext(pkl_path)
-        dst = f'{root}_c2{ext}'
+        dst = f'{root}_vlmcap{ext}'
     with open(dst, 'wb') as f:
         pickle.dump(data, f)
     print(f'  -> wrote {dst}')
@@ -68,13 +68,13 @@ def merge(pkl_path, json_path, out_path=None, in_place=False):
 
 def main():
     p = argparse.ArgumentParser(
-        description='Merge C2 summary JSON sidecar into a KL c1 pkl.')
+        description='Merge VLM-caption summary JSON sidecar into a KL c1 pkl.')
     p.add_argument('--pkl-path', required=True,
-                   help='The c1 pkl (numpy-1.x written, e.g. *_with_cam_c1.pkl '
+                   help='The geo-facts pkl (numpy-1.x written, e.g. *_with_cam_geo.pkl '
                         'or a subset).')
     p.add_argument('--json-path', required=True, nargs='+',
-                   help='C2 sidecar(s), *_summaries.json. Pass several '
-                        '(or a shell glob) to merge all C2 shards at once.')
+                   help='VLM-caption sidecar(s), *_summaries.json. Pass several '
+                        '(or a shell glob) to merge all VLM-caption shards at once.')
     p.add_argument('--out-path', default=None)
     p.add_argument('--in-place', action='store_true')
     args = p.parse_args()

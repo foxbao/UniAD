@@ -15,6 +15,14 @@
 生成中文场景 summary 作为监督；训练一个挂在 UniAD **LiDAR query** 上的小 LLM（Qwen2.5-0.5B），
 让它**推理时仅凭 LiDAR query** 就能说出图像老师才看得到的语义。推理零图像依赖，不动现有 LiDAR 链路。
 
+## 0.1.1 术语（C1/C2 是历史简称，下文沿用）
+
+- **C1 = 几何事实生成**：脚本 `gen_geo_facts.py`，从 GT 几何算出每帧 `info['geo_facts']`
+  （方位/距离/运动/冲突/作业门控等）。产物 pkl 后缀 `_geo`。
+- **C2 = VLM caption 生成**：脚本 `gen_vlm_caption.py`，VLM 看图 + 读 geo_facts → 中文 summary。
+  产物 JSON sidecar `*_vlmcap_summaries.json`、合并后 pkl 后缀 `_vlmcap`。
+- 早期代号 C1/C2 仍在正文用作简称；文件/字段名已统一为 geo_facts / vlm_caption。
+
 ## 0.2 环境矩阵（关键：两套 env，因 numpy/torch 不兼容必须分开）
 
 | env | torch | numpy | transformers | 用途 |
@@ -67,12 +75,12 @@ python tools/data_converter/add_cam_sync.py \
 ```
 
 **Step 2 — C1 几何事实**（env: uniad_train）
-`gen_c1_facts.py`：从 GT 算每帧 `info['c1_facts']`（per-agent: range/bearing/motion/heading/
+`gen_geo_facts.py`：从 GT 算每帧 `info['geo_facts']`（per-agent: range/bearing/motion/heading/
 load/conflict+ttc/activity_gate；scene: agents_of_interest/ego_advice/congestion/crane_status），
 并 dump 静止时长 / 吊机距离分布（用于定 activity 阈值）。
 ```bash
-python tools/data_converter/gen_c1_facts.py \
-  --pkl-path data/kl_8/kl_infos_val_with_cam.pkl   # 产物: *_with_cam_c1.pkl
+python tools/data_converter/gen_geo_facts.py \
+  --pkl-path data/kl_8/kl_infos_val_with_cam.pkl   # 产物: *_with_cam_geo.pkl
 # 关键参数（已数据校准）: --conflict-dist 4.0 --gate-static-s 2.0 --gate-crane-m 30.0
 ```
 
@@ -81,31 +89,31 @@ python tools/data_converter/gen_c1_facts.py \
 固定 seed 可复现。用于快速迭代 C2 / LLMBridgeHead。
 ```bash
 python tools/data_converter/make_subset.py \
-  --pkl-path data/kl_8/kl_infos_val_with_cam_c1.pkl \
-  --out-path data/kl_8/kl_infos_val_sub1k_c1.pkl --size 1500
+  --pkl-path data/kl_8/kl_infos_val_with_cam_geo.pkl \
+  --out-path data/kl_8/kl_infos_val_sub1k_geo.pkl --size 1500
 ```
 
 **Step 4 — C2 Qwen2.5-VL summary**（env: qwen_vl）
-`gen_c2_summary.py`：读 c1_facts + 渲染中文事实约束文本 + 前视图 → VLM → 一句中文 summary。
+`gen_vlm_caption.py`：读 geo_facts + 渲染中文事实约束文本 + 前视图 → VLM → 一句中文 summary。
 **关键产物是 JSON sidecar**（`*_summaries.json`，token→summary），pkl 输出可丢 /tmp。
 ```bash
-CUDA_VISIBLE_DEVICES=0 python tools/data_converter/gen_c2_summary.py \
-  --pkl-path data/kl_8/kl_infos_val_sub1k_c1.pkl \
+CUDA_VISIBLE_DEVICES=0 python tools/data_converter/gen_vlm_caption.py \
+  --pkl-path data/kl_8/kl_infos_val_sub1k_geo.pkl \
   --model-path /mnt/disk1/models/Qwen2.5-VL-7B-Instruct \
-  --device cuda:0 --out-path /tmp/sub1k_c2.pkl
-# 真正要用的产物: /tmp/sub1k_c2_summaries.json
+  --device cuda:0 --out-path /tmp/sub1k_vlmcap.pkl
+# 真正要用的产物: /tmp/sub1k_vlmcap_summaries.json
 # 速度 ~1.4 帧/s（单卡 4090）；--limit N 抽样；--dry-run 只渲染 prompt 不加载模型
 ```
 
 **Step 5 — summary 合并回训练 pkl**（env: uniad_train）
 `merge_summaries.py`：读 JSON sidecar，按 token 把 summary 写进 pkl 的
-`info['c1_facts']['summary']`，输出训练用 pkl（numpy1.x 写，训练可读）。
+`info['geo_facts']['summary']`，输出训练用 pkl（numpy1.x 写，训练可读）。
 ```bash
 python tools/data_converter/merge_summaries.py \
-  --pkl-path data/kl_8/kl_infos_val_sub1k_c1.pkl \
-  --json-path /tmp/sub1k_c2_summaries.json \
-  --out-path data/kl_8/kl_infos_val_sub1k_c2.pkl
-# 产物: kl_infos_val_sub1k_c2.pkl（1500 帧, 1466 带 summary, uniad_train 可读）
+  --pkl-path data/kl_8/kl_infos_val_sub1k_geo.pkl \
+  --json-path /tmp/sub1k_vlmcap_summaries.json \
+  --out-path data/kl_8/kl_infos_val_sub1k_vlmcap.pkl
+# 产物: kl_infos_val_sub1k_vlmcap.pkl（1500 帧, 1466 带 summary, uniad_train 可读）
 ```
 
 ## 0.5 模型与磁盘
@@ -117,10 +125,10 @@ python tools/data_converter/merge_summaries.py \
 
 ## 0.6 已知问题 / 待办
 
-- **Step 1~5 流水线已全跑通**（val 1500 子集）：产物 `data/kl_8/kl_infos_val_sub1k_c2.pkl`
+- **Step 1~5 流水线已全跑通**（val 1500 子集）：产物 `data/kl_8/kl_infos_val_sub1k_vlmcap.pkl`
   （1466/1500 带 summary，uniad_train 可读）。
 - **C2 全量未跑**：目前只在 val 1500 子集验证；train 43981 帧全量约 18h（可多卡并行）。
-  train 侧需先跑 Step1(add_cam_sync)+Step2(gen_c1_facts) 得到 `kl_infos_train_with_cam_c1.pkl`。
+  train 侧需先跑 Step1(add_cam_sync)+Step2(gen_geo_facts) 得到 `kl_infos_train_with_cam_geo.pkl`。
 - **LLMBridgeHead 未落地**：第 7 步，挂在 `UniADMotionLidar` 上、消费 `outs_motion['track_query']`。
   早期写过骨架已回退（git）；现数据已就绪，可开始重做。
 - **第7步 Step0 兼容性验证已通过（2026-06-21）**：
@@ -132,7 +140,10 @@ python tools/data_converter/merge_summaries.py \
     已用 `pip install --no-deps torch==1.12.1+cu116 torchvision==0.13.1+cu116` 恢复，
     mmcv.ops 验证 OK、训练链路完好。后续装包注意别再动 torch（用 --no-deps 或避开 accelerate 升级）。
 - 文件清单（本方案新增）：
-  `tools/data_converter/{add_cam_sync,gen_c1_facts,make_subset,gen_c2_summary,merge_summaries}.py`、本文档。
+  `tools/data_converter/{add_cam_sync,gen_geo_facts,make_subset,gen_vlm_caption,merge_summaries}.py`、
+  `tools/run_vlm_caption_train_7gpu.sh`（7 卡并行 C2）、
+  `projects/mmdet3d_plugin/uniad/dense_heads/llm_bridge_head.py`、
+  `projects/configs/stage2_e2e_lidar/base_e2e_lidar_occ_llm.py`、本文档。
 
 ---
 
@@ -326,7 +337,7 @@ motion traj_query             ├─► Projector (MLP, 256 → d_llm) ─► [N
    - **已运行**（uniad_train conda 环境，mmcv 1.5.0），保留副本不覆盖原 pkl：
      `data/kl_8/kl_infos_{train,val}_with_cam.pkl`（train 98.58% / val 98.19% 命中）。
      原 pkl 不动，C1/C2/LLM config 显式指向 `_with_cam.pkl`；现有 LiDAR 训练不受影响。
-5. ✅ **C1 几何生成器**：`tools/data_converter/gen_c1_facts.py`（后处理，写 `info['c1_facts']`）。
+5. ✅ **C1 几何生成器**：`tools/data_converter/gen_geo_facts.py`（后处理，写 `info['geo_facts']`）。
    - 已验证 fut_traj 约定（相对自身当前位置的累积位移，LiDAR 帧）；冲突 = agent/ego 未来绝对轨迹最近距离。
    - per-agent：range/bearing(8扇区)/motion/heading/load(粗)/conflict+ttc/activity_gate；
      scene：agents_of_interest/ego_advice/congestion/crane_status。
@@ -336,13 +347,13 @@ motion traj_query             ├─► Projector (MLP, 256 → d_llm) ─► [N
    - conflict=True 0.5%、ego_advice keep94%/yield4.8%/slow1%（合理）。
    - **congestion 修正**：原"30m内≥3 非移动"误把停车场当排队(66%)；
      改为"只数 moving_slow 且 ≥4"，降到 **1.5%**（真·缓行队列）。
-   - 副本：`data/kl_8/kl_infos_{train,val}_with_cam_c1.pkl`（val 已跑；train 待跑）。
-6. ▶ C2：Qwen2.5-VL prompt 设计 + 批量生成 summary（吃 c1_facts 约束 + front 图）。
+   - 副本：`data/kl_8/kl_infos_{train,val}_with_cam_geo.pkl`（val 已跑；train 待跑）。
+6. ▶ C2：Qwen2.5-VL prompt 设计 + 批量生成 summary（吃 geo_facts 约束 + front 图）。
    - **环境**：新建独立 conda env `qwen_vl`（torch 2.6+cu124 / transformers 4.57.6 /
      qwen-vl-utils / torchvision 0.21），与 uniad_train(torch1.12) 隔离；C2 是离线数据生成，不进训练/推理。
    - **模型**：Qwen2.5-VL-7B-Instruct，modelscope 下载到 `/mnt/disk1/models/`
      （⚠️ 系统盘 `/` 仅剩 46G，模型必须放 disk1，勿进 `~/.cache`）。单卡 24G 可跑。
-   - **脚本**：`tools/data_converter/gen_c2_summary.py`（后处理，写 `c1_facts['summary']`）。
+   - **脚本**：`tools/data_converter/gen_vlm_caption.py`（后处理，写 `geo_facts['summary']`）。
      - facts→中文约束文本 + front 图 → VLM；system prompt 严令：几何事实不可改/编造，
        只补图像独有语义（装卸作业、吊机忙闲、满载/空载目视确认），输出一句≤60字中文 summary。
      - 只对 `agents_of_interest` 渲染细节；`activity_gate=True` 才提示"请结合图像确认作业"。
@@ -354,7 +365,7 @@ motion traj_query             ├─► Projector (MLP, 256 → d_llm) ─► [N
      - ✅ C2 脚本去 mmcv 依赖（改 pickle 读写），可在纯净 qwen_vl 环境跑。
      - **子集策略**：`tools/data_converter/make_subset.py` 分层抽样——稀有场景（queue/conflict/
        activity_gate）全保留 + 普通帧补足。val 子集 1500 帧（1123 稀有 + 377 普通），
-       `data/kl_8/kl_infos_val_sub1k_c1.pkl`，先在子集上跑通 LLMBridgeHead 再放大。
+       `data/kl_8/kl_infos_val_sub1k_geo.pkl`，先在子集上跑通 LLMBridgeHead 再放大。
      - ▶ 子集批量生成中（GPU0，~1.5s/帧）。全量 train 43981 帧约 18h（待定，可多卡并行）。
      - ✅ 子集已生成（1500 帧，1468 有 summary / 32 无图跳过，~17.5min）。抽检：
        GATE/QUEUE/normal 质量好（方位+类别+作业状态+转向，mean 22.8 字）；
@@ -379,7 +390,7 @@ motion traj_query             ├─► Projector (MLP, 256 → d_llm) ─► [N
      的，不是父类 KlBEVFormerDataset 那个**）在 current frame 的 frame_meta 加 `gt_caption`；
      `_current_caption` 走整数键 metas_map[max(keys)] 取。`_extract_raw_meta` 带 summary。
    - config `base_e2e_lidar_occ_llm.py`：继承 occ base，加 llm_head + task_loss_weight['llm']=1.0，
-     train/val 指向 `kl_infos_val_sub1k_c2.pkl`，load_from 改 stage-1 ckpt（stage-2 ckpt 不存在）。
+     train/val 指向 `kl_infos_val_sub1k_vlmcap.pkl`，load_from 改 stage-1 ckpt（stage-2 ckpt 不存在）。
    - smoke 通过：caption 正确注入，llm.loss_llm≈5.2~5.7（有限），120 个 loss key（track/motion/
      occ/llm 共存不冲突），backward OK。
 8. ▶ 正式训练：train 全量 C2（被中断在 7.6%，需重跑，~9h）→ 全量训练 + val 评估。

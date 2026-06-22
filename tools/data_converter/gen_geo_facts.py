@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""C1: derive per-frame geometric scene facts from KL pkl (for the LLM teacher).
+"""GEO: derive per-frame geometric scene facts from KL pkl (for the LLM teacher).
 
 See documents/llm_integration_plan.md (3.2). This produces, per LiDAR frame,
 a structured fact dict that (a) seeds the scene-level summary and (b) is fed
@@ -13,7 +13,7 @@ trajectories). fut_traj convention (verified): cumulative displacement from
 each agent's own current position, in the LiDAR frame; agent future absolute
 xy = bbox_xy + fut_traj[t], ego future absolute xy = sdc_fut_traj[t].
 
-Output: writes facts into info['c1_facts'] (incremental, like add_cam_sync),
+Output: writes facts into info['geo_facts'] (incremental, like add_cam_sync),
 and prints distribution summaries.
 """
 
@@ -145,7 +145,7 @@ def _nearest_crane_dist(agent_xy, crane_xys):
 
 
 def _frame_facts(info, cfg, dist_stats):
-    """Build the c1_facts dict for one frame; append to dist_stats lists."""
+    """Build the geo_facts dict for one frame; append to dist_stats lists."""
     instances = info.get('instances', [])
     ego_fut = np.asarray(info.get('gt_sdc_fut_traj', [[]]))
     ego_fut = ego_fut[0] if ego_fut.ndim == 3 else ego_fut
@@ -225,13 +225,13 @@ def _scene_summary(agents, cfg):
     }
 
 
-def gen_c1_to_pkl(pkl_path, out_path=None, in_place=False, cfg=None):
+def gen_geo_to_pkl(pkl_path, out_path=None, in_place=False, cfg=None):
     cfg = cfg or _default_cfg()
     data = mmcv.load(pkl_path)
     infos = _get_infos(data)
     dist_stats = {'static_dur': [], 'crane_dist': []}
     for info in tqdm(infos, desc=osp.basename(pkl_path)):
-        info['c1_facts'] = _frame_facts(info, cfg, dist_stats)
+        info['geo_facts'] = _frame_facts(info, cfg, dist_stats)
     _report_dist(pkl_path, dist_stats, cfg)
     _write(data, pkl_path, out_path, in_place)
     return data
@@ -271,14 +271,14 @@ def _write(data, pkl_path, out_path, in_place):
         dst = out_path
     else:
         root, ext = osp.splitext(pkl_path)
-        dst = f'{root}_c1{ext}'
+        dst = f'{root}_geo{ext}'
     mmcv.dump(data, dst)
     print(f'  -> wrote {dst}')
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Generate C1 geometric scene facts for KL pkl files.')
+        description='Generate geometric scene facts for KL pkl files.')
     parser.add_argument('--pkl-path', nargs='+', required=True)
     parser.add_argument('--out-path', default=None)
     parser.add_argument('--in-place', action='store_true')
@@ -293,7 +293,7 @@ def main():
                gate_static_s=args.gate_static_s,
                gate_crane_m=args.gate_crane_m)
     for pkl_path in args.pkl_path:
-        gen_c1_to_pkl(pkl_path, out_path=args.out_path,
+        gen_geo_to_pkl(pkl_path, out_path=args.out_path,
                       in_place=args.in_place, cfg=cfg)
 
 

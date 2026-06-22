@@ -1,17 +1,17 @@
 #!/usr/bin/env python
-"""C2: Qwen2.5-VL teacher — turn C1 geometric facts + front image into a
+"""VLM caption: Qwen2.5-VL teacher — turn geometric facts + front image into a
 natural Chinese scene summary, written back into the pkl.
 
 See documents/llm_integration_plan.md (3.2). Pipeline per frame:
-  c1_facts (geometry, authoritative) + CAM_FRONT image
+  geo_facts (geometry, authoritative) + CAM_FRONT image
     -> render facts to a Chinese constraint prompt
     -> Qwen2.5-VL: keep the geometry, ADD only image-only semantics
        (loading/unloading activity, crane busy/idle, load state check),
        output ONE fluent Chinese summary sentence
-    -> info['c1_facts']['summary']
+    -> info['geo_facts']['summary']
 
 This is offline data generation: run it in the `qwen_vl` conda env (torch 2.6
-+ transformers 4.57.6), NOT in uniad_train. It only reads images + the C1 pkl
++ transformers 4.57.6), NOT in uniad_train. It only reads images + the geo-facts pkl
 and writes the summary field back; the model is never part of inference.
 
 Runs on a single GPU (7B fits in 24G). Use --device cuda:0 to pin.
@@ -67,7 +67,7 @@ _SYSTEM = (
 
 
 def _render_facts(facts):
-    """C1 facts dict -> Chinese constraint text fed alongside the image."""
+    """geo_facts dict -> Chinese constraint text fed alongside the image."""
     lines = [f'场景共有 {facts.get("n_agents", 0)} 个目标。']
     aoi = set(facts.get('agents_of_interest', []))
     for a in facts.get('agents', []):
@@ -140,7 +140,7 @@ def _resolve_img(info, data_root):
     return p if osp.isabs(p) or osp.exists(p) else osp.join(data_root, p)
 
 
-def gen_c2_to_pkl(pkl_path, model_path, out_path=None, in_place=False,
+def gen_vlm_to_pkl(pkl_path, model_path, out_path=None, in_place=False,
                   data_root='', device='cuda:0', limit=0,
                   max_new_tokens=96, dry_run=False,
                   num_shards=1, shard_id=0):
@@ -162,7 +162,7 @@ def gen_c2_to_pkl(pkl_path, model_path, out_path=None, in_place=False,
     summaries = {}  # token -> summary, numpy-version-safe sidecar
     todo = infos if not limit else infos[:limit]
     for info in tqdm(todo, desc=osp.basename(pkl_path)):
-        facts = info.get('c1_facts')
+        facts = info.get('geo_facts')
         if facts is None:
             n_skip += 1
             continue
@@ -196,7 +196,7 @@ def _write(data, pkl_path, out_path, in_place, summaries,
            num_shards=1, shard_id=0):
     """Write a token->summary JSON sidecar (+ the pkl when not sharding).
 
-    The JSON sidecar is the numpy-version-safe handoff: C2 runs under numpy
+    The JSON sidecar is the numpy-version-safe handoff: VLM caption gen runs under numpy
     2.x (qwen_vl env) but training reads under numpy 1.x (uniad_train), and a
     full pkl re-pickle would re-serialize numpy arrays into the 2.x format
     that 1.x cannot load. The merge step reads only this JSON.
@@ -211,7 +211,7 @@ def _write(data, pkl_path, out_path, in_place, summaries,
         dst = out_path
     else:
         root, ext = osp.splitext(pkl_path)
-        dst = f'{root}_c2{ext}'
+        dst = f'{root}_vlmcap{ext}'
     json_base = osp.splitext(dst)[0] + '_summaries'
     if num_shards > 1:
         json_dst = f'{json_base}.shard{shard_id}of{num_shards}.json'
@@ -230,7 +230,7 @@ def _write(data, pkl_path, out_path, in_place, summaries,
 
 def main():
     parser = argparse.ArgumentParser(
-        description='C2: Qwen2.5-VL scene summaries for KL pkl files.')
+        description='VLM caption: Qwen2.5-VL scene summaries for KL pkl files.')
     parser.add_argument('--pkl-path', nargs='+', required=True)
     parser.add_argument('--model-path',
                         default='/mnt/disk1/models/Qwen2.5-VL-7B-Instruct')
@@ -252,7 +252,7 @@ def main():
     if args.out_path is not None and len(args.pkl_path) != 1:
         raise ValueError('--out-path can only be used with one --pkl-path.')
     for pkl_path in args.pkl_path:
-        gen_c2_to_pkl(
+        gen_vlm_to_pkl(
             pkl_path, args.model_path, out_path=args.out_path,
             in_place=args.in_place, data_root=args.data_root,
             device=args.device, limit=args.limit,

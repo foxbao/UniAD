@@ -1,10 +1,10 @@
 _base_ = ['./base_e2e_lidar_occ.py']
 
 # Stage-2 LiDAR e2e + LLMBridgeHead (cross-modal distillation).
-# Smoke-test config: trains/evaluates on the val 1500-frame C2 subset
-# (kl_infos_val_sub1k_c2.pkl, which carries c1_facts.summary). The goal here
+# Smoke-test config: trains/evaluates on the val 1500-frame VLM-caption subset
+# (kl_infos_val_sub1k_vlmcap.pkl, which carries geo_facts.summary). The goal here
 # is to verify forward + llm.loss_llm decreases without disturbing the other
-# task losses; full-scale training waits for train-set C2 summaries.
+# task losses; full-scale training waits for train-set VLM-caption summaries.
 # See documents/llm_integration_plan.md (step 7).
 
 point_cloud_range = [-64.0, -48.0, -2.0, 64.0, 48.0, 6.0]
@@ -23,8 +23,8 @@ model = dict(
         use_lora=True,
         loss_weight=1.0))
 
-# Point train/val/test at the C2 subset (summaries merged in).
-_sub = 'kl_infos_val_sub1k_c2.pkl'
+# Point train/val/test at the VLM-caption subset (summaries merged in).
+_sub = 'kl_infos_val_sub1k_vlmcap.pkl'
 data = dict(
     train=dict(ann_file=_sub),
     val=dict(ann_file=_sub),

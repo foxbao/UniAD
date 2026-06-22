@@ -1775,10 +1775,10 @@ class KlBEVFormerDataset(KlDataset):
             next=info.get('next', None),
             timestamp=float(info.get('timestamp', 0.0)),
             token=info.get('token', ''),
-            # C2 VLM scene caption (cross-modal distillation target); None if
-            # the frame has no c1_facts/summary. Carried in img_metas so it
+            # VLM scene caption (cross-modal distillation target); None if
+            # the frame has no geo_facts/summary. Carried in img_metas so it
             # reaches the detector without touching the shared Collect3D config.
-            gt_caption=(info.get('c1_facts') or {}).get('summary'))
+            gt_caption=(info.get('geo_facts') or {}).get('summary'))
 
     @staticmethod
     def _dc_data(value):

@@ -1,12 +1,12 @@
 #!/usr/bin/env python
-"""Build a stratified subset of a KL c1 pkl for fast C2/LLM iteration.
+"""Build a stratified subset of a KL geo-facts pkl for fast VLM-caption/LLM iteration.
 
 Rare-but-valuable scenes (queue / conflict / activity-gate) are kept in full;
 ordinary frames are randomly sampled to fill up to --size. This keeps the
 subset small (fast VLM generation + quick LLMBridgeHead smoke tests) while
 guaranteeing the interesting cases are not drowned out.
 
-prev/next tokens are left untouched (C2 generation is per-frame and ignores
+prev/next tokens are left untouched (VLM caption generation is per-frame and ignores
 time order); the subset is therefore NOT meant for temporal track training as
 its prev/next may point outside the subset. See documents/llm_integration_plan.md.
 """
@@ -40,8 +40,8 @@ def make_subset(pkl_path, size, out_path, seed=0):
         data = pickle.load(f)
     infos, key = _infos(data)
 
-    rare = [i for i in infos if _is_rare(i.get('c1_facts'))]
-    ordinary = [i for i in infos if not _is_rare(i.get('c1_facts'))]
+    rare = [i for i in infos if _is_rare(i.get('geo_facts'))]
+    ordinary = [i for i in infos if not _is_rare(i.get('geo_facts'))]
     rng = random.Random(seed)
     rng.shuffle(ordinary)
     n_fill = max(0, size - len(rare))
@@ -63,7 +63,7 @@ def make_subset(pkl_path, size, out_path, seed=0):
 
 
 def main():
-    p = argparse.ArgumentParser(description='Stratified subset of a KL c1 pkl.')
+    p = argparse.ArgumentParser(description='Stratified subset of a KL geo-facts pkl.')
     p.add_argument('--pkl-path', required=True)
     p.add_argument('--out-path', required=True)
     p.add_argument('--size', type=int, default=1000)

@@ -3,7 +3,7 @@
 See documents/llm_integration_plan.md. This head projects UniAD's
 object-centric LiDAR queries (track_query) into the token space of a small
 causal LLM (Qwen2.5-0.5B) and trains it, via a language-modelling loss, to
-reproduce the C2 VLM teacher's Chinese scene summary. At inference it
+reproduce the VLM teacher's Chinese scene summary. At inference it
 generates a caption from LiDAR queries alone -- no image is ever used by the
 model, so this branch does not touch the TensorRT LiDAR inference path.
 
