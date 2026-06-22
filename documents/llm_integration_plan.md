@@ -23,8 +23,11 @@ sidecar `*_vlmcap_summaries.json`、合并后 pkl 后缀 `_vlmcap`）。
 
 | env | torch | numpy | transformers | 用途 |
 |-----|-------|-------|--------------|------|
-| `uniad_train` | 1.12.1+cu116 | 1.22.4 | 无 | 训练主环境；跑 几何事实生成、子集抽样、读写 KL pkl |
+| `uniad_train` | 1.12.1+cu116 | 1.22.4 | 4.46.3 (+peft 0.13.2) | 训练主环境；几何事实生成、子集抽样、读写 KL pkl、**LLMBridgeHead 训练**（Qwen0.5B）|
 | `qwen_vl`（本方案新建） | 2.6.0+cu124 | 2.2.6 | 4.57.6 | 仅跑 VLM caption 的 Qwen2.5-VL 离线推理 |
+
+> uniad_train 的 transformers/peft 是 LLMBridgeHead 训练所需，**后装**（原始环境无）。
+> ⚠️ 装时务必 `--no-deps` 锁 torch，否则 accelerate 会强升 torch→2.4 打断 mmcv.ops（见 4.2）。
 
 ⚠️ **numpy 跨版本陷阱**：qwen_vl(numpy2.x) 直接 pickle 重写 KL pkl 后，uniad_train(numpy1.x)
 会因 `No module named numpy._core` **读不了**。因此 VLM caption 的产物通过 **token→summary 的 JSON sidecar**

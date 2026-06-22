@@ -63,16 +63,26 @@ class LLMBridgeHead(BaseModule):
             self.spatial_pe = nn.Sequential(
                 nn.Linear(3, d_llm), nn.GELU(), nn.Linear(d_llm, d_llm))
 
-        # Lazy: built on first forward so the detector constructs without the
-        # LLM present. _llm stays None until _ensure_llm() runs.
-        self._llm = None
+        # Build the LLM (+LoRA) eagerly here, NOT lazily on first forward.
+        # The training loop builds the optimizer and wraps DDP right after the
+        # model is constructed and before any forward, so a lazily-created LLM
+        # would leave its LoRA params out of the optimizer (never trained) and
+        # unregistered by DDP (no grad sync). Building in __init__ makes the
+        # params visible to both. They live on CPU until the trainer's
+        # model.cuda() moves the whole module.
         self.tokenizer = None
+        self._llm = None
+        self._build_llm()
 
-    def _ensure_llm(self, device):
-        """Lazily load tokenizer + (LoRA-wrapped) causal LM in bf16 on device."""
-        if self._llm is not None:
-            return
-        from transformers import AutoModelForCausalLM, AutoTokenizer
+    def _build_llm(self):
+        """Construct tokenizer + (LoRA-wrapped, bf16) causal LM in __init__."""
+        try:
+            from transformers import AutoModelForCausalLM, AutoTokenizer
+        except ImportError as e:
+            raise ImportError(
+                'LLMBridgeHead needs transformers (and peft for LoRA). In '
+                'uniad_train: pip install transformers==4.46.3 peft==0.13.2 '
+                '(use --no-deps for torch so mmcv.ops stays intact).') from e
         self.tokenizer = AutoTokenizer.from_pretrained(self.llm_name)
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
@@ -87,7 +97,8 @@ class LLMBridgeHead(BaseModule):
             from peft import LoraConfig, get_peft_model
             llm = get_peft_model(
                 llm, LoraConfig(task_type='CAUSAL_LM', **self.lora_cfg))
-        self._llm = llm.to(device)
+        # Register as a submodule so optimizer/DDP/.cuda()/.train() see it.
+        self._llm = llm
 
     @property
     def _llm_dtype(self):
@@ -145,7 +156,6 @@ class LLMBridgeHead(BaseModule):
         agent_query = self._agent_query(outs_motion, outs_track)
         device = (agent_query.device if agent_query is not None
                   else next(self.projector.parameters()).device)
-        self._ensure_llm(device)
 
         target = gt_caption[0] if isinstance(gt_caption, (list, tuple)) \
             else gt_caption
@@ -174,7 +184,6 @@ class LLMBridgeHead(BaseModule):
         agent_query = self._agent_query(outs_motion, outs_track)
         device = (agent_query.device if agent_query is not None
                   else next(self.projector.parameters()).device)
-        self._ensure_llm(device)
 
         prompt_ids, prompt_emb = self._embed_text(self.prompt, device)
         if agent_query is None or agent_query.numel() == 0:
