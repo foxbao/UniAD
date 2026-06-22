@@ -91,7 +91,7 @@ python tools/data_converter/make_subset.py \
 
 **Step 4 — VLM caption 生成**（env: qwen_vl）
 `gen_vlm_caption.py`：读 geo_facts + 渲染中文事实约束文本 + 前视图 → VLM → 一句中文 summary。
-**关键产物是 JSON sidecar**（`*_summaries.json`，token→summary），pkl 输出可丢 /tmp。
+**关键产物是 JSON sidecar**（`<pkl去后缀>_summaries.json`，token→summary），pkl 输出可丢 /tmp。
 ```bash
 CUDA_VISIBLE_DEVICES=0 python tools/data_converter/gen_vlm_caption.py \
   --pkl-path data/kl_8/kl_infos_val_sub1k_geo.pkl \
@@ -99,6 +99,8 @@ CUDA_VISIBLE_DEVICES=0 python tools/data_converter/gen_vlm_caption.py \
   --device cuda:0 --out-path /tmp/sub1k_vlmcap.pkl
 # 真正要用的产物: /tmp/sub1k_vlmcap_summaries.json
 # 速度 ~1.4 帧/s（单卡 4090）；--limit N 抽样；--dry-run 只渲染 prompt 不加载模型
+# train 全量请用 7 卡分片：bash tools/run_vlm_caption_train_7gpu.sh（见第 8 步），
+#   --num-shards N --shard-id i 把数据切 N 份并行，各写 *_summaries.shard{i}ofN.json
 ```
 
 **Step 5 — summary 合并回训练 pkl**（env: uniad_train）
@@ -121,20 +123,16 @@ python tools/data_converter/merge_summaries.py \
 
 ## 0.6 已知问题 / 待办
 
-- **Step 1~5 流水线已全跑通**（val 1500 子集）：产物 `data/kl_8/kl_infos_val_sub1k_vlmcap.pkl`
-  （1466/1500 带 summary，uniad_train 可读）。
-- **VLM caption 全量未跑**：目前只在 val 1500 子集验证；train 43981 帧全量约 18h（可多卡并行）。
-  train 侧需先跑 Step1(add_cam_sync)+Step2(gen_geo_facts) 得到 `kl_infos_train_with_cam_geo.pkl`。
-- **LLMBridgeHead 未落地**：第 7 步，挂在 `UniADMotionLidar` 上、消费 `outs_motion['track_query']`。
-  早期写过骨架已回退（git）；现数据已就绪，可开始重做。
-- **第7步 Step0 兼容性验证已通过（2026-06-21）**：
-  - uniad_train（python3.8 / torch1.12.1+cu116）装 `transformers==4.46.3 peft==0.13.2`
-    可加载并训练 Qwen2.5-0.5B-Instruct（d_model=896，494M）；inputs_embeds 路径
-    forward+LM loss+backward+LoRA 全通过。模型在 `/mnt/disk1/models/Qwen2.5-0.5B-Instruct`。
-  - ⚠️ **必须用 bf16（或 fp32），不能 fp16**：fp16 下 LM loss=nan；bf16 正常（4090 支持）。
-  - ⚠️ **pip 装 transformers 时 accelerate 会强升 torch→2.4，打断 mmcv.ops CUDA 扩展**！
-    已用 `pip install --no-deps torch==1.12.1+cu116 torchvision==0.13.1+cu116` 恢复，
-    mmcv.ops 验证 OK、训练链路完好。后续装包注意别再动 torch（用 --no-deps 或避开 accelerate 升级）。
+- **流水线 Step 1~5 + LLMBridgeHead 已全跑通**（截至 2026-06-22）：
+  - 数据：val 1500 子集 `data/kl_8/kl_infos_val_sub1k_vlmcap.pkl`（1466/1500 带 summary）。
+  - 几何事实：train/val 全量 `kl_infos_{train,val}_with_cam_geo.pkl` 已生成。
+  - 模型：`LLMBridgeHead` + config `base_e2e_lidar_occ_llm.py` smoke test 通过
+    （caption 注入、llm.loss_llm 有限、与 track/motion/occ 共存、backward OK）。详见第 7 步。
+- **正式训练待办**（第 8 步）：
+  - train 全量 VLM caption 未跑完（曾启动后中断）；用 7 卡分片脚本
+    `tools/run_vlm_caption_train_7gpu.sh` 约 1.3h 可完成（单卡约 9h）。
+  - 跑完 merge → `kl_infos_train_vlmcap.pkl` → 改 config 的 train `ann_file` → 正式训练。
+- **评估指标待加**：当前只有 loss，没有 caption 质量指标（BLEU / 关键语义命中率）。
 - 文件清单（本方案新增）：
   `tools/data_converter/{add_cam_sync,gen_geo_facts,make_subset,gen_vlm_caption,merge_summaries}.py`、
   `tools/run_vlm_caption_train_7gpu.sh`（7 卡并行 VLM caption）、
@@ -183,7 +181,8 @@ base_track_lidar  →  base_track_drivable_lidar  →  base_e2e_lidar  →  base
 
 ### 3.0 定调（2026-06-19 讨论确定）
 
-**一句话**：用离线大 VLM 看 6 路环视相机图，生成"图像才看得到的语义"作为监督；
+**一句话**：用离线大 VLM 看相机图（设想 6 路环视，**当前落地先只用 front**），
+生成"图像才看得到的语义"作为监督；
 让挂在 UniAD LiDAR query 上的小 LLM 学会 **只凭 LiDAR 几何推出图像老师才能看到的东西**。
 
 - **推理时纯 LiDAR**，零图像依赖 —— 不破坏现有 LiDAR 链路与 Orin/TensorRT 部署路线。
@@ -327,8 +326,6 @@ motion traj_query             ├─► Projector (MLP, 256 → d_llm) ─► [N
    - 复用 converter 的 `CAM_NAME_MAP` / `make_sync_entry` 约定，写进 `info['sync_info']['cameras']`。
    - 核心匹配逻辑已离线自验：val 5191 帧 98.19% 命中（<50ms），median 35.9ms / p95 46.1ms，
      与 train 抽样一致；缺帧段正确标 `valid=False`。
-   - 实际写 pkl 需在 docker（mmcv）里跑：
-     `python tools/data_converter/add_cam_sync.py --pkl-path <train.pkl> <val.pkl> [--in-place]`
    - 默认 front、容差 0.05s（对齐建库 cfg 的 `camera_max_diff`）；`--views` 可扩环视。
    - **已运行**（uniad_train conda 环境，mmcv 1.5.0），保留副本不覆盖原 pkl：
      `data/kl_8/kl_infos_{train,val}_with_cam.pkl`（train 98.58% / val 98.19% 命中）。
@@ -362,7 +359,8 @@ motion traj_query             ├─► Projector (MLP, 256 → d_llm) ─► [N
      - **子集策略**：`tools/data_converter/make_subset.py` 分层抽样——稀有场景（queue/conflict/
        activity_gate）全保留 + 普通帧补足。val 子集 1500 帧（1123 稀有 + 377 普通），
        `data/kl_8/kl_infos_val_sub1k_geo.pkl`，先在子集上跑通 LLMBridgeHead 再放大。
-     - ▶ 子集批量生成中（GPU0，~1.5s/帧）。全量 train 43981 帧约 18h（待定，可多卡并行）。
+     - ✅ 子集批量生成完成（GPU0，~1.5s/帧）。train 全量改用 7 卡分片（见第 8 步），
+       约 1.3h（单卡约 9h）。
      - ✅ 子集已生成（1500 帧，1468 有 summary / 32 无图跳过，~17.5min）。抽检：
        GATE/QUEUE/normal 质量好（方位+类别+作业状态+转向，mean 22.8 字）；
        **CONFLICT 初版退化成套话"前方有障碍物请减速"**（297 条几乎重复）。
@@ -376,6 +374,14 @@ motion traj_query             ├─► Projector (MLP, 256 → d_llm) ─► [N
      - ✅ numpy 跨版本交接：VLM caption 改为额外导出 `*_summaries.json`（token→summary），
        训练侧只读 JSON 合并，避免 qwen_vl(numpy2.x) 重写 pkl 致 uniad_train(numpy1.x) 读不了。
 7. ✅ `LLMBridgeHead` + config + smoke test（2026-06-22 跑通）。
+   - **训练侧 LLM 依赖（含踩坑，复现必读）**：uniad_train（python3.8 / torch1.12.1+cu116）
+     装 `transformers==4.46.3 peft==0.13.2` 即可加载训练 Qwen2.5-0.5B-Instruct
+     （d_model=896，494M，在 `/mnt/disk1/models/Qwen2.5-0.5B-Instruct`）。
+     - ⚠️ **bf16 强制**：fp16 下 LM loss=nan；用 bf16（4090 支持）或 fp32。
+     - ⚠️ **装包别动 torch**：pip 装 transformers 时 accelerate 会把 torch 强升到 2.4，
+       打断 mmcv.ops CUDA 扩展（训练链路崩）。已用
+       `pip install --no-deps torch==1.12.1+cu116 torchvision==0.13.1+cu116` 恢复。
+       后续装包用 `--no-deps` 或避开 accelerate 升级。
    - 新建 `dense_heads/llm_bridge_head.py`（`LLMBridgeHead`）：projector(256→896)+spatial_pe(3→896)
      + lazy 加载 Qwen2.5-0.5B(bf16,冻结+LoRA) + forward_train(LM loss, prompt/object 段 -100)
      + forward_test(generate)。**关键**：projector/spatial_pe 用自身(fp32) dtype 计算，
@@ -389,6 +395,19 @@ motion traj_query             ├─► Projector (MLP, 256 → d_llm) ─► [N
      train/val 指向 `kl_infos_val_sub1k_vlmcap.pkl`，load_from 改 stage-1 ckpt（stage-2 ckpt 不存在）。
    - smoke 通过：caption 正确注入，llm.loss_llm≈5.2~5.7（有限），120 个 loss key（track/motion/
      occ/llm 共存不冲突），backward OK。
-8. ▶ 正式训练：train 全量 VLM caption（被中断在 7.6%，需重跑，~9h）→ 全量训练 + val 评估。
-   训练命令：`./tools/uniad_dist_train.sh projects/configs/stage2_e2e_lidar/base_e2e_lidar_occ_llm.py <GPUS>`
-   （注意：当前 config 指向 val 子集；正式训练需把 train ann_file 换成 train 全量 c2 pkl）。
+8. ▶ 正式训练（待 train 全量 VLM caption 就绪）。完整命令链：
+   ```bash
+   # (1) 7 卡并行生成 train 全量 caption（~1.3h；占 GPU1-7，留 GPU0）
+   bash tools/run_vlm_caption_train_7gpu.sh
+   # (2) 合并各分片 sidecar 回 train pkl（uniad_train env，几秒）
+   python tools/data_converter/merge_summaries.py \
+     --pkl-path data/kl_8/kl_infos_train_with_cam_geo.pkl \
+     --json-path /tmp/train_vlmcap_summaries.shard*of7.json \
+     --out-path data/kl_8/kl_infos_train_vlmcap.pkl
+   # (3) 改 config base_e2e_lidar_occ_llm.py：train 的 ann_file 指向 kl_infos_train_vlmcap.pkl
+   #     （val 保持 kl_infos_val_sub1k_vlmcap.pkl 做评估）
+   # (4) 正式训练
+   ./tools/uniad_dist_train.sh \
+     projects/configs/stage2_e2e_lidar/base_e2e_lidar_occ_llm.py <GPUS>
+   ```
+   注意：当前 config 的 train/val 都指向 val 子集（smoke 用）；正式训练须先做 (3)。
