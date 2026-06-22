@@ -6,3 +6,4 @@ from .occ_head import OccHead
 from .lidar_drivable_head import LidarDrivableHead, SegDeformableEncoder
 from .planning_head import PlanningHeadSingleMode
 from .bevformer_lidar_head import BEVFormerLidarHead, BEVFormerLidarTrackHead
+from .llm_bridge_head import LLMBridgeHead

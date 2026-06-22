@@ -1774,7 +1774,11 @@ class KlBEVFormerDataset(KlDataset):
             prev=info.get('prev', None),
             next=info.get('next', None),
             timestamp=float(info.get('timestamp', 0.0)),
-            token=info.get('token', ''))
+            token=info.get('token', ''),
+            # C2 VLM scene caption (cross-modal distillation target); None if
+            # the frame has no c1_facts/summary. Carried in img_metas so it
+            # reaches the detector without touching the shared Collect3D config.
+            gt_caption=(info.get('c1_facts') or {}).get('summary'))
 
     @staticmethod
     def _dc_data(value):
@@ -1810,6 +1814,8 @@ class KlBEVFormerDataset(KlDataset):
 
         img_metas = self._dc_data(sample['img_metas'])
         img_metas['queue_metas'] = queue_metas
+        # Current-frame VLM caption (cross-modal distillation target).
+        img_metas['gt_caption'] = raw_meta[-1].get('gt_caption')
         sample['img_metas'] = DC(img_metas, cpu_only=True)
         return sample
 
@@ -2067,6 +2073,12 @@ class KlTrackDataset(KlBEVFormerDataset):
                 frame_meta['time_delta'] = float(meta['timestamp'] -
                                                  prev_timestamp)
             metas_map[idx] = frame_meta
+
+            # Current-frame VLM caption (cross-modal distillation target).
+            # Lives on the last queue frame's meta; the detector reads it via
+            # _current_caption (which indexes metas_map[max(keys)]).
+            if idx == len(queue) - 1:
+                frame_meta['gt_caption'] = meta.get('gt_caption')
 
             l2g_r_mat, l2g_t = self._ego_pose_parts(meta)
             l2g_r_mat_list.append(self._as_tensor(l2g_r_mat))

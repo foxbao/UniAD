@@ -14,6 +14,7 @@ class UniADMotionLidar(UniADTrackLidar):
                  motion_head=None,
                  occ_head=None,
                  planning_head=None,
+                 llm_head=None,
                  task_loss_weight=None,
                  map_lane_encoder=None,
                  **kwargs):
@@ -22,6 +23,7 @@ class UniADMotionLidar(UniADTrackLidar):
         self.occ_head = build_head(occ_head) if occ_head else None
         self.planning_head = (
             build_head(planning_head) if planning_head else None)
+        self.llm_head = build_head(llm_head) if llm_head else None
         self.task_loss_weight = task_loss_weight or dict(
             track=1.0, motion=1.0, occ=1.0, planning=1.0)
 
@@ -66,6 +68,38 @@ class UniADMotionLidar(UniADTrackLidar):
     def with_planning_head(self):
         return (hasattr(self, 'planning_head')
                 and self.planning_head is not None)
+
+    @property
+    def with_llm_head(self):
+        return hasattr(self, 'llm_head') and self.llm_head is not None
+
+    def _current_caption(self, img_metas):
+        """Extract the current-frame VLM caption from img_metas.
+
+        img_metas for this stack is an integer-keyed metas_map
+        ({0:..., N-1:{... 'gt_caption':...}}); the caption sits on the last
+        frame. Mirrors _current_frame_ego2global's unwrapping of the nested
+        list/dict layouts. Returns None when absent.
+        """
+        if img_metas is None:
+            return None
+        while (isinstance(img_metas, (list, tuple)) and len(img_metas) == 1 and
+               isinstance(img_metas[0], (list, tuple))):
+            img_metas = img_metas[0]
+        if isinstance(img_metas, (list, tuple)):
+            meta = img_metas[-1] if img_metas else None
+        else:
+            meta = img_metas
+        if not isinstance(meta, dict):
+            return None
+        if 'gt_caption' in meta:
+            return meta['gt_caption']
+        # integer-keyed metas_map: caption lives on the last frame
+        if meta and all(isinstance(k, int) for k in meta.keys()):
+            last = meta[max(meta.keys())]
+            if isinstance(last, dict):
+                return last.get('gt_caption')
+        return None
 
     @staticmethod
     def _bev_for_motion_head(bev_embed):
@@ -283,6 +317,15 @@ class UniADMotionLidar(UniADTrackLidar):
                 self.loss_weighted_and_prefixed(
                     outs_planning['losses'], prefix='planning'))
 
+        if self.with_llm_head:
+            if not self.with_motion_head:
+                raise RuntimeError('LLMBridgeHead requires MotionHead outputs.')
+            losses_llm = self.llm_head.forward_train(
+                outs_motion, outs_track=outs_track,
+                gt_caption=self._current_caption(img_metas))
+            losses.update(
+                self.loss_weighted_and_prefixed(losses_llm, prefix='llm'))
+
         sanitized_losses = {}
         for key, value in sorted(losses.items()):
             if not torch.isfinite(value).all():
@@ -368,6 +411,14 @@ class UniADMotionLidar(UniADTrackLidar):
                 ),
                 result_planning=result_planning,
             )
+
+        # LLM caption from LiDAR queries (consumes track_bbox_results /
+        # track_query_embeddings, so run before the cleanup below strips them).
+        # NB: if planning is enabled and command is None, the early return above
+        # skips this; planning is off in the LLM smoke-test config.
+        if self.with_llm_head:
+            results[0]['llm_caption'] = self.llm_head.forward_test(
+                outs_motion, outs_track=result)
 
         for key in ('bev_embed', 'bev_pos', 'track_query_embeddings',
                     'track_query_matched_idxes', 'track_bbox_results'):

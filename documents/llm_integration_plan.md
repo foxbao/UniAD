@@ -123,6 +123,14 @@ python tools/data_converter/merge_summaries.py \
   train 侧需先跑 Step1(add_cam_sync)+Step2(gen_c1_facts) 得到 `kl_infos_train_with_cam_c1.pkl`。
 - **LLMBridgeHead 未落地**：第 7 步，挂在 `UniADMotionLidar` 上、消费 `outs_motion['track_query']`。
   早期写过骨架已回退（git）；现数据已就绪，可开始重做。
+- **第7步 Step0 兼容性验证已通过（2026-06-21）**：
+  - uniad_train（python3.8 / torch1.12.1+cu116）装 `transformers==4.46.3 peft==0.13.2`
+    可加载并训练 Qwen2.5-0.5B-Instruct（d_model=896，494M）；inputs_embeds 路径
+    forward+LM loss+backward+LoRA 全通过。模型在 `/mnt/disk1/models/Qwen2.5-0.5B-Instruct`。
+  - ⚠️ **必须用 bf16（或 fp32），不能 fp16**：fp16 下 LM loss=nan；bf16 正常（4090 支持）。
+  - ⚠️ **pip 装 transformers 时 accelerate 会强升 torch→2.4，打断 mmcv.ops CUDA 扩展**！
+    已用 `pip install --no-deps torch==1.12.1+cu116 torchvision==0.13.1+cu116` 恢复，
+    mmcv.ops 验证 OK、训练链路完好。后续装包注意别再动 torch（用 --no-deps 或避开 accelerate 升级）。
 - 文件清单（本方案新增）：
   `tools/data_converter/{add_cam_sync,gen_c1_facts,make_subset,gen_c2_summary,merge_summaries}.py`、本文档。
 
@@ -360,4 +368,20 @@ motion traj_query             ├─► Projector (MLP, 256 → d_llm) ─► [N
        效果：conflict 帧 5.8%→1.6%，冲突目标变为行人(70)/空载IGV(26) 等真·动态目标，锥桶清零。
      - ✅ numpy 跨版本交接：C2 改为额外导出 `*_summaries.json`（token→summary），
        训练侧只读 JSON 合并，避免 qwen_vl(numpy2.x) 重写 pkl 致 uniad_train(numpy1.x) 读不了。
-7. ▶ `LLMBridgeHead` + config，小规模跑通前向 + loss（子集 summary 就绪后开始）。
+7. ✅ `LLMBridgeHead` + config + smoke test（2026-06-22 跑通）。
+   - 新建 `dense_heads/llm_bridge_head.py`（`LLMBridgeHead`）：projector(256→896)+spatial_pe(3→896)
+     + lazy 加载 Qwen2.5-0.5B(bf16,冻结+LoRA) + forward_train(LM loss, prompt/object 段 -100)
+     + forward_test(generate)。**关键**：projector/spatial_pe 用自身(fp32) dtype 计算，
+     输出再 cast 到 bf16 喂 LLM（否则 Linear dtype 不匹配报错）。
+   - detector `uniad_motion_lidar.py`：加 `llm_head`/`with_llm_head`/`_current_caption`；
+     forward_train 末尾接 llm loss(prefix='llm')；simple_test 接 forward_test 存 llm_caption。
+   - **caption 注入**：`kl_dataset.py` 的 `KlTrackDataset._union2one`（line ~1963，**注意是子类
+     的，不是父类 KlBEVFormerDataset 那个**）在 current frame 的 frame_meta 加 `gt_caption`；
+     `_current_caption` 走整数键 metas_map[max(keys)] 取。`_extract_raw_meta` 带 summary。
+   - config `base_e2e_lidar_occ_llm.py`：继承 occ base，加 llm_head + task_loss_weight['llm']=1.0，
+     train/val 指向 `kl_infos_val_sub1k_c2.pkl`，load_from 改 stage-1 ckpt（stage-2 ckpt 不存在）。
+   - smoke 通过：caption 正确注入，llm.loss_llm≈5.2~5.7（有限），120 个 loss key（track/motion/
+     occ/llm 共存不冲突），backward OK。
+8. ▶ 正式训练：train 全量 C2（被中断在 7.6%，需重跑，~9h）→ 全量训练 + val 评估。
+   训练命令：`./tools/uniad_dist_train.sh projects/configs/stage2_e2e_lidar/base_e2e_lidar_occ_llm.py <GPUS>`
+   （注意：当前 config 指向 val 子集；正式训练需把 train ann_file 换成 train 全量 c2 pkl）。
