@@ -327,6 +327,18 @@ motion traj_query             ├─► Projector (MLP, 256 → d_llm) ─► [N
   `track_bbox_results`/`track_query_embeddings` 的 cleanup **之前** 调用）。
 - config：新建 `base_e2e_lidar_occ_llm.py` 继承 `base_e2e_lidar_occ`，加 `llm_head` 与
   `task_loss_weight['llm']`；pipeline Collect 增加 `gt_caption`。
+  - **为什么继承 `base_e2e_lidar_occ`**：这是继承链
+    `base_track_lidar`(track) → `base_track_drivable_lidar`(+map seg) → `base_e2e_lidar`(+motion，
+    冻结 BEV) → `base_e2e_lidar_occ`(+occ) 的**顶端、感知最全的基线**。LLMBridgeHead 吃
+    `outs_motion['track_query']` + box center，监督信号 `geo_facts` 来自多 agent 轨迹+占据语义，
+    所以要站在 track+map+motion+occ 都齐全的模型上 query 才有料；继承更低层会缺 motion/occ、
+    head 直接拿不到输入。继承它还自动复用 stage2 的冻结策略（`freeze_lidar_backbone/bev_encoder`）。
+    注：occ config 未启用 planning，故 LLM 站在 track+map+motion+occ 之上、不含 plan。
+  - **感知底座 ckpt**：正式 config `_train` 的 `load_from` 指向
+    `base_e2e_lidar_occ/latest.pth`(=epoch_4)——已训练收敛的端到端权重（occ.loss_dice 0.99→0.14、
+    motion.loss_traj 0.55→0.44，5 epoch）。该 ckpt 用旧 `kl_infos_train.pkl`(单front)训，但只提供
+    点云感知主干（与相机/caption/gate 无关），LLM 训练时全部冻结，故配新 caption pkl 自洽。
+    （smoke config 用 stage-1 drivable ckpt 仅为快速验证 llm forward/loss。）
 - 数据：图像同步脚本（补相机路径）+ 几何模板生成 + VLM caption 生成，产出每帧 caption，存入 pkl/sidecar。
 
 ### 3.4 训练策略
@@ -364,7 +376,9 @@ motion traj_query             ├─► Projector (MLP, 256 → d_llm) ─► [N
 8. ✅ train 全量 caption（2026-06-22）：7 卡分片 ~2.2h（错开启动避 OOM，见 4.2）→ merge →
    `kl_infos_train_vlmcap.pkl`（43747/43981=99.5% 带 summary）。正式 config
    `base_e2e_lidar_occ_llm_train.py` 已建并验证（train→该 pkl，val/test→v3 子集）。
-   **下一步：跑正式训练**（4.3-A (3)）。
+   **单卡 smoke 验证通过**（2026-06-22）：occ ckpt 正确加载（occ.loss_dice 一上来即 0.14 收敛值）、
+   `llm.loss_llm` 有限且下降（2.73→1.70）、track/map/motion/occ/llm 全 task 共存、forward+backward
+   无报错。**下一步：手动起多卡正式训练**（4.3-A (4)）。
 
 ### 4.2 经验教训（踩过的坑，复现必读）
 
