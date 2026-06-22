@@ -135,24 +135,29 @@ python tools/data_converter/merge_summaries.py \
 ## 0.6 已知问题 / 待办
 
 - **流水线 Step 1~5 + LLMBridgeHead 已全跑通**（截至 2026-06-22）：
-  - 数据：6 路环视 val 子集 `data/kl_8/kl_infos_val_sub6cam_vlmcap.pkl`（911 帧, 903 带 summary；
-    全为稀有帧，conflict/gate 密集）。旧单 front 子集 `kl_infos_val_sub1k_vlmcap.pkl` 仅作历史对比。
-  - 几何事实：**train/val 全量均已是 6 路** `kl_infos_{train,val}_with_cam_geo.pkl`
-    （train 43981 帧，6 路各 valid 98.45%~98.61%，gate 帧 18.3%；2026-06-22 已重做完）。
+  - 数据：6 路环视 val 子集 **v3** `data/kl_8/kl_infos_val_sub6cam_v3_vlmcap.pkl`（805 帧, 797 带 summary；
+    全为稀有帧，gate 已排除非作业类）。v1/v2 子集与旧单 front `kl_infos_val_sub1k_vlmcap.pkl` 仅作历史对比。
+  - 几何事实：**train/val 全量均已是 6 路 + gate 清理** `kl_infos_{train,val}_with_cam_geo.pkl`
+    （train 43981 帧，6 路各 valid 98.45%~98.61%；2026-06-22 重做并排除非作业类 gate）。
+  - **train 全量 caption 已完成**：7 卡分片跑 ~2.2h → merge → `kl_infos_train_vlmcap.pkl`
+    （43747/43981=99.5% 带 summary）。
   - 模型：`LLMBridgeHead` + config `base_e2e_lidar_occ_llm.py` smoke test 通过
     （caption 注入、llm.loss_llm 有限、与 track/motion/occ 共存、backward OK）。详见第 7 步。
   - 评估：`eval_llm_caption.py` template/teacher 可跑；activity 拆为 addressed/busy（见 4.3-B）。
     6 路 + gate 入 prompt + 排除非作业类后 teacher activity_addressed **74.5%**（单 front 17.0%）。
 - **正式训练待办**（第 8 步）：
-  - (0) ✅ train pkl 已重做 6 相机（2026-06-22）。
-  - (1) 7 卡分片 caption `tools/run_vlm_caption_train_7gpu.sh` 约 1.3h（单卡约 9h）。
-  - (2) merge → `kl_infos_train_vlmcap.pkl` → 改 config 的 train `ann_file` → 正式训练。详见 4.3-A。
+  - (0) ✅ train pkl 已重做 6 相机 + gate 清理（2026-06-22）。
+  - (1) ✅ 7 卡分片 caption 已完成（~2.2h，43747 帧带 summary）。
+  - (2) ✅ merge → `kl_infos_train_vlmcap.pkl`；正式 config `base_e2e_lidar_occ_llm_train.py`
+    （train→该 pkl，val/test→v3 子集）已建并验证。
+  - (3) ⏳ **待跑正式训练**：`uniad_dist_train.sh base_e2e_lidar_occ_llm_train.py <GPUS>`。详见 4.3-A。
 - 文件清单（本方案新增）：
   `tools/data_converter/{add_cam_sync,gen_geo_facts,make_subset,gen_vlm_caption,merge_summaries}.py`、
   `tools/run_vlm_caption_train_7gpu.sh`（7 卡并行 VLM caption）、
   `tools/analysis_tools/eval_llm_caption.py`（caption 质量评测）、
   `projects/mmdet3d_plugin/uniad/dense_heads/llm_bridge_head.py`、
-  `projects/configs/stage2_e2e_lidar/base_e2e_lidar_occ_llm.py`、本文档。
+  `projects/configs/stage2_e2e_lidar/base_e2e_lidar_occ_llm.py`（smoke）、
+  `projects/configs/stage2_e2e_lidar/base_e2e_lidar_occ_llm_train.py`（正式训练）、本文档。
 
 ---
 
@@ -356,6 +361,10 @@ motion traj_query             ├─► Projector (MLP, 256 → d_llm) ─► [N
    llm.loss_llm 有限（≈5.2~5.7）、与 track/motion/occ 共存、backward OK。
    实现细节见 3.1 / 3.3；代码 `llm_bridge_head.py`、`uniad_motion_lidar.py`、
    `kl_dataset.py`、config `base_e2e_lidar_occ_llm.py`。
+8. ✅ train 全量 caption（2026-06-22）：7 卡分片 ~2.2h（错开启动避 OOM，见 4.2）→ merge →
+   `kl_infos_train_vlmcap.pkl`（43747/43981=99.5% 带 summary）。正式 config
+   `base_e2e_lidar_occ_llm_train.py` 已建并验证（train→该 pkl，val/test→v3 子集）。
+   **下一步：跑正式训练**（4.3-A (3)）。
 
 ### 4.2 经验教训（踩过的坑，复现必读）
 
@@ -375,14 +384,18 @@ motion traj_query             ├─► Projector (MLP, 256 → d_llm) ─► [N
   目标(方位+类别)+TTC+建议、禁用"障碍物"泛称、加 few-shot 后具体化。
 - **activity 门控数据化**：dump 分布后定 `static≥2s & crane≤30m`（通过率 3.0%，宽松预筛，
   VLM 看图终判），不写死阈值。
+- **7 卡 caption 同时启动 OOM**：7 个进程零间隔 fork、各自瞬间加载 16G 模型，分配器峰值碰撞
+  导致全部 OOM（`CUDA_VISIBLE_DEVICES` 隔离本身没问题——单跑/错开跑都正常）。修法：分片间
+  `sleep` 错开启动 + `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`；脚本加每分片启动自检
+  （崩了立即报错中止）+ 前台 `tail -f` 实时观察。见 `run_vlm_caption_train_7gpu.sh`。
 
 ### 4.3 下一步（待办）
 
-**A. 正式训练**（待 train 全量 VLM caption 就绪）。完整命令链：
+**A. 正式训练**。(0)(1)(2) 均已于 2026-06-22 完成，命令留作复现记录；当前只剩 (4) 跑训练。
    ```bash
-   # (0) ✅ 已完成（2026-06-22）：train pkl 重做成 6 相机。下面两条命令是当时所跑（留作记录）。
+   # (0) ✅ 已完成：train pkl 重做成 6 相机 + gate 排除非作业类。下面两条是当时所跑（留作记录）。
    #     ⚠️ add_cam_sync 的 --views 默认只有 front，6 路必须显式传全部 6 个磁盘视角名。
-   #     若日后从头复现需重跑；当前 kl_infos_train_with_cam_geo.pkl 已是 6 路，可跳过直接到 (1)。
+   #     当前 kl_infos_train_with_cam_geo.pkl 已是 6 路+gate清理，可跳过直接到 (4)。
    python tools/data_converter/add_cam_sync.py \
      --pkl-path data/kl_8/kl_infos_train.pkl \
      --out-path data/kl_8/kl_infos_train_with_cam.pkl \
@@ -391,22 +404,22 @@ motion traj_query             ├─► Projector (MLP, 256 → d_llm) ─► [N
      --pkl-path data/kl_8/kl_infos_train_with_cam.pkl \
      --conflict-dist 4.0 --gate-static-s 2.0 --gate-crane-m 30.0
    #     -> data/kl_8/kl_infos_train_with_cam_geo.pkl（含 6 路 + geo_facts）
-   #     （val 已是 6 路，勿覆盖；这两步纯 CPU/numpy1.x，不占 GPU）
-   # (1) 7 卡并行生成 train 全量 caption（~1.3h；占 GPU1-7，留 GPU0）
-   #     脚本无需 --views：相机按目标方位自动路由（_resolve_views 读 sync_info.cameras）。
+   # (1) ✅ 已完成：7 卡并行 train 全量 caption（~2.2h；占 GPU1-7，留 GPU0）。
+   #     脚本错开启动避 OOM（见 4.2），无需 --views（相机自动路由）。
    bash tools/run_vlm_caption_train_7gpu.sh
-   # (2) 合并各分片 sidecar 回 train pkl（uniad_train env，几秒）
+   # (2) ✅ 已完成：合并 7 片 sidecar 回 train pkl（43747/43981=99.5% 带 summary）。
    python tools/data_converter/merge_summaries.py \
      --pkl-path data/kl_8/kl_infos_train_with_cam_geo.pkl \
      --json-path /tmp/train_vlmcap_summaries.shard*of7.json \
      --out-path data/kl_8/kl_infos_train_vlmcap.pkl
-   # (3) 用正式 config `base_e2e_lidar_occ_llm_train.py`（train→kl_infos_train_vlmcap.pkl，
-   #     val/test→kl_infos_val_sub6cam_vlmcap.pkl）；不改 smoke config base_e2e_lidar_occ_llm.py。
-   # (4) 正式训练
+   # (3) ✅ 正式 config base_e2e_lidar_occ_llm_train.py 已建并验证
+   #     （train→kl_infos_train_vlmcap.pkl, val/test→kl_infos_val_sub6cam_v3_vlmcap.pkl）。
+   #     smoke config base_e2e_lidar_occ_llm.py 不动。
+   # (4) ⏳ 待跑：正式训练
    ./tools/uniad_dist_train.sh \
      projects/configs/stage2_e2e_lidar/base_e2e_lidar_occ_llm_train.py <GPUS>
    ```
-   注意：(0) 已完成；正式训练用 `_train` config（见 (3)），smoke config 保持只指向 val 子集不动。
+   注意：(0)~(3) 已完成，只剩 (4)。正式训练用 `_train` config，smoke config 保持只指向 val 子集不动。
 
 **B. 评估指标**（已落地 `tools/analysis_tools/eval_llm_caption.py`）：
    规则解析 caption → 关键语义命中率（conflict 类别/方位、TTC 桶、ego_advice、activity、幻觉），

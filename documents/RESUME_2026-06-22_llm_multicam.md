@@ -59,13 +59,19 @@ pkl后缀: _with_cam -> _geo -> _vlmcap. 字段名 geo_facts.
 - **gate误标锥桶(已修)**: activity_gate对静止近吊机的任意目标触发,含锥桶/行人/小车(val子集941个误标).
   加_NO_ACTIVITY_IDS={0,1,9}排除. gate目标2481->1540. commit dcc88f6.
 
-## 正在做: 锥桶排除后重生成数据 + v3验证
-- gen_geo_facts重算 train+val _with_cam_geo.pkl (gate已排除锥桶等, 19:09完成).
-- 重抽val子集 kl_infos_val_sub6cam_geo.pkl (稀有帧911->805).
-- v3 caption跑中(GPU0, ~16min) -> 待merge+eval确认 activity_addressed 保持高位+gate更干净.
+## 锥桶排除后重生成数据 + v3验证 (已完成)
+- gen_geo_facts重算 train+val _with_cam_geo.pkl (gate已排除锥桶等).
+- 重抽val子集 (稀有帧911->805). v3 caption + eval: **activity_addressed 74.5%** (v2 69.4%, 单front 17%),
+  advice 80->84.8 (清掉"向锥桶让行"误导帧), conflict/ttc/halluc不变. 产物 kl_infos_val_sub6cam_v3_vlmcap.pkl.
 
-## 待办: 正式训练 (4.3-A)
-✅ train pkl 已是6路+gate已清理(kl_infos_train_with_cam_geo.pkl). 直接跑:
-  7卡caption(run_vlm_caption_train_7gpu.sh, 无需--views自动路由) -> merge -> kl_infos_train_vlmcap.pkl
-  -> 用 base_e2e_lidar_occ_llm_train.py -> uniad_dist_train.sh
+## train全量caption (已完成)
+- 7卡分片 run_vlm_caption_train_7gpu.sh ~2.2h. 先遇OOM(7进程同时load 16G模型,分配器碰撞);
+  修法=错开sleep启动+expandable_segments+每分片自检+前台tail. commit 8641695/b72acd3.
+- 7片sidecar -> merge -> kl_infos_train_vlmcap.pkl (43747/43981=99.5%带summary).
+- config base_e2e_lidar_occ_llm_train.py: train->该pkl, val/test->v3子集. 已验证三个pkl+load_from都存在. commit a249cc4.
+
+## 待办: 只剩跑正式训练
+./tools/uniad_dist_train.sh projects/configs/stage2_e2e_lidar/base_e2e_lidar_occ_llm_train.py <GPUS>
+(前台DDP,实时打印loss). 跑出ckpt后可补 eval_llm_caption.py --mode model/shuffle (forward_test逐帧,当前NotImplementedError).
+
 
