@@ -142,7 +142,7 @@ python tools/data_converter/merge_summaries.py \
   - 模型：`LLMBridgeHead` + config `base_e2e_lidar_occ_llm.py` smoke test 通过
     （caption 注入、llm.loss_llm 有限、与 track/motion/occ 共存、backward OK）。详见第 7 步。
   - 评估：`eval_llm_caption.py` template/teacher 可跑；activity 拆为 addressed/busy（见 4.3-B）。
-    6 路 teacher activity_addressed 37.3%（单 front 17.0%）。
+    6 路 + gate 入 prompt 后 teacher activity_addressed **69.4%**（单 front 17.0%、6路只AOI入prompt 37.3%）。
 - **正式训练待办**（第 8 步）：
   - (0) ✅ train pkl 已重做 6 相机（2026-06-22）。
   - (1) 7 卡分片 caption `tools/run_vlm_caption_train_7gpu.sh` 约 1.3h（单卡约 9h）。
@@ -350,7 +350,7 @@ motion traj_query             ├─► Projector (MLP, 256 → d_llm) ─► [N
 5. ✅ 几何事实生成：`gen_geo_facts.py` → `..._with_cam_geo.pkl`（train/val 全量）。
    阈值数据化校准（见 0.4 Step 2 与 4.2 经验）。前视 gate 收紧的弯路已回退（见 4.3-B）。
 6. ✅ VLM caption 多相机化：`gen_vlm_caption.py`，prompt 设计 + 按方位路由 2-4 路环视 +
-   6 路 val 子集批量生成（911 帧，903 带 summary）。teacher activity_addressed 17%→37%。
+   6 路 val 子集批量生成（911 帧，903 带 summary）。teacher activity_addressed 17%→69%（gate 入 prompt 后）。
    见 0.4 Step 4 与 4.3-B。
 7. ✅ `LLMBridgeHead` + config + smoke test（2026-06-22）：caption 注入正确、
    llm.loss_llm 有限（≈5.2~5.7）、与 track/motion/occ 共存、backward OK。
@@ -431,11 +431,22 @@ motion traj_query             ├─► Projector (MLP, 256 → d_llm) ─► [N
    - ✅ **同帧严格对比（已核实）**：6cam 子集(911)与旧单front 子集(1500)的 gated 帧
      **交集=777、各自独有=0**（两次 make_subset 同 seed，稀有帧确定性全保留），
      即 17.0%→37.3% 是同一批 777 帧上的对比，非近似。6cam(911) 整体亦是 front(1500) 的子集。
+   - ⚠️ **路由/渲染/评测口径不一致（已修，2026-06-22）**：`_resolve_views` 按**全部 gate 目标**
+     方位选相机，但 `_render_facts` 原本**只渲染 AOI 目标**，导致非 AOI 的 gate 目标"取了图却没在
+     prompt 点名"，VLM 没被要求判它，却被 eval 计入 activity 分母。量化：777 gated 帧里仅 395 帧
+     gate 目标进 prompt，addressed 全分母 37.3% vs 仅 prompted-gate 57.7%——37.3% 被"没让它判"的帧
+     稀释。**修法**：`_render_facts` 渲染 AOI∪conflict∪gate（与 `_resolve_views` 同集），gate 目标
+     100% 进 prompt（395→777）。**重跑子集 caption 后 activity_addressed 37.3%→69.4%**（n=777），
+     即近 7 成 gated 帧 VLM 做了三态判断；`activity_busy` 38%(n=290)→20%(n=539)，分母涨是因新纳入
+     大量"等待/空闲"判断（后方远处吊机），是更全面的分布。conflict/ttc/halluc 不变（只改 activity 渲染）。
+     注：6cam vs front 对比同口径仍成立，此修只抬高 teacher 绝对值（单front 17%→6cam+gate入prompt 69%）。
    - `shuffle` 对照（query 配错帧）是证伪试金石：若打乱后命中不掉 = LLM 没真用 LiDAR query。
 
 **C. 优先改进**：
-   - **(高) 提升 VLM activity 召回** — ✅ 已根治：6 路环视 + 评测指标修正，activity_addressed
-     17%→37%（见 B）。下一步跑 train 全量（需先把 train pkl 重做成 6 相机，见 4.3-A）。
+   - **(高) 提升 VLM activity 召回** — ✅ 已根治：6 路环视 + 评测指标修正 + gate 目标入 prompt，
+     activity_addressed 17%→69%（见 B）。train pkl 已是 6 路，可直接跑全量。
+   - **(中) gate 误标锥桶**：activity_gate 只看 static+near-crane，会把锥桶(cls=9)等静态路标也标
+     "请判断作业状态"。应在 gate 逻辑排除非作业类（参照 conflict 的 `_NO_CONFLICT_IDS`）。训练前可做。
    - (中) 显式特征入 head：当前只喂 track_query+box center；可拼 class logits / bbox 尺寸/yaw /
      velocity / conflict-advice 结构特征，提升可控性（评注第 2 条，训练后迭代）。
    - (低) 多卡 DDP 全量完整验证（smoke 只跑 3 iter）。

@@ -79,12 +79,25 @@ _SYSTEM = (
 
 
 def _render_facts(facts):
-    """geo_facts dict -> Chinese constraint text fed alongside the image."""
+    """geo_facts dict -> Chinese constraint text fed alongside the image.
+
+    Renders agents that are AOI OR conflict OR activity_gate -- the SAME set
+    _resolve_views routes a camera for. Earlier this rendered AOI-only, so a
+    gate target outside AOI got a camera routed (the VLM was shown the image)
+    but was never named in the prompt -> the VLM was never asked to judge it.
+    That mismatch deflated the activity metric. AOI agents are listed first
+    (most ego-relevant), then any gate/conflict-only agents.
+    """
     lines = [f'场景共有 {facts.get("n_agents", 0)} 个目标。']
     aoi = set(facts.get('agents_of_interest', []))
-    for a in facts.get('agents', []):
-        if a['id'] not in aoi:
-            continue
+
+    def _relevant(a):
+        return a['id'] in aoi or a.get('conflict') or a.get('activity_gate')
+
+    agents = [a for a in facts.get('agents', []) if _relevant(a)]
+    # AOI first, then conflict/gate-only; stable within each group.
+    agents.sort(key=lambda a: a['id'] not in aoi)
+    for a in agents:
         load_pfx = '' if a['cls'] in _LOAD_IN_NAME else _LOAD_ZH.get(a['load'], '')
         bearing = _BEARING_ZH.get(a['bearing'], a['bearing'])
         seg = [f'{bearing}方 {a["range"]}米处一台{load_pfx}'
