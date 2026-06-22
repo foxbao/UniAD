@@ -11,9 +11,11 @@
 
 ## 0.1 一句话目标
 
-跨模态蒸馏：用离线大 VLM（Qwen2.5-VL-7B）看**前视相机图**，结合 LiDAR 几何事实，
-生成中文场景 summary 作为监督；训练一个挂在 UniAD **LiDAR query** 上的小 LLM（Qwen2.5-0.5B），
-让它**推理时仅凭 LiDAR query** 就能说出图像老师才看得到的语义。推理零图像依赖，不动现有 LiDAR 链路。
+跨模态蒸馏：用离线大 VLM（Qwen2.5-VL-7B）看**环视相机图（6 路，按目标方位自动路由 2-4 路）**，
+结合 LiDAR 几何事实，生成中文场景 summary 作为监督；训练一个挂在 UniAD **LiDAR query** 上的小
+LLM（Qwen2.5-0.5B），让它**推理时仅凭 LiDAR query** 就能说出图像老师才看得到的语义。推理零图像依赖，
+不动现有 LiDAR 链路。（注：早期落地先只用 front，后因后方/侧方作业目标看不见导致 activity 召回偏低，
+已改为 6 路环视，见 4.3-B。）
 
 数据流两步走：**几何事实生成**（`gen_geo_facts.py`，从 GT 算出 `info['geo_facts']`，产物 pkl 后缀 `_geo`）
 → **VLM caption 生成**（`gen_vlm_caption.py`，VLM 看图 + 读 geo_facts 出中文 summary，
@@ -65,12 +67,16 @@ pip install "transformers==4.57.6" accelerate qwen-vl-utils modelscope pillow
 
 **Step 1 — 图像↔LiDAR 同步**（env: uniad_train）
 `add_cam_sync.py`：按 `scene_token` 定位相机目录，对每个 LiDAR 帧做时间戳最近邻匹配，
-写 `info['sync_info']['cameras']['CAM_FRONT']`（含 path/dt/valid）。容差 50ms（对齐建库 cfg）。
+写 `info['sync_info']['cameras'][<CAM_*>]`（含 path/dt/valid）。容差 50ms（对齐建库 cfg）。
+⚠️ `--views` **默认只有 front**；6 路环视必须显式传全部 6 个磁盘视角名。
 ```bash
 python tools/data_converter/add_cam_sync.py \
-  --pkl-path data/kl_8/kl_infos_train.pkl data/kl_8/kl_infos_val.pkl
+  --pkl-path data/kl_8/kl_infos_train.pkl data/kl_8/kl_infos_val.pkl \
+  --views front left_front left_rear rear right_front right_rear
+# 磁盘视角名 -> CAM_*: front=CAM_FRONT, left_front=CAM_FRONT_LEFT, left_rear=CAM_BACK_LEFT,
+#   rear=CAM_BACK, right_front=CAM_FRONT_RIGHT, right_rear=CAM_BACK_RIGHT
 # 产物（保留副本，不覆盖原 pkl）: data/kl_8/kl_infos_{train,val}_with_cam.pkl
-# 命中率: train 98.58% / val 98.19%（<50ms）; 缺帧标 valid=False
+# 命中率(front): train 98.58% / val 98.19%（<50ms）; 缺帧标 valid=False
 ```
 
 **Step 2 — 几何事实生成**（env: uniad_train）
@@ -93,15 +99,17 @@ python tools/data_converter/make_subset.py \
 ```
 
 **Step 4 — VLM caption 生成**（env: qwen_vl）
-`gen_vlm_caption.py`：读 geo_facts + 渲染中文事实约束文本 + 前视图 → VLM → 一句中文 summary。
+`gen_vlm_caption.py`：读 geo_facts + 渲染中文事实约束文本 + **按目标方位自动路由的 2-4 路环视图**
+（`_resolve_views` 按帧内 AOI/conflict/gate 目标方位选相机，每图标【方位相机】）→ VLM → 一句中文 summary。
 **关键产物是 JSON sidecar**（`<pkl去后缀>_summaries.json`，token→summary），pkl 输出可丢 /tmp。
 ```bash
 CUDA_VISIBLE_DEVICES=0 python tools/data_converter/gen_vlm_caption.py \
-  --pkl-path data/kl_8/kl_infos_val_sub1k_geo.pkl \
+  --pkl-path data/kl_8/kl_infos_val_sub6cam_geo.pkl \
   --model-path /mnt/disk1/models/Qwen2.5-VL-7B-Instruct \
-  --device cuda:0 --out-path /tmp/sub1k_vlmcap.pkl
-# 真正要用的产物: /tmp/sub1k_vlmcap_summaries.json
-# 速度 ~1.4 帧/s（单卡 4090）；--limit N 抽样；--dry-run 只渲染 prompt 不加载模型
+  --device cuda:0 --out-path /tmp/val_sub6cam_vlmcap.pkl
+# 真正要用的产物: /tmp/val_sub6cam_vlmcap_summaries.json
+# 速度 ~1.4-1.8 帧/s（单卡 4090，多相机约 3.4 路/帧）；--limit N 抽样；--dry-run 只渲染 prompt 不加载模型
+# 输入 pkl 须已含 6 路 sync_info（add_cam_sync 用 6 路 --views 生成）；无则只路由到 front。
 # train 全量请用 7 卡分片：bash tools/run_vlm_caption_train_7gpu.sh（见第 8 步），
 #   --num-shards N --shard-id i 把数据切 N 份并行，各写 *_summaries.shard{i}ofN.json
 ```
@@ -127,18 +135,23 @@ python tools/data_converter/merge_summaries.py \
 ## 0.6 已知问题 / 待办
 
 - **流水线 Step 1~5 + LLMBridgeHead 已全跑通**（截至 2026-06-22）：
-  - 数据：val 1500 子集 `data/kl_8/kl_infos_val_sub1k_vlmcap.pkl`（1466/1500 带 summary）。
-  - 几何事实：train/val 全量 `kl_infos_{train,val}_with_cam_geo.pkl` 已生成。
+  - 数据：6 路环视 val 子集 `data/kl_8/kl_infos_val_sub6cam_vlmcap.pkl`（911 帧, 903 带 summary；
+    全为稀有帧，conflict/gate 密集）。旧单 front 子集 `kl_infos_val_sub1k_vlmcap.pkl` 仅作历史对比。
+  - 几何事实：**val** 全量 `kl_infos_val_with_cam_geo.pkl` 已是 6 路。
+    ⚠️ **train** 全量 `kl_infos_train_with_cam_geo.pkl` 仍是单 CAM_FRONT（6 路改造前所建），
+    正式训练前必须重做（见 4.3-A 的 (0) 步）。
   - 模型：`LLMBridgeHead` + config `base_e2e_lidar_occ_llm.py` smoke test 通过
     （caption 注入、llm.loss_llm 有限、与 track/motion/occ 共存、backward OK）。详见第 7 步。
+  - 评估：`eval_llm_caption.py` template/teacher 可跑；activity 拆为 addressed/busy（见 4.3-B）。
+    6 路 teacher activity_addressed 37.3%（单 front 17.0%）。
 - **正式训练待办**（第 8 步）：
-  - train 全量 VLM caption 未跑完（曾启动后中断）；用 7 卡分片脚本
-    `tools/run_vlm_caption_train_7gpu.sh` 约 1.3h 可完成（单卡约 9h）。
-  - 跑完 merge → `kl_infos_train_vlmcap.pkl` → 改 config 的 train `ann_file` → 正式训练。
-- **评估指标待加**：当前只有 loss，没有 caption 质量指标（BLEU / 关键语义命中率）。
+  - (0) train pkl 重做 6 相机（add_cam_sync 6 路 → gen_geo_facts）。
+  - (1) 7 卡分片 caption `tools/run_vlm_caption_train_7gpu.sh` 约 1.3h（单卡约 9h）。
+  - (2) merge → `kl_infos_train_vlmcap.pkl` → 改 config 的 train `ann_file` → 正式训练。详见 4.3-A。
 - 文件清单（本方案新增）：
   `tools/data_converter/{add_cam_sync,gen_geo_facts,make_subset,gen_vlm_caption,merge_summaries}.py`、
   `tools/run_vlm_caption_train_7gpu.sh`（7 卡并行 VLM caption）、
+  `tools/analysis_tools/eval_llm_caption.py`（caption 质量评测）、
   `projects/mmdet3d_plugin/uniad/dense_heads/llm_bridge_head.py`、
   `projects/configs/stage2_e2e_lidar/base_e2e_lidar_occ_llm.py`、本文档。
 
@@ -328,11 +341,12 @@ motion traj_query             ├─► Projector (MLP, 256 → d_llm) ─► [N
 2. ✅ 方案定调：VLM 图像老师 + 纯 LiDAR 推理（跨模态蒸馏）；几何模板互补。
 3. ✅ token 边界 + caption schema（scene-level summary）锁定。见 3.2.1 / 3.2.2。
 4. ✅ 图像↔LiDAR 同步：`add_cam_sync.py` → `kl_infos_{train,val}_with_cam.pkl`
-   （train 98.58% / val 98.19% 命中）。见 0.4 Step 1。
+   （front 命中 train 98.58% / val 98.19%）。**val 已重做成 6 路；train 仍单 front 待重做**。见 0.4 Step 1 / 4.3-A。
 5. ✅ 几何事实生成：`gen_geo_facts.py` → `..._with_cam_geo.pkl`（train/val 全量）。
-   阈值数据化校准（见 0.4 Step 2 与 4.2 经验）。
-6. ✅ VLM caption：`gen_vlm_caption.py`，prompt 设计 + 子集批量生成
-   （val 1500 子集，1466 带 summary）。见 0.4 Step 4 与 4.2 经验。
+   阈值数据化校准（见 0.4 Step 2 与 4.2 经验）。前视 gate 收紧的弯路已回退（见 4.3-B）。
+6. ✅ VLM caption 多相机化：`gen_vlm_caption.py`，prompt 设计 + 按方位路由 2-4 路环视 +
+   6 路 val 子集批量生成（911 帧，903 带 summary）。teacher activity_addressed 17%→37%。
+   见 0.4 Step 4 与 4.3-B。
 7. ✅ `LLMBridgeHead` + config + smoke test（2026-06-22）：caption 注入正确、
    llm.loss_llm 有限（≈5.2~5.7）、与 track/motion/occ 共存、backward OK。
    实现细节见 3.1 / 3.3；代码 `llm_bridge_head.py`、`uniad_motion_lidar.py`、
@@ -361,7 +375,20 @@ motion traj_query             ├─► Projector (MLP, 256 → d_llm) ─► [N
 
 **A. 正式训练**（待 train 全量 VLM caption 就绪）。完整命令链：
    ```bash
+   # (0) ⚠️ 前置：train pkl 当前仍是单 CAM_FRONT（建于 6 路改造前），必须先重做成 6 相机，
+   #     否则 7 卡 caption 仍只能看前视、activity 召回回到 17%。从原始 train pkl 重做两步：
+   #     add_cam_sync 的 --views 默认只有 front，6 路要显式传全部 6 个磁盘视角名。
+   python tools/data_converter/add_cam_sync.py \
+     --pkl-path data/kl_8/kl_infos_train.pkl \
+     --out-path data/kl_8/kl_infos_train_with_cam.pkl \
+     --views front left_front left_rear rear right_front right_rear
+   python tools/data_converter/gen_geo_facts.py \
+     --pkl-path data/kl_8/kl_infos_train_with_cam.pkl \
+     --conflict-dist 4.0 --gate-static-s 2.0 --gate-crane-m 30.0
+   #     -> data/kl_8/kl_infos_train_with_cam_geo.pkl（含 6 路 + geo_facts）
+   #     （val 已是 6 路，勿覆盖；这两步纯 CPU/numpy1.x，不占 GPU）
    # (1) 7 卡并行生成 train 全量 caption（~1.3h；占 GPU1-7，留 GPU0）
+   #     脚本无需 --views：相机按目标方位自动路由（_resolve_views 读 sync_info.cameras）。
    bash tools/run_vlm_caption_train_7gpu.sh
    # (2) 合并各分片 sidecar 回 train pkl（uniad_train env，几秒）
    python tools/data_converter/merge_summaries.py \
@@ -369,27 +396,40 @@ motion traj_query             ├─► Projector (MLP, 256 → d_llm) ─► [N
      --json-path /tmp/train_vlmcap_summaries.shard*of7.json \
      --out-path data/kl_8/kl_infos_train_vlmcap.pkl
    # (3) 改 config base_e2e_lidar_occ_llm.py：train 的 ann_file 指向 kl_infos_train_vlmcap.pkl
-   #     （val 保持 kl_infos_val_sub1k_vlmcap.pkl 做评估）
+   #     （val 用 6 路子集 kl_infos_val_sub6cam_vlmcap.pkl 做评估）
    # (4) 正式训练
    ./tools/uniad_dist_train.sh \
      projects/configs/stage2_e2e_lidar/base_e2e_lidar_occ_llm.py <GPUS>
    ```
-   注意：当前 config 的 train/val 都指向 val 子集（smoke 用）；正式训练须先做 (3)。
+   注意：当前 config 的 train/val 都指向 val 子集（smoke 用）；正式训练须先做 (0) 与 (3)。
 
 **B. 评估指标**（已落地 `tools/analysis_tools/eval_llm_caption.py`）：
    规则解析 caption → 关键语义命中率（conflict 类别/方位、TTC 桶、ego_advice、activity、幻觉），
    主对 geo_facts。baseline：`template`（几何直出，floor）/`teacher`（VLM summary，蒸馏上限）
    已可跑；`model`/`shuffle`/`noquery` 待训练出 checkpoint 后接（forward_test 逐帧）。
-   - 已测基准（val 1500）：template 几何字段 100%、activity 0%（符合预期）；
-     **teacher: conflict_cls 75% / advice 85% / activity 仅 15.6% / 幻觉 2%**。
-   - ⚠️ **关键发现**：作业状态(activity)是方案核心卖点（图像独有语义），但 **VLM 老师本身
-     只在 15.6% 的该标帧里说了作业** —— 老师没教够，学生无从学。同 conflict 退化一类问题：
-     VLM prompt 对作业状态引导不足。**正式训练前应先改 prompt 提升 activity 召回**（见 C）。
+   - ⚠️ **走过的弯路（已纠正，复现必读）**：曾以为 activity 召回低的根因是"门控把后方目标也
+     标了、前视相机看不到"，于是把 activity_gate **收紧到只对前视扇区**（_FRONT_SECTORS +
+     gate_visible_m）。方向错了——正解不是"剔掉后方目标"，而是**上 6 路环视让后方目标可见**。
+     该收紧逻辑已从 `gen_geo_facts.py` **回退**，activity_gate 恢复全方位（static≥2s & crane≤30m）。
+   - ⚠️ **评测指标 bug（已修，2026-06-22）**：旧 `activity` 指标用 `pred==gt['has_activity']`，
+     而 `pred` 只匹配"作业/装卸"两词，**把 VLM 正确判出的"空闲/等待"当成漏报**。门控本意是
+     三选一（装卸/等待/空闲），"空闲"是有效判断。旧 14.3%~15.6% 严重低估了真实效果。
+     已拆成两个指标：`activity_addressed`（gated 帧是否给出三态之一，衡量"VLM 有没有看图回应
+     门控"）/ `activity_busy`（其中判"装卸作业"的比例，是 rate 不是命中分）。
+   - ✅ **多相机实测（val 子集 teacher）**：单 front → 6 路环视，`activity_addressed`
+     **17.0% → 37.3% 翻倍**（gated 分母均=777）。根因证实：单 front 时后方/侧方 gate 目标
+     （35-46m 外的吊机居多）看不到只能照搬几何；6 路按目标方位路由 CAM_BACK 后 VLM 才能看图判断。
+     连带 conflict_cls 75%→88%、conflict_bearing 75%→84%、ttc 59%→72% 均涨（侧后方冲突有相机佐证）。
+     `activity_busy` 92%(n=132)→38%(n=290) 下降是**更真实**：单 front 偏向只说近前方明显在作业的，
+     6 路纳入大量后方空闲吊机，VLM 如实判"空闲" ⇒ busy 占比降但 addressed 大涨，正是要的效果。
+     幻觉(无幻觉率) 98%→96% 基本持平。
+   - ⚠️ 保留：两子集非同帧（旧单front 1500 / 新6cam 911），gated 分母恰好都=777、rate 可比；
+     严格同帧对比需在旧子集按相同 seed 重抽，但 17→37 的量级差足以支撑"多相机有效"。
    - `shuffle` 对照（query 配错帧）是证伪试金石：若打乱后命中不掉 = LLM 没真用 LiDAR query。
 
 **C. 优先改进**：
-   - **(高) 提升 VLM activity 召回**：改 gen_vlm_caption prompt，对 `activity_gate=True` 帧
-     强制 VLM 明确判断"装卸中/等待/空闲"（类比 conflict 修复加 few-shot），重测 teacher activity。
+   - **(高) 提升 VLM activity 召回** — ✅ 已根治：6 路环视 + 评测指标修正，activity_addressed
+     17%→37%（见 B）。下一步跑 train 全量（需先把 train pkl 重做成 6 相机，见 4.3-A）。
    - (中) 显式特征入 head：当前只喂 track_query+box center；可拼 class logits / bbox 尺寸/yaw /
      velocity / conflict-advice 结构特征，提升可控性（评注第 2 条，训练后迭代）。
-   - (低) 扩环视（front→6 路）提升老师质量；多卡 DDP 全量完整验证（smoke 只跑 3 iter）。
+   - (低) 多卡 DDP 全量完整验证（smoke 只跑 3 iter）。

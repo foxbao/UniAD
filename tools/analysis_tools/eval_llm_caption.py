@@ -11,6 +11,11 @@ Metrics (per frame, then averaged):
   - bearing/class hit of the conflict agent
   - TTC bucket accuracy (<2s / 2-4s / >4s)
   - ego_advice accuracy (keep/slow/yield)
+  - activity_addressed: on gated frames, did the VLM give ANY three-way
+    activity judgement (busy/waiting/idle)? This is the real test of whether
+    it looked at the routed camera and responded to the gate.
+  - activity_busy: of addressed gated frames, the fraction judged 'busy'
+    (active loading/unloading) — a rate, not a hit/miss score.
   - hallucination rate: object classes mentioned that are NOT in geo_facts
 
 Baselines (run on the SAME val frames; --mode):
@@ -43,18 +48,32 @@ _ADVICE_ZH = [('让行', 'yield'), ('停车', 'stop'), ('减速', 'slow'),
 
 
 def parse_caption(text):
-    """Regex-parse a Chinese caption into structured fields."""
+    """Regex-parse a Chinese caption into structured fields.
+
+    activity_state is the three-way gate judgement the VLM is asked to make:
+    'busy' (装卸/作业 in progress), 'waiting' (等待), 'idle' (空闲), or None if
+    the caption gave no activity judgement at all. "addressed" = state is not
+    None. Note: idle/waiting are valid judgements (a rear crane 40m away is
+    usually genuinely idle), so they must NOT be scored as misses.
+    """
     if not text:
         return dict(classes=set(), bearings=set(), ttc=None, advice=None,
-                    activity=False)
+                    activity_state=None)
     classes = {cid for name, cid in _CLS_ZH.items() if name in text}
     bearings = {canon for zh, canon in _BEARING_ZH.items() if zh in text}
     m = re.search(r'([0-9]+(?:\.[0-9]+)?)\s*秒', text)
     ttc = float(m.group(1)) if m else None
     advice = next((c for zh, c in _ADVICE_ZH if zh in text), None)
-    activity = ('作业' in text) or ('装卸' in text)
+    if ('作业' in text) or ('装卸' in text):
+        activity_state = 'busy'
+    elif '等待' in text:
+        activity_state = 'waiting'
+    elif '空闲' in text:
+        activity_state = 'idle'
+    else:
+        activity_state = None
     return dict(classes=classes, bearings=bearings, ttc=ttc,
-                advice=advice, activity=activity)
+                advice=advice, activity_state=activity_state)
 
 
 def _ttc_bucket(t):
@@ -98,9 +117,16 @@ def score_frame(pred, gt):
         s['ttc_bucket'] = (False, False)
     # advice — always applicable
     s['advice'] = (pred['advice'] == gt['advice'], True)
-    # activity — only where geometry gated it on
-    s['activity'] = (pred['activity'] == gt['has_activity'],
-                     gt['has_activity'])
+    # activity — only on gated frames. Two metrics, because "idle"/"waiting"
+    # are valid judgements, not misses:
+    #   activity_addressed: did the VLM give ANY three-way judgement (the real
+    #     test of whether it looked at the image and responded to the gate)?
+    #   activity_busy: of addressed gated frames, how many were 'busy' (the
+    #     active-operation rate — informative, not a hit/miss score).
+    addressed = pred['activity_state'] is not None
+    s['activity_addressed'] = (addressed, gt['has_activity'])
+    s['activity_busy'] = (pred['activity_state'] == 'busy',
+                          gt['has_activity'] and addressed)
     # hallucination: predicted classes not present in GT (lower better)
     halluc = pred['classes'] - gt['present_classes']
     s['halluc'] = (len(halluc) == 0, len(pred['classes']) > 0)
@@ -139,7 +165,7 @@ def template_caption(facts):
 def aggregate(rows):
     """rows: list of per-frame score dicts -> per-metric rate."""
     keys = ['conflict_cls', 'conflict_bearing', 'ttc_bucket', 'advice',
-            'activity', 'halluc']
+            'activity_addressed', 'activity_busy', 'halluc']
     out = {}
     for k in keys:
         hits = sum(1 for r in rows if r[k][1] and r[k][0])

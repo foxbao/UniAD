@@ -1,14 +1,21 @@
 #!/usr/bin/env python
-"""VLM caption: Qwen2.5-VL teacher — turn geometric facts + front image into a
-natural Chinese scene summary, written back into the pkl.
+"""VLM caption: Qwen2.5-VL teacher — turn geometric facts + surround-camera
+images into a natural Chinese scene summary, written back into the pkl.
 
 See documents/llm_integration_plan.md (3.2). Pipeline per frame:
-  geo_facts (geometry, authoritative) + CAM_FRONT image
+  geo_facts (geometry, authoritative) + surround-camera images
+    -> _resolve_views routes only the cameras covering this frame's relevant
+       agents (AOI/conflict/gate) to the VLM (cost ~2x, not 6x)
     -> render facts to a Chinese constraint prompt
     -> Qwen2.5-VL: keep the geometry, ADD only image-only semantics
        (loading/unloading activity, crane busy/idle, load state check),
        output ONE fluent Chinese summary sentence
     -> info['geo_facts']['summary']
+
+Each image is labeled with its bearing (【前方相机】/【右后方相机】...) so the VLM
+aligns activity/load judgements to the correct direction. Multi-camera fixes the
+single-front blind spot: rear/side targets that front-only could not see (and so
+were never captioned with an activity state — see plan 4.2/4.3).
 
 This is offline data generation: run it in the `qwen_vl` conda env (torch 2.6
 + transformers 4.57.6), NOT in uniad_train. It only reads images + the geo-facts pkl
@@ -49,20 +56,25 @@ def _cls_name(cid):
 
 
 _SYSTEM = (
-    '你是港口自动驾驶场景的标注助手。下面给你一张本车前视相机图像，'
+    '你是港口自动驾驶场景的标注助手。下面给你若干张本车环视相机图像（每张图前'
+    '都标注了它的方位，如【前方相机】【右后方相机】），'
     '以及一份由激光雷达几何计算得到的、准确无误的场景事实。'
     '请严格遵守：\n'
     '1. 事实中的数量、类别、方位、距离、运动、冲突均为准确数据，不得改动或编造；\n'
     '2. 你的任务是结合图像，补充“几何无法判断、但图像能看出”的语义，仅限：'
-    '目标是否正在装卸作业、吊机是忙碌还是空闲、满载/空载的目视确认；\n'
+    '目标是否正在装卸作业、吊机是忙碌还是空闲、满载/空载的目视确认；'
+    '判断某目标时，请看与其方位一致的那张相机图（如右后方的目标看【右后方相机】）；\n'
     '3. 对图像看不清或不确定的，不要猜测；\n'
     '4. 若事实中标注了“与本车规划路径冲突”的目标，summary 必须明确点出'
     '是哪个目标（方位+类别）、以及预计多少秒后冲突，并给出建议（减速/让行）。'
     '严禁用“障碍物”等笼统说法代替具体目标；\n'
-    '5. 最终只输出一句通顺的中文场景描述（不超过60字），面向本车视角，'
+    '5. 若事实中标注了某目标“（请判断作业状态）”，该目标已在某路相机可见范围内，'
+    'summary 必须明确说出它的作业状态，三选一：正在装卸作业 / 等待作业 / 空闲，'
+    '依据其方位对应相机的图像观察（吊具是否起落、周围是否有箱、是否有车停靠装卸）。不得回避；\n'
+    '6. 最终只输出一句通顺的中文场景描述（不超过60字），面向本车视角，'
     '突出对本车行驶最相关的目标与建议。不要分点，不要复述全部目标。\n'
     '示例（含冲突）：右前方12米处一台满载IGV缓行，预计3秒后与本车路径冲突，建议让行。\n'
-    '示例（含作业）：正后方吊机正在装卸作业，右前方空挂车静止，本车可保持。'
+    '示例（含作业）：右后方吊机正在装卸作业，正前方空挂车等待，本车可保持。'
 )
 
 
@@ -84,7 +96,7 @@ def _render_facts(facts):
             ttc = a['ttc']
             seg.append(f'约{ttc}秒后与本车规划路径冲突' if ttc else '与本车路径冲突')
         if a['activity_gate']:
-            seg.append('（几何上可能在作业，请结合图像确认）')
+            seg.append('（请判断作业状态）')
         lines.append('- ' + '，'.join(seg) + '。')
     advice = _ADVICE_ZH.get(facts.get('ego_advice', 'keep'), '保持')
     lines.append(f'本车建议：{advice}。')
@@ -107,14 +119,18 @@ def _load_model(model_path, device):
     return model, processor
 
 
-def _infer_one(model, processor, img_path, facts_text, max_new_tokens=96):
+def _infer_one(model, processor, views, facts_text, max_new_tokens=96):
+    """views: [(cam, zh_label, path), ...]. Feeds each labeled view so the VLM
+    aligns activity/load judgements to the correct bearing."""
     from qwen_vl_utils import process_vision_info
+    content = []
+    for _, zh, path in views:
+        content.append({'type': 'text', 'text': f'【{zh}相机】'})
+        content.append({'type': 'image', 'image': path})
+    content.append({'type': 'text', 'text': '场景事实：\n' + facts_text})
     messages = [
         {'role': 'system', 'content': _SYSTEM},
-        {'role': 'user', 'content': [
-            {'type': 'image', 'image': img_path},
-            {'type': 'text', 'text': '场景事实：\n' + facts_text},
-        ]},
+        {'role': 'user', 'content': content},
     ]
     text = processor.apply_chat_template(
         messages, tokenize=False, add_generation_prompt=True)
@@ -131,13 +147,50 @@ def _infer_one(model, processor, img_path, facts_text, max_new_tokens=96):
         clean_up_tokenization_spaces=True)[0].strip()
 
 
-def _resolve_img(info, data_root):
+# 8-way bearing sector -> surround camera that best sees it (nuScenes layout,
+# confirmed from camera_extrinsics). Routes only cameras covering this frame's
+# relevant agents to the VLM (cost ~2x, not 6x).
+_BEARING_CAM = {
+    'front': 'CAM_FRONT', 'left-front': 'CAM_FRONT_LEFT',
+    'left': 'CAM_FRONT_LEFT', 'left-rear': 'CAM_BACK_LEFT',
+    'rear': 'CAM_BACK', 'right-rear': 'CAM_BACK_RIGHT',
+    'right': 'CAM_FRONT_RIGHT', 'right-front': 'CAM_FRONT_RIGHT',
+}
+_CAM_ZH = {
+    'CAM_FRONT': '前方', 'CAM_FRONT_LEFT': '左前方',
+    'CAM_FRONT_RIGHT': '右前方', 'CAM_BACK': '后方',
+    'CAM_BACK_LEFT': '左后方', 'CAM_BACK_RIGHT': '右后方',
+}
+
+
+def _cam_path(info, cam, data_root):
     cams = info.get('sync_info', {}).get('cameras', {})
-    front = cams.get('CAM_FRONT')
-    if not front or not front.get('valid') or 'path' not in front:
+    e = cams.get(cam)
+    if not e or not e.get('valid') or 'path' not in e:
         return None
-    p = front['path']
+    p = e['path']
     return p if osp.isabs(p) or osp.exists(p) else osp.join(data_root, p)
+
+
+def _resolve_views(facts, info, data_root):
+    """Cameras covering this frame's relevant agents (AOI/conflict/gate),
+    deduped; returns [(cam, zh_label, path), ...] for valid views; falls back
+    to CAM_FRONT."""
+    aoi = set(facts.get('agents_of_interest', []))
+    cams = []
+    for a in facts.get('agents', []):
+        if a['id'] in aoi or a.get('conflict') or a.get('activity_gate'):
+            c = _BEARING_CAM.get(a['bearing'])
+            if c and c not in cams:
+                cams.append(c)
+    if not cams:
+        cams = ['CAM_FRONT']
+    out = []
+    for c in cams:
+        p = _cam_path(info, c, data_root)
+        if p is not None:
+            out.append((c, _CAM_ZH.get(c, c), p))
+    return out
 
 
 def gen_vlm_to_pkl(pkl_path, model_path, out_path=None, in_place=False,
@@ -166,21 +219,21 @@ def gen_vlm_to_pkl(pkl_path, model_path, out_path=None, in_place=False,
         if facts is None:
             n_skip += 1
             continue
-        img = _resolve_img(info, data_root)
+        views = _resolve_views(facts, info, data_root)
         facts_text = _render_facts(facts)
         if dry_run:
-            print('\n--- IMG:', img, '---')
+            print('\n--- VIEWS:', [v[0] for v in views], '---')
             print(facts_text)
             n_done += 1
             continue
         token = info.get('token')
-        if img is None:
+        if not views:
             facts['summary'] = None
             summaries[token] = None
             n_skip += 1
             continue
         facts['summary'] = _infer_one(
-            model, processor, img, facts_text, max_new_tokens)
+            model, processor, views, facts_text, max_new_tokens)
         summaries[token] = facts['summary']
         n_done += 1
 

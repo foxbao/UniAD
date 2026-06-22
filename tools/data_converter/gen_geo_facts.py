@@ -170,6 +170,10 @@ def _frame_facts(info, cfg, dist_stats):
             flag, ttc = False, None
         sdur = _static_duration(past) if past.size else 0.0
         cdist = _nearest_crane_dist(xy, crane_xys)
+        # Activity gate: static agent near a crane, ALL-AROUND. With 6-cam
+        # surround every bearing has a camera, so VLM caption routes the
+        # matching view per agent (see gen_vlm_caption). The earlier front-only
+        # restriction was a single-cam workaround, removed.
         gate = (sdur >= cfg['gate_static_s']
                 and cdist is not None and cdist <= cfg['gate_crane_m'])
         agents.append({
@@ -246,7 +250,7 @@ def _default_cfg():
         top_k=5,             # agents_of_interest cap
         # activity geometric gate (LOOSE pre-filter; C2 image decides final):
         gate_static_s=2.0,   # >= this static duration AND
-        gate_crane_m=30.0,   # <= this distance to nearest Crane -> gate True
+        gate_crane_m=30.0,   # <= this distance to nearest Crane -> gate
     )
 
 
