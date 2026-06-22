@@ -20,7 +20,22 @@ class TrajLoss(nn.Module):
     Multipath outputs, with residuals added to anchors.
     """
 
-    def __init__(self, use_variance=False, cls_loss_weight=1., nll_loss_weight=1., loss_weight_minade=0., loss_weight_minfde=1., loss_weight_mr=1.):
+    def __init__(self,
+                 use_variance=False,
+                 cls_loss_weight=1.,
+                 nll_loss_weight=1.,
+                 loss_weight_minade=0.,
+                 loss_weight_minfde=1.,
+                 loss_weight_mr=1.,
+                 best_mode_metric='minade',
+                 fde_weight=0.5,
+                 turn_loss_weights=None,
+                 static_path_thr=2.0,
+                 straight_deg=15.0,
+                 mild_deg=45.0,
+                 straight_lateral_ratio=0.15,
+                 mild_lateral_ratio=0.35,
+                 normalize_turn_weights=True):
         """
         Initialize MTP loss
         :param args: Dictionary with the following (optional) keys
@@ -37,6 +52,19 @@ class TrajLoss(nn.Module):
         self.nll_loss_weight = nll_loss_weight
         self.loss_weight_minade = loss_weight_minade
         self.loss_weight_minfde = loss_weight_minfde
+        if best_mode_metric not in ('minade', 'minfde', 'ade_fde'):
+            raise ValueError(
+                'best_mode_metric must be one of minade, minfde, ade_fde, '
+                f'got {best_mode_metric}')
+        self.best_mode_metric = best_mode_metric
+        self.fde_weight = float(fde_weight)
+        self.turn_loss_weights = turn_loss_weights
+        self.static_path_thr = float(static_path_thr)
+        self.straight_deg = float(straight_deg)
+        self.mild_deg = float(mild_deg)
+        self.straight_lateral_ratio = float(straight_lateral_ratio)
+        self.mild_lateral_ratio = float(mild_lateral_ratio)
+        self.normalize_turn_weights = bool(normalize_turn_weights)
 
     def forward(self,
                 traj_prob, 
@@ -64,35 +92,140 @@ class TrajLoss(nn.Module):
         # Masks for variable length ground truth trajectories
         masks = 1 - gt_future_traj_valid_mask.to(traj.dtype)
 
-        l_minfde, inds = min_fde(traj, traj_gt, masks)
+        per_mode_ade, per_mode_fde = mode_ade_fde(traj, traj_gt, masks)
+        l_minade, inds_ade = torch.min(per_mode_ade, dim=1)
+        l_minfde, inds_fde = torch.min(per_mode_fde, dim=1)
         try:
             l_mr = miss_rate(traj, traj_gt, masks)
         except:
             l_mr = torch.zeros_like(l_minfde)
-        l_minade, inds = min_ade(traj, traj_gt, masks)
-        inds_rep = inds.repeat(
-            sequence_length,
-            pred_params, 1, 1).permute(3, 2, 0, 1)
+        if self.best_mode_metric == 'minade':
+            inds = inds_ade
+            selected_ade = l_minade
+        elif self.best_mode_metric == 'minfde':
+            inds = inds_fde
+            selected_ade = torch.gather(
+                per_mode_ade, 1, inds.unsqueeze(1)).squeeze(1)
+        else:
+            best_score = per_mode_ade + self.fde_weight * per_mode_fde
+            _, inds = torch.min(best_score, dim=1)
+            selected_ade = torch.gather(
+                per_mode_ade, 1, inds.unsqueeze(1)).squeeze(1)
+
+        gather_idx = inds[:, None, None, None].expand(
+            -1, 1, sequence_length, traj.size(-1))
 
         # Calculate MSE or NLL loss for trajectories corresponding to selected
         # outputs:
-        traj_best = traj.gather(1, inds_rep).squeeze(dim=1)
+        traj_best = traj.gather(1, gather_idx).squeeze(dim=1)
 
         if self.use_variance:
             l_reg = traj_nll(traj_best, traj_gt, masks)
         else:
-            l_reg = l_minade
+            l_reg = selected_ade
 
         # Compute classification loss
-        l_class = - torch.squeeze(log_probs.gather(1, inds.unsqueeze(1)))
+        l_class = -log_probs.gather(1, inds.unsqueeze(1)).squeeze(1)
 
-        l_reg = torch.sum(l_reg)/(batch_size + 1e-5) 
-        l_class = torch.sum(l_class)/(batch_size + 1e-5)
-        l_minade = torch.sum(l_minade)/(batch_size + 1e-5) 
-        l_minfde = torch.sum(l_minfde)/(batch_size + 1e-5) 
+        sample_weights = self._sample_weights(traj_gt, masks)
+        l_reg = torch.sum(l_reg * sample_weights)/(batch_size + 1e-5)
+        l_class = torch.sum(l_class * sample_weights)/(batch_size + 1e-5)
+        l_minade = torch.sum(l_minade * sample_weights)/(batch_size + 1e-5)
+        l_minfde = torch.sum(l_minfde * sample_weights)/(batch_size + 1e-5)
 
         loss = l_class * self.cls_loss_weight + l_reg * self.nll_loss_weight + l_minade * self.loss_weight_minade + l_minfde * self.loss_weight_minfde
         return loss, l_class, l_reg, l_minade, l_minfde, l_mr
+
+    def _sample_weights(self, traj_gt: torch.Tensor,
+                        masks: torch.Tensor) -> torch.Tensor:
+        if not self.turn_loss_weights:
+            return traj_gt.new_ones((traj_gt.shape[0], ))
+        weights = traj_gt.new_ones((traj_gt.shape[0], ))
+        valid = (1 - masks).bool()
+        for idx in range(traj_gt.shape[0]):
+            pts = traj_gt[idx, valid[idx], :2]
+            bucket = self._classify_turn_bucket(pts)
+            weights[idx] = float(self.turn_loss_weights.get(bucket, 1.0))
+        if self.normalize_turn_weights and weights.numel() > 0:
+            weights = weights / weights.mean().clamp(min=1e-6)
+        return weights
+
+    def _classify_turn_bucket(self, pts: torch.Tensor) -> str:
+        if pts.shape[0] < 2:
+            return 'static_slow'
+        path = torch.norm(pts[1:] - pts[:-1], dim=1).sum()
+        net = torch.norm(pts[-1])
+        if float(path.detach()) < self.static_path_thr or \
+                float(net.detach()) < self.static_path_thr:
+            return 'static_slow'
+        heading = self._heading_change_deg(pts)
+        lat_ratio = self._lateral_ratio(pts)
+        if heading <= self.straight_deg and \
+                lat_ratio <= self.straight_lateral_ratio:
+            return 'straight'
+        if heading <= self.mild_deg and lat_ratio <= self.mild_lateral_ratio:
+            return 'mild_turn'
+        return 'sharp_turn'
+
+    @staticmethod
+    def _heading_change_deg(pts: torch.Tensor,
+                            segment_min_disp: float = 0.05) -> float:
+        if pts.shape[0] < 3:
+            return 0.0
+        deltas = pts[1:] - pts[:-1]
+        norms = torch.norm(deltas, dim=1)
+        valid = torch.nonzero(norms >= segment_min_disp).flatten()
+        if valid.numel() < 2:
+            return 0.0
+        v0 = deltas[valid[0]]
+        v1 = deltas[valid[-1]]
+        a0 = torch.atan2(v0[1], v0[0])
+        a1 = torch.atan2(v1[1], v1[0])
+        diff = (a1 - a0 + math.pi) % (2.0 * math.pi) - math.pi
+        return float(torch.abs(diff).detach() * 180.0 / math.pi)
+
+    @staticmethod
+    def _lateral_ratio(pts: torch.Tensor) -> float:
+        if pts.shape[0] < 2:
+            return 0.0
+        end = pts[-1]
+        net = torch.norm(end)
+        if float(net.detach()) < 1e-6:
+            return 0.0
+        direction = end / net.clamp(min=1e-6)
+        normal = torch.stack((-direction[1], direction[0]))
+        lateral = torch.max(torch.abs(torch.matmul(pts, normal)))
+        return float((lateral / net.clamp(min=1e-6)).detach())
+
+
+def mode_ade_fde(traj: torch.Tensor,
+                 traj_gt: torch.Tensor,
+                 masks: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Return per-mode ADE and FDE for every sample."""
+    num_modes = traj.shape[1]
+    traj_gt_rpt = traj_gt.unsqueeze(1).repeat(1, num_modes, 1, 1)
+    masks_rpt = masks.unsqueeze(1).repeat(1, num_modes, 1)
+    valid = 1 - masks_rpt
+    dist = traj_gt_rpt - traj[:, :, :, 0:2]
+    dist = torch.pow(torch.sum(torch.pow(dist, exponent=2), dim=3),
+                     exponent=0.5)
+    ade = torch.sum(dist * valid, dim=2) / torch.clip(
+        torch.sum(valid, dim=2), min=1)
+
+    lengths = torch.sum(1 - masks, dim=1).long()
+    last_inds = torch.clamp(lengths, min=1) - 1
+    gather_inds = last_inds[:, None, None, None].repeat(1, num_modes, 1, 2)
+    traj_last = torch.gather(traj[..., :2], dim=2,
+                             index=gather_inds).squeeze(2)
+    gt_last = torch.gather(traj_gt_rpt, dim=2,
+                           index=gather_inds).squeeze(2)
+    fde = torch.pow(torch.sum(torch.pow(gt_last - traj_last, exponent=2),
+                              dim=2), exponent=0.5)
+    invalid = lengths <= 0
+    if invalid.any():
+        ade[invalid] = 0
+        fde[invalid] = 0
+    return ade, fde
 
 def min_ade(traj: torch.Tensor, traj_gt: torch.Tensor,
             masks: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
