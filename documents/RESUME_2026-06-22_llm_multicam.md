@@ -50,9 +50,22 @@ pkl后缀: _with_cam -> _geo -> _vlmcap. 字段名 geo_facts.
   conflict_cls 75->88, bearing 75->84, ttc 59->72 均涨. halluc(无幻觉)98->96持平.
 - 文档已全面更新(0.1/0.4/0.6/4.1/4.3-B/C), memory已记 llm-multicam-activity-recall.
 
+## 复核迭代 (另一AI复核6条建议, 全部核实属实并处理)
+- train pkl 已重做6路(98.45-98.61%命中, gate 18.3%); 文档过期项已改(0.6/4.1/4.3-A).
+- 新建正式config base_e2e_lidar_occ_llm_train.py(train->kl_infos_train_vlmcap, val/test->sub6cam, load_from stage2-occ ckpt). smoke config不动.
+- §3 加banner标"front-only是历史阶段".
+- **第4点(口径不一致, 已修)**: _resolve_views按全部gate目标选相机, 但_render_facts只渲染AOI->gate目标"给图不给题".
+  改为渲染AOI∪conflict∪gate. 重跑v2: activity_addressed 37.3%->**69.4%**(同帧777). commit 2e23ebb.
+- **gate误标锥桶(已修)**: activity_gate对静止近吊机的任意目标触发,含锥桶/行人/小车(val子集941个误标).
+  加_NO_ACTIVITY_IDS={0,1,9}排除. gate目标2481->1540. commit dcc88f6.
+
+## 正在做: 锥桶排除后重生成数据 + v3验证
+- gen_geo_facts重算 train+val _with_cam_geo.pkl (gate已排除锥桶等, 19:09完成).
+- 重抽val子集 kl_infos_val_sub6cam_geo.pkl (稀有帧911->805).
+- v3 caption跑中(GPU0, ~16min) -> 待merge+eval确认 activity_addressed 保持高位+gate更干净.
+
 ## 待办: 正式训练 (4.3-A)
-⚠️ train pkl 仍是单 CAM_FRONT(6路改造前所建), 必须先重做:
-  add_cam_sync --views front left_front left_rear rear right_front right_rear -> gen_geo_facts
-  (纯CPU/numpy1.x, 不占GPU; val已6路勿覆盖)
-然后: 7卡caption(run_vlm_caption_train_7gpu.sh, 无需--views自动路由) -> merge -> kl_infos_train_vlmcap.pkl
-  -> config(_full) train ann_file指向它, val用 kl_infos_val_sub6cam_vlmcap.pkl -> uniad_dist_train.sh
+✅ train pkl 已是6路+gate已清理(kl_infos_train_with_cam_geo.pkl). 直接跑:
+  7卡caption(run_vlm_caption_train_7gpu.sh, 无需--views自动路由) -> merge -> kl_infos_train_vlmcap.pkl
+  -> 用 base_e2e_lidar_occ_llm_train.py -> uniad_dist_train.sh
+
