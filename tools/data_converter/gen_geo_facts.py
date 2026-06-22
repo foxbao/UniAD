@@ -51,6 +51,12 @@ _CRANE_IDS = {7, 12}   # Crane, WheelCrane
 # emergency markers), so the ego routinely drives past them; treating "path
 # near a cone" as a conflict produced spurious "yield to cone" summaries.
 _NO_CONFLICT_IDS = {9}  # Cone
+# Classes that can never be "doing loading/unloading work": pedestrians and
+# cars are not cargo handlers, cones are static markers. A pedestrian/car/cone
+# standing near a crane is NOT an activity target, so don't gate it for the
+# VLM to judge (cranes themselves stay gated -- their busy/idle IS the
+# question). This mirrors _NO_CONFLICT_IDS: a per-scene semantic exclusion.
+_NO_ACTIVITY_IDS = {0, 1, 9}  # Pedestrian, Car, Cone
 
 
 def _bearing(x, y):
@@ -173,8 +179,10 @@ def _frame_facts(info, cfg, dist_stats):
         # Activity gate: static agent near a crane, ALL-AROUND. With 6-cam
         # surround every bearing has a camera, so VLM caption routes the
         # matching view per agent (see gen_vlm_caption). The earlier front-only
-        # restriction was a single-cam workaround, removed.
-        gate = (sdur >= cfg['gate_static_s']
+        # restriction was a single-cam workaround, removed. Non-handler classes
+        # (pedestrian/car/cone) are excluded -- they can't be doing work.
+        gate = (label not in _NO_ACTIVITY_IDS
+                and sdur >= cfg['gate_static_s']
                 and cdist is not None and cdist <= cfg['gate_crane_m'])
         agents.append({
             'id': int(inst.get('track_id', -1)),
