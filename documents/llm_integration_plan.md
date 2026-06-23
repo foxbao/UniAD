@@ -326,9 +326,11 @@ motion traj_query             ├─► Projector (MLP, 256 → d_llm) ─► [N
 ### 3.3 落点（代码）
 
 - 新 detector head：`llm_bridge_head.py`（`LLMBridgeHead`，`@HEADS.register_module()`）。
-- detector 接线：`uniad_motion_lidar.py` 的 `forward_train` / `simple_test`，motion 之后取
-  `outs_motion['track_query']` + `outs_track`（注意 `simple_test` 里要在剥离
-  `track_bbox_results`/`track_query_embeddings` 的 cleanup **之前** 调用）。
+- detector 接线：`uniad_motion_lidar.py` 的 `forward_train` / `simple_test`，调用点在 motion 之后，
+  把 `outs_motion` + `outs_track` 都传给 llm_head；但 head 内 `_agent_query` **优先用
+  `outs_track['track_query_embeddings']`**（与 box center 同源同序，见 3.3 末"query/center 对齐"），
+  `outs_motion['track_query']` 仅作 fallback。注意 `simple_test` 里要在剥离
+  `track_bbox_results`/`track_query_embeddings` 的 cleanup **之前** 调用。
 - config：新建 `base_e2e_lidar_occ_llm.py` 继承 `base_e2e_lidar_occ`，加 `llm_head` 与
   `task_loss_weight['llm']`。caption 不走 pipeline 的 Collect key，而是数据集
   （`kl_dataset.py` `_union2one`）把 `gt_caption` 注入当前帧的 **img_metas**，detector
@@ -346,6 +348,12 @@ motion traj_query             ├─► Projector (MLP, 256 → d_llm) ─► [N
     点云感知主干（与相机/caption/gate 无关），LLM 训练时全部冻结，故配新 caption pkl 自洽。
     （smoke config 用 stage-1 drivable ckpt 仅为快速验证 llm forward/loss。）
 - 数据：图像同步脚本（补相机路径）+ 几何模板生成 + VLM caption 生成，产出每帧 caption，存入 pkl/sidecar。
+- **query/center 对齐（2026-06-23 修）**：LLM 的 per-agent query 与 box center 必须 1:1 对应。
+  曾用 `outs_motion['track_query']` 当 query、`outs_track['track_bbox_results']` 当 center——但
+  `MotionHeadLidar` 把 track_query 过滤成 vehicle 类并剥掉 SDC slot，而 box 未过滤，导致 query[i]
+  与 center[i] 描述不同物体、spatial_pe 加错位置。改用 `outs_track['track_query_embeddings']`：它与
+  `track_bbox_results` 在 `select_active_track_query` 里同 topk bbox_index + 同 mask 生成，严格同序同长，
+  且保留 caption 会提到的行人/锥桶等非 vehicle agent。motion query 仅作 fallback。
 
 ### 3.4 训练策略
 
