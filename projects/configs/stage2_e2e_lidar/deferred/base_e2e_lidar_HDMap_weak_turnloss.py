@@ -1,8 +1,7 @@
-_base_ = ['./base_e2e_lidar_HDMap.py']
+_base_ = ['../base_e2e_lidar_HDMap_weak.py']
 
-# Hard-map counterpart of base_e2e_lidar_turnaware_loss. This keeps the
-# existing HDMap lane prior and turn-aware anchors, changing only the motion
-# loss objective so map/no-map comparisons remain clean.
+# Weak-map counterpart of base_e2e_lidar_turnaware_turnloss. The map gate still
+# starts near the no-map branch; only the motion objective is changed.
 model = dict(
     motion_head=dict(
         loss_traj=dict(
@@ -20,4 +19,4 @@ model = dict(
                 mild_turn=1.5,
                 sharp_turn=2.0))))
 
-work_dir = './projects/work_dirs/stage2_e2e_lidar/base_e2e_lidar_HDMap_loss'
+work_dir = './projects/work_dirs/stage2_e2e_lidar/base_e2e_lidar_HDMap_weak_turnloss'

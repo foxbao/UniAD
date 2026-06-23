@@ -1,7 +1,7 @@
 _base_ = ['./base_e2e_lidar_turnaware.py']
 
-# Same no-map turn-aware-anchor baseline, but train motion modes with a
-# turn-aware objective:
+# Combined ablation: turn-aware anchors plus the turn-aware motion loss.
+# The loss trains motion modes with:
 # - classify/regress the mode selected by ADE + 0.5 * FDE instead of pure ADE
 # - up-weight moving turn samples while normalizing the batch mean weight to 1
 model = dict(
@@ -21,4 +21,4 @@ model = dict(
                 mild_turn=1.5,
                 sharp_turn=2.0))))
 
-work_dir = './projects/work_dirs/stage2_e2e_lidar/base_e2e_lidar_turnaware_loss'
+work_dir = './projects/work_dirs/stage2_e2e_lidar/base_e2e_lidar_turnaware_turnloss'

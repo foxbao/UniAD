@@ -1,4 +1,4 @@
-_base_ = ['./base_e2e_lidar_occ.py']
+_base_ = ['../base_e2e_lidar_occ.py']
 
 # Planning consumes the current frame plus planning_steps future frames
 # (collision loss uses indices [1:planning_steps+1]). Bump the DATASET's

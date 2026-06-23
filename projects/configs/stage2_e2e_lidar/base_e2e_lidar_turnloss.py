@@ -1,7 +1,7 @@
-_base_ = ['./base_e2e_lidar_HDMap_weak.py']
+_base_ = ['./base_e2e_lidar.py']
 
-# Weak-map counterpart of base_e2e_lidar_turnaware_loss. The map gate still
-# starts near the no-map branch; only the motion objective is changed.
+# Pure loss ablation: keep the original old-anchor no-map baseline unchanged,
+# and only switch the motion objective to the turn-aware loss variant.
 model = dict(
     motion_head=dict(
         loss_traj=dict(
@@ -19,4 +19,4 @@ model = dict(
                 mild_turn=1.5,
                 sharp_turn=2.0))))
 
-work_dir = './projects/work_dirs/stage2_e2e_lidar/base_e2e_lidar_HDMap_weak_loss'
+work_dir = './projects/work_dirs/stage2_e2e_lidar/base_e2e_lidar_turnloss'

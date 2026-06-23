@@ -1,6 +1,6 @@
 # KL LiDAR Motion Turn-Aware 工作总结
 
-更新时间：2026-06-22  
+更新时间：2026-06-23  
 对应提交：`dd632f7 feat(motion): add turn-aware training and analysis tooling`
 
 ## 1. 背景
@@ -64,6 +64,61 @@ turn-bucket 结果更有信息量：
 - turn-aware anchor 对 `mild_turn` 有明确帮助；
 - `sharp_turn` 的 oracle minFDE 变差，但 top1FDE 变好；
 - 说明问题不只是 anchor 覆盖，还包括 mode assignment、分类概率选择和 loss 对转弯样本的重视程度。
+
+### 2.3 HDMap 2x2 epoch6 消融结果
+
+2026-06-23 对以下 4 个已经训练 6 epoch 的配置做了统一对比：
+
+```text
+base_e2e_lidar
+base_e2e_lidar_turnaware
+base_e2e_lidar_HDMap_old_anchor
+base_e2e_lidar_HDMap
+```
+
+这里的 `base_e2e_lidar` 就是旧 anchor 的无地图基线，工作目录已经改回这个标准名字。4 个配置构成一个 2x2 消融：
+
+| 维度 | old anchor | turn-aware anchor |
+|---|---|---|
+| no map | `base_e2e_lidar` | `base_e2e_lidar_turnaware` |
+| hard HDMap | `base_e2e_lidar_HDMap_old_anchor` | `base_e2e_lidar_HDMap` |
+
+epoch6 validation 总体指标：
+
+| 配置 | 地图 | anchor | minADE | minFDE | MR | Recall | mAP | AMOTA |
+|---|---|---|---:|---:|---:|---:|---:|---:|
+| `base_e2e_lidar` | 无 | old | **0.33683** | 0.59741 | 0.08124 | **0.92837** | 0.84523 | 0.80039 |
+| `base_e2e_lidar_turnaware` | 无 | turn-aware | 0.33708 | **0.59263** | 0.08227 | 0.92705 | 0.84096 | 0.80758 |
+| `base_e2e_lidar_HDMap_old_anchor` | hard HDMap | old | 0.33847 | 0.59873 | **0.07985** | 0.92375 | 0.83880 | 0.80574 |
+| `base_e2e_lidar_HDMap` | hard HDMap | turn-aware | 0.33887 | 0.60617 | 0.08150 | 0.92650 | **0.84565** | **0.80917** |
+
+按消融轴拆开看：
+
+| 对比 | minFDE 变化 | 结论 |
+|---|---:|---|
+| no-map 下 old -> turn-aware | `0.59741 -> 0.59263`，-0.00478 | turn-aware anchor 对 no-map motion 有小幅收益 |
+| HDMap 下 old -> turn-aware | `0.59873 -> 0.60617`，+0.00744 | 带地图时 turn-aware 没有转化为 motion 收益 |
+| old anchor 下 no-map -> HDMap | `0.59741 -> 0.59873`，+0.00132 | hard HDMap 基本没有改善 motion |
+| turn-aware anchor 下 no-map -> HDMap | `0.59263 -> 0.60617`，+0.01354 | hard HDMap 明显拉大平均终点误差 |
+
+类别级结果也支持这个判断。以 turn-aware anchor 为例，加入 hard HDMap 后：
+
+| 类别 | no-map turn-aware minFDE | HDMap turn-aware minFDE | 变化 |
+|---|---:|---:|---:|
+| Truck | 0.76540 | 0.78041 | 变差 |
+| Trailer-Empty | 0.62171 | 0.65099 | 变差 |
+| Trailer-Full | 0.81603 | 0.84742 | 变差 |
+| Crane | 1.03974 | 1.06965 | 变差 |
+| Forklift | 0.44427 | 0.38037 | 变好 |
+| ContainerForklift | 2.04589 | 1.98250 | 变好 |
+
+阶段性结论：
+
+- 这组 2x2 消融不支持“hard HDMap 能显著改善 motion”的说法。
+- `base_e2e_lidar_turnaware` 是 4 个配置里 motion minFDE 最好的。
+- `base_e2e_lidar_HDMap` 的 mAP/AMOTA 最好，说明地图版本的 tracking/整体检测跟踪指标不差，但 motion 平均终点误差没有受益。
+- hard HDMap 对 Forklift、ContainerForklift 这类小样本/低速作业类可能有局部帮助，但对 Truck、Trailer、Crane 等主力类别没有形成稳定正收益。
+- 更合理的后续方向不是继续强化 hard HDMap，而是验证 weak-map gate，让地图作为可学习弱先验。
 
 ## 3. 本轮代码改动
 
@@ -204,17 +259,18 @@ transformerlayers=dict(map_gate_init=-4.0)
 
 | 配置 | 地图 | anchor | loss |
 |---|---|---|---|
-| `base_e2e_lidar_turnaware_loss.py` | 无 | turn-aware 3grp | ADE+FDE + turn weighting |
-| `base_e2e_lidar_HDMap_loss.py` | hard map | turn-aware 3grp | ADE+FDE + turn weighting |
-| `base_e2e_lidar_HDMap_weak_loss.py` | weak map | turn-aware 3grp | ADE+FDE + turn weighting |
+| `base_e2e_lidar_turnloss.py` | 无 | old 2grp | ADE+FDE + turn weighting |
+| `base_e2e_lidar_turnaware_turnloss.py` | 无 | turn-aware 3grp | ADE+FDE + turn weighting |
+| `deferred/base_e2e_lidar_HDMap_turnloss.py` | hard map | turn-aware 3grp | ADE+FDE + turn weighting |
+| `deferred/base_e2e_lidar_HDMap_weak_turnloss.py` | weak map | turn-aware 3grp | ADE+FDE + turn weighting |
 
-### 4.3 loss + stratified K=6 anchor 的新实验
+### 4.3 loss + stratified K=6 anchor 的扩展实验（暂放 deferred）
 
 | 配置 | 地图 | anchor | loss |
 |---|---|---|---|
-| `base_e2e_lidar_stratified_k6_loss.py` | 无 | stratified K=6 | ADE+FDE + turn weighting |
-| `base_e2e_lidar_HDMap_stratified_k6_loss.py` | hard map | stratified K=6 | ADE+FDE + turn weighting |
-| `base_e2e_lidar_HDMap_weak_stratified_k6_loss.py` | weak map | stratified K=6 | ADE+FDE + turn weighting |
+| `deferred/base_e2e_lidar_stratified_k6_turnloss.py` | 无 | stratified K=6 | ADE+FDE + turn weighting |
+| `deferred/base_e2e_lidar_HDMap_stratified_k6_turnloss.py` | hard map | stratified K=6 | ADE+FDE + turn weighting |
+| `deferred/base_e2e_lidar_HDMap_weak_stratified_k6_turnloss.py` | weak map | stratified K=6 | ADE+FDE + turn weighting |
 
 ## 5. 推荐训练顺序
 
@@ -225,16 +281,16 @@ transformerlayers=dict(map_gate_init=-4.0)
 先跑：
 
 ```text
-projects/configs/stage2_e2e_lidar/base_e2e_lidar_turnaware_loss.py
+projects/configs/stage2_e2e_lidar/base_e2e_lidar_turnloss.py
 ```
 
 对比：
 
 ```text
-base_e2e_lidar_turnaware.py
+base_e2e_lidar.py
 ```
 
-这样只看 loss 改动，不混入地图和新 anchor。
+这样只看 loss 改动，不混入地图和 turn-aware anchor。
 
 重点观察：
 
@@ -244,21 +300,29 @@ base_e2e_lidar_turnaware.py
 - `wrong_mode` failure 数量；
 - top1FDE 与 minFDE 的 gap 是否缩小。
 
+如果这一步有效，再把同一套 loss 放到 turn-aware anchor 上，跑：
+
+```text
+projects/configs/stage2_e2e_lidar/base_e2e_lidar_turnaware_turnloss.py
+```
+
+这样才能区分“loss 有效”还是“old anchor 偶然更适配”。
+
 ### 5.2 第二组：验证 weak map 是否比 hard map 更合理
 
 如果 no-map loss 有收益，再跑：
 
 ```text
-base_e2e_lidar_HDMap_loss.py
-base_e2e_lidar_HDMap_weak_loss.py
+deferred/base_e2e_lidar_HDMap_turnloss.py
+deferred/base_e2e_lidar_HDMap_weak_turnloss.py
 ```
 
 重点比较：
 
 ```text
-base_e2e_lidar_turnaware_loss.py
-base_e2e_lidar_HDMap_loss.py
-base_e2e_lidar_HDMap_weak_loss.py
+base_e2e_lidar_turnloss.py
+deferred/base_e2e_lidar_HDMap_turnloss.py
+deferred/base_e2e_lidar_HDMap_weak_turnloss.py
 ```
 
 这样可以判断地图到底是帮助 motion，还是对非地图约束车辆造成干扰。
@@ -268,13 +332,13 @@ base_e2e_lidar_HDMap_weak_loss.py
 如果 loss 方向正确，再跑：
 
 ```text
-base_e2e_lidar_stratified_k6_loss.py
+deferred/base_e2e_lidar_stratified_k6_turnloss.py
 ```
 
 对比：
 
 ```text
-base_e2e_lidar_turnaware_loss.py
+base_e2e_lidar_turnloss.py
 ```
 
 这样只看 stratified anchor 相对 weighted-kmeans anchor 是否继续提升。
@@ -397,7 +461,7 @@ base_e2e_lidar.py vs base_e2e_lidar_HDMap.py
 | old anchor 下地图有没有用 | `base_e2e_lidar.py` vs `base_e2e_lidar_HDMap_old_anchor.py` |
 | turn-aware anchor 下地图有没有用 | `base_e2e_lidar_turnaware.py` vs `base_e2e_lidar_HDMap.py` |
 | weak map 是否更合理 | `base_e2e_lidar_HDMap.py` vs `base_e2e_lidar_HDMap_weak.py` |
-| 新 loss 下地图有没有用 | `base_e2e_lidar_turnaware_loss.py` vs `base_e2e_lidar_HDMap_loss.py` vs `base_e2e_lidar_HDMap_weak_loss.py` |
+| 新 loss 下地图有没有用 | `base_e2e_lidar_turnloss.py` vs `deferred/base_e2e_lidar_HDMap_turnloss.py` vs `deferred/base_e2e_lidar_HDMap_weak_turnloss.py` |
 
 ## 9. 当前结论
 
@@ -406,7 +470,7 @@ base_e2e_lidar.py vs base_e2e_lidar_HDMap.py
 1. 原始 anchor 对港口转弯车辆覆盖不足。
 2. weighted turn-aware anchor 对 `mild_turn` 有明确收益，但对 `sharp_turn` 还不稳定。
 3. 单纯换 anchor 不够，必须配合 loss 的 mode assignment 和 turn 样本加权。
-4. 港口导航地图应该作为弱先验，而不是所有车辆的强约束。
+4. 当前这版 hard HDMap 没有给 motion 带来稳定正收益，尤其在 turn-aware anchor 下还会拉大 minFDE；更合理的是把地图作为弱先验继续试。
 5. 后续判断改动是否有效，不能只看整体 minADE/minFDE，必须结合 turn-bucket 和 failure mining。
 
 ## 10. 下一步建议
@@ -414,20 +478,26 @@ base_e2e_lidar.py vs base_e2e_lidar_HDMap.py
 优先训练：
 
 ```text
-base_e2e_lidar_turnaware_loss.py
+base_e2e_lidar_turnloss.py
 ```
 
-如果 `wrong_mode` 明显减少、top1FDE 接近 minFDE，再继续看地图：
+如果 `wrong_mode` 明显减少、top1FDE 接近 minFDE，再训练组合版：
 
 ```text
-base_e2e_lidar_HDMap_loss.py
-base_e2e_lidar_HDMap_weak_loss.py
+base_e2e_lidar_turnaware_turnloss.py
+```
+
+如果组合版仍然有效，再继续看地图：
+
+```text
+deferred/base_e2e_lidar_HDMap_turnloss.py
+deferred/base_e2e_lidar_HDMap_weak_turnloss.py
 ```
 
 如果 `poor_oracle` 仍然很多，再训练：
 
 ```text
-base_e2e_lidar_stratified_k6_loss.py
+deferred/base_e2e_lidar_stratified_k6_turnloss.py
 ```
 
 这样每一步都能回答一个明确问题：
