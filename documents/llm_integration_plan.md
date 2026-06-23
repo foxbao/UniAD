@@ -452,7 +452,9 @@ motion traj_query             ├─► Projector (MLP, 256 → d_llm) ─► [N
 **B. 评估指标**（已落地 `tools/analysis_tools/eval_llm_caption.py`）：
    规则解析 caption → 关键语义命中率（conflict 类别/方位、TTC 桶、ego_advice、activity、幻觉），
    主对 geo_facts。baseline：`template`（几何直出，floor）/`teacher`（VLM summary，蒸馏上限）
-   已可跑；`model`/`shuffle`/`noquery` 待训练出 checkpoint 后接（forward_test 逐帧）。
+   已可跑；`model`/`shuffle`/`noquery` **已实现**（`_run_model_captions`：建 detector+ckpt、
+   跑 dataloader 时用 wrapper 抓每帧 (query,centres)，再按 mode 生成；shuffle 错位的是 query 不是 GT）。
+   需 `--config --checkpoint` + `PYTHONPATH=$(pwd)`，待训练出 ckpt 后跑。**尚未端到端验证**（无 ckpt）。
    - ⚠️ **走过的弯路（已纠正，复现必读）**：曾以为 activity 召回低的根因是"门控把后方目标也
      标了、前视相机看不到"，于是把 activity_gate **收紧到只对前视扇区**（_FRONT_SECTORS +
      gate_visible_m）。方向错了——正解不是"剔掉后方目标"，而是**上 6 路环视让后方目标可见**。
@@ -489,7 +491,10 @@ motion traj_query             ├─► Projector (MLP, 256 → d_llm) ─► [N
      （清掉"向锥桶让行"的误导帧）、conflict/ttc/halluc 不变。
    - 📊 **三轮演进汇总**（val teacher，activity_addressed）：单front 17.0% → 6cam-only-AOI 37.3%
      → 6cam+gate入prompt 69.4% → +排除非作业类 **74.5%**。幻觉稳定 ~96%（无幻觉率）。
-   - `shuffle` 对照（query 配错帧）是证伪试金石：若打乱后命中不掉 = LLM 没真用 LiDAR query。
+   - `shuffle` 对照（用错位帧的 query 生成、对本帧 GT 评分）是证伪试金石：若打乱后命中不掉 =
+     LLM 没真用 LiDAR query、只靠语言先验/类别分布。**判决标准**：`model > template` 且
+     `model >> shuffle/noquery` → 方案站住（head 真读了 query）；若 `shuffle ≈ model` → 蒸馏没迁移，
+     应收缩为结构化语义 head、LLM 只做自然语言表达。这是训练后下结论的**唯一硬判据**（不是 loss）。
 
 **C. 优先改进**：
    - **(高) 提升 VLM activity 召回** — ✅ 已根治：6 路环视 + 评测指标修正 + gate 目标入 prompt
