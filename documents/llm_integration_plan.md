@@ -1,6 +1,8 @@
 # LiDAR UniAD 端到端 + LLM 集成方案
 
 > 讨论记录 / 2026-06-19。基线 config: `projects/configs/stage2_e2e_lidar/base_e2e_lidar_occ.py`。
+> 当前主线 / 2026-06-23：Stage-1 纯探针 `projects/configs/stage2_e2e_lidar/base_e2e_lidar_llm_probe.py`。
+> 旧 `base_e2e_lidar_occ_llm_train.py` 是 full-task 共训历史实验，不再作为当前首选训练入口。
 > 目标场景：自有数据集（港口 / 集装箱场），13 类（IGV、Crane、Forklift、Truck 等）。
 
 ---
@@ -16,6 +18,11 @@
 LLM（Qwen2.5-0.5B），让它**推理时仅凭 LiDAR query** 就能说出图像老师才看得到的语义。推理零图像依赖，
 不动现有 LiDAR 链路。（注：早期落地先只用 front，后因后方/侧方作业目标看不见导致 activity 召回偏低，
 已改为 6 路环视，见 4.3-B。）
+
+2026-06-23 收敛后的当前阶段是 **Stage-1 纯探针**：冻结 UniAD LiDAR 感知栈，只训练
+`LLMBridgeHead`（Projector + LoRA），并把 LLM 输入 query/center detach，回答一个更干净的问题：
+**冻结后的 LiDAR object query 里是否已经含有足够语义，让小 LLM 复现 VLM 老师 caption？**
+这一步暂不追求反哺检测、预测、占据或规划。
 
 数据流两步走：**几何事实生成**（`gen_geo_facts.py`，从 GT 算出 `info['geo_facts']`，产物 pkl 后缀 `_geo`）
 → **VLM caption 生成**（`gen_vlm_caption.py`，VLM 看图 + 读 geo_facts 出中文 summary，
@@ -54,7 +61,7 @@ pip install "transformers==4.57.6" accelerate qwen-vl-utils modelscope pillow
 - **相机**：磁盘有 6 路环视去畸变图（front/left_front/left_rear/rear/right_front/right_rear），
   路径 `data/kl_8/v1.0-trainval/sample/<scene_token>/camera_undist/<view>_image/<ts>.jpg`，
   ~87 万张。**但原始 pkl 未关联相机**（建库 cfg `projects/KL8/configs/kl8_lidar_bevformer.py`
-  里 `camera_processing_cfg.enable=False`）。本方案先只用 **front**。
+  里 `camera_processing_cfg.enable=False`）。早期只用 **front**，当前 VLM caption 已改为 6 路环视按目标方位路由。
 - 13 类（post label_mapping）：0 行人 / 1 小车 / 2 满载IGV / 3 卡车 / 4 空挂车 / 5 满载挂车 /
   6 空载IGV / 7 吊机 / 8 其他车辆 / 9 锥桶 / 10 集装箱叉车 / 11 叉车 / 12 轮胎吊。
 - `gt_fut_traj_locs` / `gt_track_traj_locs` 约定（已验证）：**相对自身当前位置的累积位移**，
@@ -134,7 +141,7 @@ python tools/data_converter/merge_summaries.py \
 
 ## 0.6 已知问题 / 待办
 
-- **流水线 Step 1~5 + LLMBridgeHead 已全跑通**（截至 2026-06-22）：
+- **流水线 Step 1~5 + LLMBridgeHead 已全跑通**（截至 2026-06-23）：
   - 数据：6 路环视 val 子集 **v3** `data/kl_8/kl_infos_val_sub6cam_v3_vlmcap.pkl`（805 帧, 797 带 summary；
     全为稀有帧，gate 已排除非作业类）。v1/v2 子集与旧单 front `kl_infos_val_sub1k_vlmcap.pkl` 仅作历史对比。
     ⚠️ **子集帧数 ≠ 实际 eval queue 数**：make_subset 按稀有性挑帧，prev/next 可能落在子集外，
@@ -145,23 +152,29 @@ python tools/data_converter/merge_summaries.py \
     （train 43981 帧，6 路各 valid 98.45%~98.61%；2026-06-22 重做并排除非作业类 gate）。
   - **train 全量 caption 已完成**：7 卡分片跑 ~2.2h → merge → `kl_infos_train_vlmcap.pkl`
     （43747/43981=99.5% 带 summary）。
-  - 模型：`LLMBridgeHead` + config `base_e2e_lidar_occ_llm.py` smoke test 通过
-    （caption 注入、llm.loss_llm 有限、与 track/motion/occ 共存、backward OK）。详见第 7 步。
+  - 模型：`LLMBridgeHead` 已支持两种接线：
+    1) 历史 full-task 分支 `base_e2e_lidar_occ_llm*.py`，与 track/map/motion/occ 共训；
+    2) 当前 Stage-1 纯探针 `base_e2e_lidar_llm_probe.py`，继承 `base_e2e_lidar.py`，冻结非 LLM 模块，
+    只训练 `llm_head.*`，并 `detach_inputs=True` 断开 LLM loss 到感知 query 的梯度。详见 3.3 / 3.4。
   - 评估：`eval_llm_caption.py` template/teacher 可跑；activity 拆为 addressed/busy（见 4.3-B）。
     6 路 + gate 入 prompt + 排除非作业类后 teacher activity_addressed **74.5%**（单 front 17.0%）。
-- **正式训练待办**（第 8 步）：
+- **训练状态 / 下一步**：
   - (0) ✅ train pkl 已重做 6 相机 + gate 清理（2026-06-22）。
   - (1) ✅ 7 卡分片 caption 已完成（~2.2h，43747 帧带 summary）。
-  - (2) ✅ merge → `kl_infos_train_vlmcap.pkl`；正式 config `base_e2e_lidar_occ_llm_train.py`
-    （train→该 pkl，val/test→v3 子集）已建并验证。
-  - (3) ⏳ **待跑正式训练**：`uniad_dist_train.sh base_e2e_lidar_occ_llm_train.py <GPUS>`。详见 4.3-A。
+  - (2) ✅ merge → `kl_infos_train_vlmcap.pkl`；训练/评测数据已就绪。
+  - (3) ✅ 历史 full-task `base_e2e_lidar_occ_llm_train.py` 已跑 1 epoch，证明能输出中文 caption，
+    但 `model≈shuffle`，没有证据表明它读到了同帧 query 语义；且主任务指标有退化。见 4.1 / 4.3-B。
+  - (4) ✅ 当前 Stage-1 纯探针代码已落地并 smoke 通过：`base_e2e_lidar_llm_probe.py` 只训练
+    `llm_head.*`，单 batch forward/backward OK。
+  - (5) ⏳ **待跑当前主线训练**：`uniad_dist_train.sh base_e2e_lidar_llm_probe.py <GPUS>`。详见 4.3-A。
 - 文件清单（本方案新增）：
   `tools/data_converter/{add_cam_sync,gen_geo_facts,make_subset,gen_vlm_caption,merge_summaries}.py`、
   `tools/run_vlm_caption_train_7gpu.sh`（7 卡并行 VLM caption）、
   `tools/analysis_tools/eval_llm_caption.py`（caption 质量评测）、
   `projects/mmdet3d_plugin/uniad/dense_heads/llm_bridge_head.py`、
   `projects/configs/stage2_e2e_lidar/base_e2e_lidar_occ_llm.py`（smoke）、
-  `projects/configs/stage2_e2e_lidar/base_e2e_lidar_occ_llm_train.py`（正式训练）、本文档。
+  `projects/configs/stage2_e2e_lidar/base_e2e_lidar_occ_llm_train.py`（历史 full-task 训练）、
+  `projects/configs/stage2_e2e_lidar/base_e2e_lidar_llm_probe.py`（当前 Stage-1 纯探针）、本文档。
 
 ---
 
@@ -252,20 +265,24 @@ front，后已改 6 路环视，见 4.3-B**），
 
 ### 3.1 模型侧设计
 
-新增一个 **LLM bridge head**，与 motion/occ 并列，挂在 detector 上：
+新增一个 **LLM bridge head**，挂在 detector 上。当前保留两种接线：
+
+1. **Stage-1 纯探针（当前主线）**：只用 `forward_track_train` 产出的
+   `outs_track['track_query_embeddings']` + box center，冻结全部非 LLM 模块，只训练 `llm_head.*`。
+2. **full-task 分支（历史实验）**：与 track/map/motion/occ 共训，用于保留对照，不再作为当前首选入口。
 
 ```
-track_query [num_tracks,256]  ┐
-motion traj_query             ├─► Projector (MLP, 256 → d_llm) ─► [N object tokens]
-(+ box 中心做空间编码)         ┘                                      │
-                                                                     ▼
+track_query_embeddings [num_tracks,256] ┐
+(+ box 中心做空间编码)                   ├─► Projector (MLP, 256 → d_llm) ─► [N object tokens]
+motion track_query（仅 fallback/历史分支）┘                                      │
+                                                                               ▼
                           [prompt tokens] ⊕ [object tokens] ─► LLM ─► 文本(老师标签)
 ```
 
 - **底座**：Qwen2.5-0.5B（d_llm=896），中文友好、单卡可 LoRA、最有上车可能（虽暂不上车）。
 - **Projector**：小 MLP，256 → 896，每个 agent 一个 token。
 - **空间编码**：box 中心 (x,y,z)（来自 `track_bbox_results[0][0].gravity_center`）→ MLP → 加到 token，给 LLM 空间先验。
-- **训练**：冻结 LLM 主干（BEV 也已冻结），只训 Projector + LoRA。LM loss(teacher forcing)。
+- **训练**：冻结 LLM 主干，只训 Projector + LoRA。Stage-1 纯探针还会冻结 UniAD 感知栈并 detach 输入 query。
 - **token 数**：agent 数不定，截断/padding 到 `max_agents`，截断要 log。
 
 
@@ -274,7 +291,7 @@ motion traj_query             ├─► Projector (MLP, 256 → d_llm) ─► [N
 | 路线 | 来源 | 内容 | 前置成本 |
 |------|------|------|----------|
 | **几何模板** | 现有 GT 框/轨迹合成 | 确定性事实：方位/距离、运动状态、ego×agent 轨迹冲突/让行、是否在可行驶区 | 低，直接可做 |
-| **VLM 图像**（主线） | Qwen2.5-VL 看 front 图 | 作业状态、满载/空载（粗）、吊机工作/空闲 | 中，需先做图像↔LiDAR 同步（已验证轻量） |
+| **VLM 图像**（主线） | Qwen2.5-VL 看 6 路环视路由图 | 作业状态、满载/空载（粗）、吊机工作/空闲 | 中，需先做图像↔LiDAR 同步（已验证轻量） |
 
 - 最终监督 = 几何精确空间/冲突事实 ⊕ VLM 场景语义，合并成每帧的 caption。
 - VLM caption 生成时让模型同时吃几何步骤的结构化事实文本作为 prompt 约束，减少幻觉、对齐到 ego 视角。
@@ -310,7 +327,7 @@ motion traj_query             ├─► Projector (MLP, 256 → d_llm) ─► [N
 
 - **训练目标**：仅 **scene-level `summary`** 自由文本（一句/几句中文）。
   per-agent 结构化字段暂不作为输出目标（将来要 grounding 再加）。
-- **生成方式 (a)**：几何模板拼几何事实 → Qwen2.5-VL 看 front 图 **改写润色 + 补作业/载货语义** →
+- **生成方式 (a)**：几何模板拼几何事实 → Qwen2.5-VL 看 6 路环视路由图 **改写润色 + 补作业/载货语义** →
   自然中文 summary。VLM 只负责"看图补语义 + 说人话"，几何事实由几何步骤保证准确，防幻觉。
 - **scene-level 字段**（几何步骤先算，作为 VLM 的 prompt 约束 + summary 的事实底料）：
   `agents_of_interest`（对 ego 最相关的 id）、`ego_advice`（keep/yield/slow/stop，由冲突导出）、
@@ -326,27 +343,22 @@ motion traj_query             ├─► Projector (MLP, 256 → d_llm) ─► [N
 ### 3.3 落点（代码）
 
 - 新 detector head：`llm_bridge_head.py`（`LLMBridgeHead`，`@HEADS.register_module()`）。
-- detector 接线：`uniad_motion_lidar.py` 的 `forward_train` / `simple_test`，调用点在 motion 之后，
-  把 `outs_motion` + `outs_track` 都传给 llm_head；但 head 内 `_agent_query` **优先用
-  `outs_track['track_query_embeddings']`**（与 box center 同源同序，见 3.3 末"query/center 对齐"），
-  `outs_motion['track_query']` 仅作 fallback。注意 `simple_test` 里要在剥离
+- detector 接线：`uniad_motion_lidar.py` 的 `forward_train` / `simple_test`。head 内 `_agent_query`
+  **优先用 `outs_track['track_query_embeddings']`**（与 box center 同源同序，见 3.3 末
+  "query/center 对齐"），`outs_motion['track_query']` 仅作 fallback。注意 `simple_test` 里要在剥离
   `track_bbox_results`/`track_query_embeddings` 的 cleanup **之前** 调用。
-- config：新建 `base_e2e_lidar_occ_llm.py` 继承 `base_e2e_lidar_occ`，加 `llm_head` 与
-  `task_loss_weight['llm']`。caption 不走 pipeline 的 Collect key，而是数据集
-  （`kl_dataset.py` `_union2one`）把 `gt_caption` 注入当前帧的 **img_metas**，detector
-  （`uniad_motion_lidar.py` `_current_caption`）从 img_metas 取出喂 llm_head。
-  - **为什么继承 `base_e2e_lidar_occ`**：这是继承链
-    `base_track_lidar`(track) → `base_track_drivable_lidar`(+map seg) → `base_e2e_lidar`(+motion，
-    冻结 BEV) → `base_e2e_lidar_occ`(+occ) 的**顶端、感知最全的基线**。LLMBridgeHead 吃
-    `outs_motion['track_query']` + box center，监督信号 `geo_facts` 来自多 agent 轨迹+占据语义，
-    所以要站在 track+map+motion+occ 都齐全的模型上 query 才有料；继承更低层会缺 motion/occ、
-    head 直接拿不到输入。继承它还自动复用 stage2 的冻结策略（`freeze_lidar_backbone/bev_encoder`）。
-    注：occ config 未启用 planning，故 LLM 站在 track+map+motion+occ 之上、不含 plan。
-  - **感知底座 ckpt**：正式 config `_train` 的 `load_from` 指向
-    `base_e2e_lidar_occ/latest.pth`(=epoch_4)——已训练收敛的端到端权重（occ.loss_dice 0.99→0.14、
-    motion.loss_traj 0.55→0.44，5 epoch）。该 ckpt 用旧 `kl_infos_train.pkl`(单front)训，但只提供
-    点云感知主干（与相机/caption/gate 无关），LLM 训练时全部冻结，故配新 caption pkl 自洽。
-    （smoke config 用 stage-1 drivable ckpt 仅为快速验证 llm forward/loss。）
+- config 分两类：
+  - **当前 Stage-1 纯探针**：`base_e2e_lidar_llm_probe.py` 继承 `base_e2e_lidar.py`，而不是
+    `base_e2e_lidar_occ.py`。原因是当前问题只问"冻结 track query 是否含有可读语义"，LLMBridgeHead
+    主输入是 `track_query_embeddings + box center`，不依赖 occ 输出。去掉 occ 可以降低耦合，避免把下游
+    task 变化误判成 LLM 证据。关键开关：`llm_probe_only=True`、`freeze_non_llm=True`、
+    `llm_head.detach_inputs=True`、`task_loss_weight=dict(track=0,map=0,motion=0,llm=1)`。
+    `load_from` 指向 `base_e2e_lidar/latest.pth`，作为冻结 LiDAR query 特征提取器。
+  - **历史 full-task 分支**：`base_e2e_lidar_occ_llm.py` / `_train.py` 继承 `base_e2e_lidar_occ`，
+    与 track/map/motion/occ 共训。它验证了工程链路能跑通，但不是当前最干净的探针入口。
+    旧说法"必须继承 occ 顶端才有料"已被修正：对 Stage-1 探针而言不成立。
+- caption 不走 pipeline 的 Collect key，而是数据集（`kl_dataset.py` `_union2one`）把 `gt_caption`
+  注入当前帧的 **img_metas**，detector（`uniad_motion_lidar.py` `_current_caption`）从 img_metas 取出喂 llm_head。
 - 数据：图像同步脚本（补相机路径）+ 几何模板生成 + VLM caption 生成，产出每帧 caption，存入 pkl/sidecar。
 - **query/center 对齐（2026-06-23 修）**：LLM 的 per-agent query 与 box center 必须 1:1 对应。
   曾用 `outs_motion['track_query']` 当 query、`outs_track['track_bbox_results']` 当 center——但
@@ -357,9 +369,15 @@ motion traj_query             ├─► Projector (MLP, 256 → d_llm) ─► [N
 
 ### 3.4 训练策略
 
-- 阶段化：感知全冻结（BEV 已冻结），只训 Projector + LoRA，保护感知不被语言 loss 破坏。
-- loss：LM loss 经 `loss_weighted_and_prefixed(prefix='llm')` 与现有 task loss 合并。
-- 验证：先小规模（少量帧 + 0.5B）跑通前向 + loss 下降，再扩。
+- **Stage-1 纯探针（当前主线）**：冻结 UniAD LiDAR 感知栈，只训练 `llm_head.*`
+  （Projector / spatial PE / LoRA）。这一步不反哺检测、map、motion、occ 或 planning。
+- 三层隔离：
+  1) `freeze_non_llm=True`：`UniADMotionLidar.train()` 每次切 train mode 后重新冻结所有非 `llm_head` 子模块；
+  2) `llm_probe_only=True`：`forward_train` 跑完 track 取 query 后，直接只返回 `llm.loss_llm`；
+  3) `detach_inputs=True`：`LLMBridgeHead._object_tokens` 对 query/center detach，断开 LLM loss 到感知 query 的梯度。
+- loss：Stage-1 只优化 `llm.loss_llm`。full-task 历史分支仍可把 LM loss 经
+  `loss_weighted_and_prefixed(prefix='llm')` 与现有 task loss 合并，但不作为当前结论依据。
+- 验证：先看 LLM caption 指标的 `model > shuffle/noquery` 是否成立，再考虑结构化特征、更多 token 或任务反哺。
 
 ### 3.5 待定 / 风险
 
@@ -383,16 +401,20 @@ motion traj_query             ├─► Projector (MLP, 256 → d_llm) ─► [N
 6. ✅ VLM caption 多相机化：`gen_vlm_caption.py`，prompt 设计 + 按方位路由 2-4 路环视 +
    6 路 val 子集批量生成（805 帧，797 带 summary）。teacher activity_addressed 17%→74.5%（见 4.3-B）。
    见 0.4 Step 4 与 4.3-B。
-7. ✅ `LLMBridgeHead` + config + smoke test（2026-06-22）：caption 注入正确、
-   llm.loss_llm 有限（≈5.2~5.7）、与 track/motion/occ 共存、backward OK。
-   实现细节见 3.1 / 3.3；代码 `llm_bridge_head.py`、`uniad_motion_lidar.py`、
-   `kl_dataset.py`、config `base_e2e_lidar_occ_llm.py`。
+7. ✅ `LLMBridgeHead` + config + smoke test（2026-06-22~23）：caption 注入正确、
+   llm.loss_llm 有限；历史 full-task 分支可与 track/motion/occ 共存；当前 Stage-1 probe 分支只返回
+   `llm.loss_llm` 且 backward OK。实现细节见 3.1 / 3.3；代码 `llm_bridge_head.py`、
+   `uniad_motion_lidar.py`、`kl_dataset.py`、config `base_e2e_lidar_occ_llm.py` /
+   `base_e2e_lidar_llm_probe.py`。
 8. ✅ train 全量 caption（2026-06-22）：7 卡分片 ~2.2h（错开启动避 OOM，见 4.2）→ merge →
-   `kl_infos_train_vlmcap.pkl`（43747/43981=99.5% 带 summary）。正式 config
-   `base_e2e_lidar_occ_llm_train.py` 已建并验证（train→该 pkl，val/test→v3 子集）。
-   **单卡 smoke 验证通过**（2026-06-22）：occ ckpt 正确加载（occ.loss_dice 一上来即 0.14 收敛值）、
-   `llm.loss_llm` 有限且下降（2.73→1.70）、track/map/motion/occ/llm 全 task 共存、forward+backward
-   无报错。**下一步：手动起多卡正式训练**（4.3-A (4)）。
+   `kl_infos_train_vlmcap.pkl`（43747/43981=99.5% 带 summary）。val/test 使用
+   `kl_infos_val_sub6cam_v3_vlmcap.pkl`。
+9. ✅ 历史 full-task `base_e2e_lidar_occ_llm_train.py` 已训练 1 epoch（2026-06-23）：
+   `llm.loss_llm` 下降并能输出中文，但 caption 评测 `model≈shuffle`，没有证明模型使用了同帧 query；
+   且主任务指标较 LiDAR baseline 退化。该分支保留为历史对照，不作为当前主线。
+10. ✅ 当前 Stage-1 纯探针 `base_e2e_lidar_llm_probe.py` 已落地并验证（2026-06-23）：
+    继承 `base_e2e_lidar.py`，`llm_probe_only=True`、`freeze_non_llm=True`、`detach_inputs=True`；
+    构建检查只剩 `llm_head.*` 可训练，单 batch forward/backward OK。**下一步：起 probe 多卡训练**（4.3-A）。
 
 ### 4.2 经验教训（踩过的坑，复现必读）
 
@@ -419,42 +441,31 @@ motion traj_query             ├─► Projector (MLP, 256 → d_llm) ─► [N
 
 ### 4.3 下一步（待办）
 
-**A. 正式训练**。(0)(1)(2) 均已于 2026-06-22 完成，命令留作复现记录；当前只剩 (4) 跑训练。
+**A. Stage-1 纯探针训练（当前主线）**。数据准备已完成，当前要跑的是 probe config，而不是历史
+`base_e2e_lidar_occ_llm_train.py`。
    ```bash
-   # (0) ✅ 已完成：train pkl 重做成 6 相机 + gate 排除非作业类。下面两条是当时所跑（留作记录）。
-   #     ⚠️ add_cam_sync 的 --views 默认只有 front，6 路必须显式传全部 6 个磁盘视角名。
-   #     当前 kl_infos_train_with_cam_geo.pkl 已是 6 路+gate清理，可跳过直接到 (4)。
-   python tools/data_converter/add_cam_sync.py \
-     --pkl-path data/kl_8/kl_infos_train.pkl \
-     --out-path data/kl_8/kl_infos_train_with_cam.pkl \
-     --views front left_front left_rear rear right_front right_rear
-   python tools/data_converter/gen_geo_facts.py \
-     --pkl-path data/kl_8/kl_infos_train_with_cam.pkl \
-     --conflict-dist 4.0 --gate-static-s 2.0 --gate-crane-m 30.0
-   #     -> data/kl_8/kl_infos_train_with_cam_geo.pkl（含 6 路 + geo_facts）
-   # (1) ✅ 已完成：7 卡并行 train 全量 caption（~2.2h；占 GPU1-7，留 GPU0）。
-   #     脚本错开启动避 OOM（见 4.2），无需 --views（相机自动路由）。
-   bash tools/run_vlm_caption_train_7gpu.sh
-   # (2) ✅ 已完成：合并 7 片 sidecar 回 train pkl（43747/43981=99.5% 带 summary）。
-   python tools/data_converter/merge_summaries.py \
-     --pkl-path data/kl_8/kl_infos_train_with_cam_geo.pkl \
-     --json-path /tmp/train_vlmcap_summaries.shard*of7.json \
-     --out-path data/kl_8/kl_infos_train_vlmcap.pkl
-   # (3) ✅ 正式 config base_e2e_lidar_occ_llm_train.py 已建并验证
-   #     （train→kl_infos_train_vlmcap.pkl, val/test→kl_infos_val_sub6cam_v3_vlmcap.pkl）。
-   #     smoke config base_e2e_lidar_occ_llm.py 不动。
-   # (4) ⏳ 待跑：正式训练
+   # train pkl、val v3 pkl、caption sidecar 合并均已完成；只需启动当前主线训练。
    ./tools/uniad_dist_train.sh \
-     projects/configs/stage2_e2e_lidar/base_e2e_lidar_occ_llm_train.py <GPUS>
+     projects/configs/stage2_e2e_lidar/base_e2e_lidar_llm_probe.py <GPUS>
    ```
-   注意：(0)~(3) 已完成，只剩 (4)。正式训练用 `_train` config，smoke config 保持只指向 val 子集不动。
+   单卡调试可用：
+   ```bash
+   CUDA_VISIBLE_DEVICES=0 python tools/train.py \
+     projects/configs/stage2_e2e_lidar/base_e2e_lidar_llm_probe.py \
+     --work-dir projects/work_dirs/stage2_e2e_lidar/base_e2e_lidar_llm_probe \
+     --no-validate
+   ```
+   历史 full-task 命令
+   `uniad_dist_train.sh projects/configs/stage2_e2e_lidar/base_e2e_lidar_occ_llm_train.py <GPUS>`
+   仅作对照复现，不再作为当前建议入口。
 
 **B. 评估指标**（已落地 `tools/analysis_tools/eval_llm_caption.py`）：
    规则解析 caption → 关键语义命中率（conflict 类别/方位、TTC 桶、ego_advice、activity、幻觉），
    主对 geo_facts。baseline：`template`（几何直出，floor）/`teacher`（VLM summary，蒸馏上限）
    已可跑；`model`/`shuffle`/`noquery` **已实现**（`_run_model_captions`：建 detector+ckpt、
    跑 dataloader 时用 wrapper 抓每帧 (query,centres)，再按 mode 生成；shuffle 错位的是 query 不是 GT）。
-   需 `--config --checkpoint` + `PYTHONPATH=$(pwd)`，待训练出 ckpt 后跑。**尚未端到端验证**（无 ckpt）。
+   需 `--config --checkpoint` + `PYTHONPATH=$(pwd)`。历史 full-task ckpt 已跑过一次；当前 Stage-1
+   probe ckpt 还待训练后正式评测。
    - ⚠️ **走过的弯路（已纠正，复现必读）**：曾以为 activity 召回低的根因是"门控把后方目标也
      标了、前视相机看不到"，于是把 activity_gate **收紧到只对前视扇区**（_FRONT_SECTORS +
      gate_visible_m）。方向错了——正解不是"剔掉后方目标"，而是**上 6 路环视让后方目标可见**。
@@ -498,11 +509,25 @@ motion traj_query             ├─► Projector (MLP, 256 → d_llm) ─► [N
      ③ geometry 指标（conflict_cls/bearing/ttc）不明显崩——注意 template 在这些上是**规则上限**，
      model 不必全面超过它，持平即可；④ halluc（无幻觉率）不明显恶化。
      若 `shuffle ≈ model` → 蒸馏没迁移，应收缩为结构化语义 head、LLM 只做自然语言表达。
+   - ⚠️ **历史 full-task epoch1 结论（2026-06-23）**：`llm.loss_llm` 从约 2.43 降到约 0.66，
+     但 loss 下降不等于 query 语义迁移。`--limit 50` caption 评测中，`model` 与 `shuffle`
+     基本相同：`activity_addressed=0.680`、`advice=0.700`，而 `noquery` 退化为
+     `activity_addressed=0.000`、`advice=1.000`。说明 object tokens 相比 noquery 有用，
+     但没有证据表明模型使用了**同帧** query 语义。该 ckpt 的中文可视化在
+     `projects/work_dirs/stage2_e2e_lidar/base_e2e_lidar_occ_llm_train/llm_caption_vis/`，
+     现象是能输出中文，但有重复、套话和空间事实偏差。
+   - ⚠️ **历史 full-task 对主任务有扰动**：epoch1 val 指标为 `mAP=0.8033`、`NDS=0.8102`、
+     `AMOTA=0.7238`、`motion_min_ade=0.4246`、`motion_mr=0.1364`；相比 LiDAR baseline
+     （约 `mAP=0.8362`、`NDS=0.8449`、`AMOTA=0.8199`、`motion_min_ade=0.3505`、
+     `motion_mr=0.0868`）明显退化。这是改成 Stage-1 冻结纯探针的重要原因。
    - ⚠️ **同帧对比**：model 系只跑 queue-able 子集（v3 805→438 帧，dataloader 序），与 template/teacher
      的全量 805 帧**分母不同**。下结论前必须给 template/teacher 加 `--queue-eval --config <cfg>`
      在同一批 438 帧上重算（实测 teacher activity_addressed 全量 0.745、queue-eval 0.778——上限是 0.778）。
 
 **C. 优先改进**：
+   - **(最高) 跑 Stage-1 纯探针并做 model/shuffle/noquery 同帧评测**：这是当前能否成立的决定性实验。
+     只有 `base_e2e_lidar_llm_probe.py` 的 `model` 明显高于 `shuffle/noquery`，才能说 frozen LiDAR query
+     里有可被 LLM 读出的场景语义。
    - **(高) 提升 VLM activity 召回** — ✅ 已根治：6 路环视 + 评测指标修正 + gate 目标入 prompt
      + 排除非作业类，activity_addressed 17%→74.5%（见 B）。train pkl 已是 6 路+gate已清理，可直接跑全量。
    - ✅ **gate 误标非作业类（已做，2026-06-22）**：`_NO_ACTIVITY_IDS={0,1,9}` 排除锥桶/行人/小车

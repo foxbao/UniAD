@@ -40,6 +40,7 @@ class LLMBridgeHead(BaseModule):
                  max_text_len=128,
                  prompt='请用一句话描述本车周围的港口场景。',
                  loss_weight=1.0,
+                 detach_inputs=False,
                  init_cfg=None):
         super().__init__(init_cfg=init_cfg)
         self.llm_name = llm_name
@@ -56,6 +57,7 @@ class LLMBridgeHead(BaseModule):
         self.max_text_len = max_text_len
         self.prompt = prompt
         self.loss_weight = loss_weight
+        self.detach_inputs = detach_inputs
 
         self.projector = nn.Sequential(
             nn.Linear(in_channels, d_llm), nn.GELU(), nn.Linear(d_llm, d_llm))
@@ -145,6 +147,10 @@ class LLMBridgeHead(BaseModule):
         """
         n = min(agent_query.size(0), self.max_agents)
         proj_dtype = self.projector[0].weight.dtype
+        if self.detach_inputs:
+            agent_query = agent_query.detach()
+            if centres is not None:
+                centres = centres.detach()
         q = agent_query[:n].to(device=device, dtype=proj_dtype)
         tokens = self.projector(q)
         if self.use_spatial_pe and centres is not None and n > 0:
@@ -227,5 +233,4 @@ class LLMBridgeHead(BaseModule):
             eos_token_id=self.tokenizer.eos_token_id)
         return self.tokenizer.batch_decode(
             gen, skip_special_tokens=True)[0].strip()
-
 

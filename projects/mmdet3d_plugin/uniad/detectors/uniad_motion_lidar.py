@@ -17,6 +17,8 @@ class UniADMotionLidar(UniADTrackLidar):
                  llm_head=None,
                  task_loss_weight=None,
                  map_lane_encoder=None,
+                 llm_probe_only=False,
+                 freeze_non_llm=False,
                  **kwargs):
         super().__init__(**kwargs)
         self.motion_head = build_head(motion_head) if motion_head else None
@@ -26,6 +28,8 @@ class UniADMotionLidar(UniADTrackLidar):
         self.llm_head = build_head(llm_head) if llm_head else None
         self.task_loss_weight = task_loss_weight or dict(
             track=1.0, motion=1.0, occ=1.0, planning=1.0)
+        self.llm_probe_only = llm_probe_only
+        self.freeze_non_llm = freeze_non_llm or llm_probe_only
 
         # HD-map lane prior. It is a detector-level module (an external survey
         # input, not a perception output), encoding surveyed lanes into
@@ -39,6 +43,21 @@ class UniADMotionLidar(UniADTrackLidar):
                 pc_range=self.motion_head.pc_range,
                 embed_dims=self.motion_head.embed_dims,
                 **map_lane_encoder)
+        if self.freeze_non_llm:
+            self._freeze_non_llm_modules()
+
+    def _freeze_non_llm_modules(self):
+        """Freeze every detector child except the LLM probe head."""
+        for name, module in self.named_children():
+            if name == 'llm_head':
+                continue
+            self._freeze_modules([module])
+
+    def train(self, mode=True):
+        super().train(mode)
+        if self.freeze_non_llm:
+            self._freeze_non_llm_modules()
+        return self
 
     def _build_outs_map(self, bev_embed, ego2global):
         """Encode HD-map lanes for the current frame into an outs_map dict.
@@ -138,6 +157,17 @@ class UniADMotionLidar(UniADTrackLidar):
             for key, value in loss_dict.items()
         }
 
+    @staticmethod
+    def _sanitize_losses(losses):
+        sanitized_losses = {}
+        for key, value in sorted(losses.items()):
+            if not torch.isfinite(value).all():
+                raise FloatingPointError(
+                    f'Non-finite UniADMotionLidar loss in {key}: '
+                    f'{value.detach().cpu()}')
+            sanitized_losses[key] = value
+        return sanitized_losses
+
     def _current_frame_ego2global(self, img_metas):
         """Extract ego2global from img_metas for the current frame."""
         if img_metas is None:
@@ -235,6 +265,16 @@ class UniADMotionLidar(UniADTrackLidar):
             l2g_r_mat=l2g_r_mat,
             timestamp=timestamp,
             **kwargs)
+        if self.llm_probe_only:
+            if not self.with_llm_head:
+                raise RuntimeError('llm_probe_only=True requires llm_head.')
+            losses_llm = self.llm_head.forward_train(
+                None, outs_track=outs_track,
+                gt_caption=self._current_caption(img_metas))
+            losses.update(
+                self.loss_weighted_and_prefixed(losses_llm, prefix='llm'))
+            return self._sanitize_losses(losses)
+
         losses.update(
             self.loss_weighted_and_prefixed(losses_track, prefix='track'))
 
@@ -326,14 +366,7 @@ class UniADMotionLidar(UniADTrackLidar):
             losses.update(
                 self.loss_weighted_and_prefixed(losses_llm, prefix='llm'))
 
-        sanitized_losses = {}
-        for key, value in sorted(losses.items()):
-            if not torch.isfinite(value).all():
-                raise FloatingPointError(
-                    f'Non-finite UniADMotionLidar loss in {key}: '
-                    f'{value.detach().cpu()}')
-            sanitized_losses[key] = value
-        return sanitized_losses
+        return self._sanitize_losses(losses)
 
     def simple_test(self, points, img_metas, img=None, history_points=None,
                     **kwargs):
