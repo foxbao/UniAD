@@ -291,6 +291,27 @@ def _run_model_captions(args, pkl_path):
     return caps, eval_infos
 
 
+def _queue_eval_infos(config, pkl_path, limit):
+    """Build ONLY the test dataset (no model) and return its queue-able eval
+    frames' infos, in dataloader order. Lets template/teacher score on the
+    exact same frame set as model/shuffle/noquery, so model-vs-template is a
+    fair same-denominator comparison instead of 805-vs-438. Needs --config +
+    PYTHONPATH but no GPU/checkpoint.
+    """
+    import os.path as osp
+    from mmcv import Config
+    from third_party.uniad_mmdet3d.datasets.builder import build_dataset
+    cfg = Config.fromfile(config)
+    if cfg.get('plugin_dir'):
+        import importlib
+        importlib.import_module(cfg.plugin_dir.rstrip('/').replace('/', '.'))
+    cfg.data.test.ann_file = osp.abspath(pkl_path)
+    cfg.data.test.test_mode = True
+    dataset = build_dataset(cfg.data.test)
+    n = len(dataset) if not limit else min(limit, len(dataset))
+    return [dataset.data_infos[dataset._to_raw_index(i)] for i in range(n)]
+
+
 def main():
     p = argparse.ArgumentParser(
         description='Eval LLM captions vs geometric GT, with baselines.')
@@ -306,6 +327,11 @@ def main():
     p.add_argument('--checkpoint', default=None)
     p.add_argument('--seed', type=int, default=0)
     p.add_argument('--limit', type=int, default=0)
+    p.add_argument('--queue-eval', action='store_true',
+                   help='template/teacher: restrict to the queue-able eval '
+                        'frames (needs --config), so the frame set matches '
+                        'model/shuffle/noquery for a fair same-denominator '
+                        'comparison. No effect on model-family modes.')
     args = p.parse_args()
 
     infos = _load_infos(args.pkl_path)
@@ -314,19 +340,24 @@ def main():
         infos = infos[:args.limit]
 
     # caption source per mode
-    if args.mode == 'template':
-        captions = [template_caption(i['geo_facts']) for i in infos]
-    elif args.mode == 'teacher':
-        # the VLM teacher's own summary — upper bound for what we distil
-        captions = [i['geo_facts'].get('summary') or '' for i in infos]
+    if args.mode in ('template', 'teacher'):
+        if args.queue_eval:
+            assert args.config, '--queue-eval needs --config'
+            # Score on the SAME queue-able eval frames model-family modes use.
+            infos = [i for i in _queue_eval_infos(
+                args.config, args.pkl_path, args.limit) if i.get('geo_facts')]
+        if args.mode == 'template':
+            captions = [template_caption(i['geo_facts']) for i in infos]
+        else:
+            # the VLM teacher's own summary — upper bound for what we distil
+            captions = [i['geo_facts'].get('summary') or '' for i in infos]
     else:
         # model / shuffle / noquery: generate from the trained head. The
         # dataloader filters to queue-able frames in a different order than the
         # pkl, so _run_model_captions also returns the per-frame infos IN
         # DATALOADER ORDER; score GT against those so caption[i] and gt[i] are
-        # the same frame. NB: this means model-family modes cover only the
-        # ~queue-able subset (e.g. 438 of v3's 805) -- to compare against
-        # template/teacher fairly, re-run those with the same frame set.
+        # the same frame. Use --queue-eval on template/teacher to compare on
+        # this same frame set.
         captions, infos = _run_model_captions(args, args.pkl_path)
 
     # GT in frame order (for model-family modes, `infos` was replaced above
