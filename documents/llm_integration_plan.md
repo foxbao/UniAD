@@ -492,9 +492,15 @@ motion traj_query             ├─► Projector (MLP, 256 → d_llm) ─► [N
    - 📊 **三轮演进汇总**（val teacher，activity_addressed）：单front 17.0% → 6cam-only-AOI 37.3%
      → 6cam+gate入prompt 69.4% → +排除非作业类 **74.5%**。幻觉稳定 ~96%（无幻觉率）。
    - `shuffle` 对照（用错位帧的 query 生成、对本帧 GT 评分）是证伪试金石：若打乱后命中不掉 =
-     LLM 没真用 LiDAR query、只靠语言先验/类别分布。**判决标准**：`model > template` 且
-     `model >> shuffle/noquery` → 方案站住（head 真读了 query）；若 `shuffle ≈ model` → 蒸馏没迁移，
-     应收缩为结构化语义 head、LLM 只做自然语言表达。这是训练后下结论的**唯一硬判据**（不是 loss）。
+     LLM 没真用 LiDAR query、只靠语言先验/类别分布。**判决标准（按指标分层理解，不是看总分/loss）**：
+     ① model 在 **activity_addressed 等非模板语义**上超过 template（template 没图像监督、这类天然弱）；
+     ② model 在关键指标上**明显高于 shuffle/noquery**（这条最硬——证明真读了 query）；
+     ③ geometry 指标（conflict_cls/bearing/ttc）不明显崩——注意 template 在这些上是**规则上限**，
+     model 不必全面超过它，持平即可；④ halluc（无幻觉率）不明显恶化。
+     若 `shuffle ≈ model` → 蒸馏没迁移，应收缩为结构化语义 head、LLM 只做自然语言表达。
+   - ⚠️ **同帧对比**：model 系只跑 queue-able 子集（v3 805→438 帧，dataloader 序），与 template/teacher
+     的全量 805 帧**分母不同**。下结论前必须给 template/teacher 加 `--queue-eval --config <cfg>`
+     在同一批 438 帧上重算（实测 teacher activity_addressed 全量 0.745、queue-eval 0.778——上限是 0.778）。
 
 **C. 优先改进**：
    - **(高) 提升 VLM activity 召回** — ✅ 已根治：6 路环视 + 评测指标修正 + gate 目标入 prompt
