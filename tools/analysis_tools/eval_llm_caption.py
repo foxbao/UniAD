@@ -19,14 +19,24 @@ Metrics (per frame, then averaged):
   - hallucination rate: object classes mentioned that are NOT in geo_facts
 
 Baselines (run on the SAME val frames; --mode):
-  - model    : the trained LLMBridgeHead (needs a checkpoint)
+  - model    : the trained LLMBridgeHead (needs --config + --checkpoint)
   - template : deterministic geo_facts -> sentence (rule, the floor)
-  - shuffle  : feed frame i's query but score against frame j's GT (the key
-               control — if hits don't drop, the LLM ignores the query)
-  - noquery  : caption from prompt only (LLM language prior)
+  - shuffle  : generate frame i's caption from a DERANGED frame's query, score
+               against frame i's GT (the key control -- if hits don't drop, the
+               LLM ignores the query and rides the language prior)
+  - noquery  : caption from prompt only, no object tokens (LLM language prior)
 
-This script only needs uniad_train + transformers (for model/shuffle/noquery
-modes); template mode needs neither GPU nor transformers.
+The decisive read is model > template AND model >> shuffle/noquery: that means
+the head genuinely reads the LiDAR query rather than parroting templates or the
+language prior. If shuffle ~ model, the distillation didn't transfer.
+
+Run from the repo root WITH PYTHONPATH set (model/shuffle/noquery build the
+detector via third_party.uniad_mmdet3d):
+  PYTHONPATH=$(pwd) python tools/analysis_tools/eval_llm_caption.py \
+    --pkl-path data/kl_8/kl_infos_val_sub6cam_v3_vlmcap.pkl --mode model \
+    --config projects/configs/stage2_e2e_lidar/base_e2e_lidar_occ_llm_train.py \
+    --checkpoint <work_dir>/latest.pth
+template/teacher modes need neither GPU, transformers, nor PYTHONPATH.
 See documents/llm_integration_plan.md sec 4.3-B.
 """
 import argparse
@@ -181,6 +191,86 @@ def _load_infos(pkl_path):
         else d['infos'] if isinstance(d, dict) and 'infos' in d else d
 
 
+def _run_model_captions(args, n_frames):
+    """Build detector+ckpt, run inference, return captions for model/shuffle/
+    noquery modes (aligned to the same frame order as _load_infos).
+
+    Implementation: drive the dataloader once; for each frame capture the head's
+    (agent_query, centres) into a bank, then generate captions per mode --
+      model   : frame i's own query
+      noquery : no query (prompt only) -> exposes the LLM's language prior
+      shuffle : frame i's query paired with a DERANGED frame's query, so if the
+                score doesn't drop, the LLM isn't really reading the query.
+    The query bank is captured by monkeypatching the head's generate_from_query
+    so we get exactly the (query, centres) the detector would have used, without
+    editing the detector/head inference path. Needs --config + --checkpoint.
+    """
+    import torch
+    from mmcv import Config
+    from mmcv.parallel import MMDataParallel
+    from mmcv.runner import load_checkpoint, wrap_fp16_model
+    from third_party.uniad_mmdet3d.datasets.builder import (
+        build_dataloader, build_dataset)
+    from third_party.uniad_mmdet3d.models.builder import build_model
+
+    assert args.config and args.checkpoint, \
+        'model/shuffle/noquery modes need --config and --checkpoint'
+    cfg = Config.fromfile(args.config)
+    if cfg.get('plugin_dir'):
+        import importlib, os.path as _osp
+        _m = cfg.plugin_dir.rstrip('/').replace('/', '.')
+        importlib.import_module(_m)
+    cfg.data.test.test_mode = True
+    dataset = build_dataset(cfg.data.test)
+    loader = build_dataloader(dataset, samples_per_gpu=1, workers_per_gpu=1,
+                              dist=False, shuffle=False)
+    model = build_model(cfg.model, test_cfg=cfg.get('test_cfg'))
+    if cfg.get('fp16') is not None:
+        wrap_fp16_model(model)
+    load_checkpoint(model, args.checkpoint, map_location='cpu')
+    model = MMDataParallel(model.cuda(), device_ids=[0])
+    head = model.module.llm_head
+    assert head is not None, 'config has no llm_head'
+
+    # Capture the (query, centres) the head would use, per frame, by wrapping
+    # generate_from_query. Store CPU clones (the bank must outlive each frame).
+    bank = []          # [(query_or_None, centres_or_None)]
+    orig = head.generate_from_query
+
+    def capture(agent_query, centres, max_new_tokens=64):
+        bank.append((
+            None if agent_query is None else agent_query.detach().cpu(),
+            None if centres is None else centres.detach().cpu()))
+        return orig(agent_query, centres, max_new_tokens=max_new_tokens)
+
+    head.generate_from_query = capture
+    model.eval()
+    with torch.no_grad():
+        for i, data in enumerate(loader):
+            if n_frames and i >= n_frames:
+                break
+            model(return_loss=False, rescale=True, **data)
+    head.generate_from_query = orig
+
+    dev = next(head.projector.parameters()).device
+
+    def gen(query, centres):
+        q = None if query is None else query.to(dev)
+        c = None if centres is None else centres.to(dev)
+        with torch.no_grad():
+            return orig(q, c)
+
+    if args.mode == 'model':
+        return [gen(q, c) for q, c in bank]
+    if args.mode == 'noquery':
+        return [gen(None, None) for _ in bank]
+    # shuffle: derange the query bank index, keep frame order for GT pairing
+    import random
+    idx = list(range(len(bank)))
+    random.Random(args.seed).shuffle(idx)
+    return [gen(bank[j][0], bank[j][1]) for j in idx]
+
+
 def main():
     p = argparse.ArgumentParser(
         description='Eval LLM captions vs geometric GT, with baselines.')
@@ -210,18 +300,14 @@ def main():
         # the VLM teacher's own summary — upper bound for what we distil
         captions = [i['geo_facts'].get('summary') or '' for i in infos]
     else:
-        raise NotImplementedError(
-            f'mode={args.mode} needs a trained checkpoint; run after training '
-            '(load config+ckpt, build detector, forward_test per frame; for '
-            'shuffle, pair frame i query with frame j GT). See sec 4.3-B.')
+        # model / shuffle / noquery: generate from the trained head.
+        captions = _run_model_captions(args, len(infos))
 
-    # GT pairing: shuffle deranges the GT index to test query-dependence
+    # GT pairing. shuffle is realised inside _run_model_captions by deranging
+    # the QUERY (frame i's GT vs another frame's query), so GT here stays in
+    # frame order for ALL modes -- do NOT also derange GT (that would be a
+    # double shuffle and break the control).
     gts = [gt_fields(i['geo_facts']) for i in infos]
-    if args.mode == 'shuffle':
-        import random
-        idx = list(range(len(gts)))
-        random.Random(args.seed).shuffle(idx)
-        gts = [gts[j] for j in idx]
 
     rows = [score_frame(parse_caption(c), g) for c, g in zip(captions, gts)]
     res = aggregate(rows)

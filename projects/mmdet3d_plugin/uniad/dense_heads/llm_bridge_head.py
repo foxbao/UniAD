@@ -195,6 +195,18 @@ class LLMBridgeHead(BaseModule):
     def forward_test(self, outs_motion, outs_track=None, max_new_tokens=64):
         """Greedy-generate a caption from LiDAR object tokens. Returns str."""
         agent_query = self._agent_query(outs_motion, outs_track)
+        centres = self._agent_centres(outs_track)
+        return self.generate_from_query(
+            agent_query, centres, max_new_tokens=max_new_tokens)
+
+    def generate_from_query(self, agent_query, centres, max_new_tokens=64):
+        """Greedy caption from explicit (agent_query[N,C], centres[N,3]).
+
+        The seam used by eval baselines (eval_llm_caption.py): pass agent_query
+        =None for the no-query language-prior baseline, or pass another frame's
+        query/centres for the shuffle control. forward_test routes the normal
+        per-frame query/centres through here.
+        """
         device = (agent_query.device if agent_query is not None
                   else next(self.projector.parameters()).device)
 
@@ -202,7 +214,6 @@ class LLMBridgeHead(BaseModule):
         if agent_query is None or agent_query.numel() == 0:
             inputs_embeds = prompt_emb
         else:
-            centres = self._agent_centres(outs_track)
             obj_tok = self._object_tokens(agent_query, centres, device)
             inputs_embeds = torch.cat([prompt_emb, obj_tok.unsqueeze(0)], dim=1)
         # In inputs_embeds mode the model can't infer the mask, and pad==eos
