@@ -106,13 +106,26 @@ class LLMBridgeHead(BaseModule):
 
     @staticmethod
     def _agent_query(outs_motion, outs_track):
-        """Per-agent query [N, C]: prefer motion track_query [1,N,C], else
-        track_query_embeddings [N,C]. Returns None when unavailable."""
+        """Per-agent query [N, C], aligned 1:1 with _agent_centres.
+
+        Use track_query_embeddings (NOT motion's track_query): MotionHeadLidar
+        filters/reorders its track_query down to vehicle classes and strips the
+        SDC slot, while the box centres come from the UNFILTERED
+        track_bbox_results -- so motion query[i] and centre[i] would describe
+        different objects. track_query_embeddings and track_bbox_results are
+        built together in select_active_track_query (same topk bbox_index +
+        same mask), so they are same-order, same-length. Using them also keeps
+        non-vehicle agents (pedestrians, cones) that the caption may reference
+        but motion drops. Falls back to motion track_query only if track
+        embeddings are absent.
+        """
+        emb = (outs_track or {}).get('track_query_embeddings')
+        if emb is not None:
+            return emb
         if outs_motion and outs_motion.get('track_query') is not None:
             q = outs_motion['track_query']
             return q[0] if q.dim() == 3 else q
-        emb = (outs_track or {}).get('track_query_embeddings')
-        return emb if emb is not None else None
+        return None
 
     @staticmethod
     def _agent_centres(outs_track):
