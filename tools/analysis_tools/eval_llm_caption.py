@@ -191,19 +191,24 @@ def _load_infos(pkl_path):
         else d['infos'] if isinstance(d, dict) and 'infos' in d else d
 
 
-def _run_model_captions(args, n_frames):
-    """Build detector+ckpt, run inference, return captions for model/shuffle/
-    noquery modes (aligned to the same frame order as _load_infos).
+def _run_model_captions(args, pkl_path):
+    """Build detector+ckpt, run inference, return (captions, eval_infos) for
+    model/shuffle/noquery modes.
 
-    Implementation: drive the dataloader once; for each frame capture the head's
-    (agent_query, centres) into a bank, then generate captions per mode --
+    CRITICAL frame-order contract: the test dataset filters to frames that can
+    form a temporal queue (e.g. v3 805 raw -> 438 eval frames, first raw index
+    ~10), so the dataloader order is NOT the pkl order. We therefore also
+    return eval_infos -- the per-frame info dicts in DATALOADER order, taken via
+    dataset._to_raw_index -- and the caller scores GT against THOSE, not the
+    first-N pkl frames. captions[i] and eval_infos[i] are the same frame.
+
       model   : frame i's own query
       noquery : no query (prompt only) -> exposes the LLM's language prior
-      shuffle : frame i's query paired with a DERANGED frame's query, so if the
-                score doesn't drop, the LLM isn't really reading the query.
-    The query bank is captured by monkeypatching the head's generate_from_query
-    so we get exactly the (query, centres) the detector would have used, without
-    editing the detector/head inference path. Needs --config + --checkpoint.
+      shuffle : frame i's GT vs a DERANGED frame's query (strict: idx[i]!=i),
+                so if the score doesn't drop, the LLM isn't reading the query.
+
+    The query bank is captured by wrapping generate_from_query (no edit to the
+    detector/head inference path). Needs --config + --checkpoint + PYTHONPATH.
     """
     import torch
     from mmcv import Config
@@ -217,9 +222,12 @@ def _run_model_captions(args, n_frames):
         'model/shuffle/noquery modes need --config and --checkpoint'
     cfg = Config.fromfile(args.config)
     if cfg.get('plugin_dir'):
-        import importlib, os.path as _osp
-        _m = cfg.plugin_dir.rstrip('/').replace('/', '.')
-        importlib.import_module(_m)
+        import importlib
+        importlib.import_module(cfg.plugin_dir.rstrip('/').replace('/', '.'))
+    # Force the test set to the SAME pkl we score against, so dataloader frames
+    # and GT come from one file (avoids --pkl-path vs config test pkl drift).
+    import os.path as osp
+    cfg.data.test.ann_file = osp.abspath(pkl_path)
     cfg.data.test.test_mode = True
     dataset = build_dataset(cfg.data.test)
     loader = build_dataloader(dataset, samples_per_gpu=1, workers_per_gpu=1,
@@ -232,8 +240,9 @@ def _run_model_captions(args, n_frames):
     head = model.module.llm_head
     assert head is not None, 'config has no llm_head'
 
-    # Capture the (query, centres) the head would use, per frame, by wrapping
-    # generate_from_query. Store CPU clones (the bank must outlive each frame).
+    # Capture the (query, centres) the head would use, per frame. Return ''
+    # from the wrapper to skip the (unused) first generation -- we regenerate
+    # per mode below. Store CPU clones (the bank must outlive each frame).
     bank = []          # [(query_or_None, centres_or_None)]
     orig = head.generate_from_query
 
@@ -241,16 +250,21 @@ def _run_model_captions(args, n_frames):
         bank.append((
             None if agent_query is None else agent_query.detach().cpu(),
             None if centres is None else centres.detach().cpu()))
-        return orig(agent_query, centres, max_new_tokens=max_new_tokens)
+        return ''
 
     head.generate_from_query = capture
     model.eval()
+    eval_infos = []
     with torch.no_grad():
         for i, data in enumerate(loader):
-            if n_frames and i >= n_frames:
+            if args.limit and i >= args.limit:
                 break
+            eval_infos.append(dataset.data_infos[dataset._to_raw_index(i)])
             model(return_loss=False, rescale=True, **data)
     head.generate_from_query = orig
+    assert len(bank) == len(eval_infos), \
+        f'query bank ({len(bank)}) != frames ({len(eval_infos)}); the head ' \
+        'must generate exactly once per frame'
 
     dev = next(head.projector.parameters()).device
 
@@ -261,14 +275,20 @@ def _run_model_captions(args, n_frames):
             return orig(q, c)
 
     if args.mode == 'model':
-        return [gen(q, c) for q, c in bank]
-    if args.mode == 'noquery':
-        return [gen(None, None) for _ in bank]
-    # shuffle: derange the query bank index, keep frame order for GT pairing
-    import random
-    idx = list(range(len(bank)))
-    random.Random(args.seed).shuffle(idx)
-    return [gen(bank[j][0], bank[j][1]) for j in idx]
+        caps = [gen(q, c) for q, c in bank]
+    elif args.mode == 'noquery':
+        caps = [gen(None, None) for _ in bank]
+    else:  # shuffle: strict derangement of the query index (idx[i] != i)
+        n = len(bank)
+        idx = list(range(n))
+        if n > 1:
+            import random
+            random.Random(args.seed).shuffle(idx)
+            for i in range(n):           # fix any fixed points by swapping
+                if idx[i] == i:
+                    idx[i], idx[(i + 1) % n] = idx[(i + 1) % n], idx[i]
+        caps = [gen(bank[j][0], bank[j][1]) for j in idx]
+    return caps, eval_infos
 
 
 def main():
@@ -300,13 +320,19 @@ def main():
         # the VLM teacher's own summary — upper bound for what we distil
         captions = [i['geo_facts'].get('summary') or '' for i in infos]
     else:
-        # model / shuffle / noquery: generate from the trained head.
-        captions = _run_model_captions(args, len(infos))
+        # model / shuffle / noquery: generate from the trained head. The
+        # dataloader filters to queue-able frames in a different order than the
+        # pkl, so _run_model_captions also returns the per-frame infos IN
+        # DATALOADER ORDER; score GT against those so caption[i] and gt[i] are
+        # the same frame. NB: this means model-family modes cover only the
+        # ~queue-able subset (e.g. 438 of v3's 805) -- to compare against
+        # template/teacher fairly, re-run those with the same frame set.
+        captions, infos = _run_model_captions(args, args.pkl_path)
 
-    # GT pairing. shuffle is realised inside _run_model_captions by deranging
-    # the QUERY (frame i's GT vs another frame's query), so GT here stays in
-    # frame order for ALL modes -- do NOT also derange GT (that would be a
-    # double shuffle and break the control).
+    # GT in frame order (for model-family modes, `infos` was replaced above
+    # with the dataloader-order eval frames). shuffle is realised inside
+    # _run_model_captions by deranging the QUERY, so GT stays in frame order
+    # for ALL modes -- do NOT also derange GT here.
     gts = [gt_fields(i['geo_facts']) for i in infos]
 
     rows = [score_frame(parse_caption(c), g) for c, g in zip(captions, gts)]
