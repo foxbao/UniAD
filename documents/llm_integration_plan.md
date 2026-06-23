@@ -137,6 +137,10 @@ python tools/data_converter/merge_summaries.py \
 - **流水线 Step 1~5 + LLMBridgeHead 已全跑通**（截至 2026-06-22）：
   - 数据：6 路环视 val 子集 **v3** `data/kl_8/kl_infos_val_sub6cam_v3_vlmcap.pkl`（805 帧, 797 带 summary；
     全为稀有帧，gate 已排除非作业类）。v1/v2 子集与旧单 front `kl_infos_val_sub1k_vlmcap.pkl` 仅作历史对比。
+    ⚠️ **子集帧数 ≠ 实际 eval queue 数**：make_subset 按稀有性挑帧，prev/next 可能落在子集外，
+    时序 track eval 只能用能组成默认 5 帧 queue 的帧（v3 的 805 帧实际约 438 帧可 eval；
+    旧 sub1k 1500→约 542）。teacher caption 评测是逐帧的、用全部 805；但跑 dist_eval 的 track/motion
+    指标会少于子集帧数。caption 蒸馏训练本身不受影响（caption 是逐帧监督）。
   - 几何事实：**train/val 全量均已是 6 路 + gate 清理** `kl_infos_{train,val}_with_cam_geo.pkl`
     （train 43981 帧，6 路各 valid 98.45%~98.61%；2026-06-22 重做并排除非作业类 gate）。
   - **train 全量 caption 已完成**：7 卡分片跑 ~2.2h → merge → `kl_infos_train_vlmcap.pkl`
@@ -326,7 +330,9 @@ motion traj_query             ├─► Projector (MLP, 256 → d_llm) ─► [N
   `outs_motion['track_query']` + `outs_track`（注意 `simple_test` 里要在剥离
   `track_bbox_results`/`track_query_embeddings` 的 cleanup **之前** 调用）。
 - config：新建 `base_e2e_lidar_occ_llm.py` 继承 `base_e2e_lidar_occ`，加 `llm_head` 与
-  `task_loss_weight['llm']`；pipeline Collect 增加 `gt_caption`。
+  `task_loss_weight['llm']`。caption 不走 pipeline 的 Collect key，而是数据集
+  （`kl_dataset.py` `_union2one`）把 `gt_caption` 注入当前帧的 **img_metas**，detector
+  （`uniad_motion_lidar.py` `_current_caption`）从 img_metas 取出喂 llm_head。
   - **为什么继承 `base_e2e_lidar_occ`**：这是继承链
     `base_track_lidar`(track) → `base_track_drivable_lidar`(+map seg) → `base_e2e_lidar`(+motion，
     冻结 BEV) → `base_e2e_lidar_occ`(+occ) 的**顶端、感知最全的基线**。LLMBridgeHead 吃

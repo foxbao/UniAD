@@ -224,8 +224,13 @@ def _scene_summary(agents, cfg):
                     if a['motion'] == 'moving_slow' and a['range'] < cfg['near_m'])
     congestion = 'queue' if slow_near >= cfg['queue_n'] else 'none'
 
-    cranes = [{'id': a['id'], 'state': 'working' if a['activity_gate']
-               else 'idle'} for a in agents if a['cls'] in _CRANE_IDS]
+    # crane state is the GEOMETRIC GATE flag, not ground-truth working/idle:
+    # 'gated' means "static & near enough to warrant a VLM look", which the VLM
+    # then resolves to busy/waiting/idle from the image. Do NOT treat 'gated'
+    # as a working label in training/eval -- it would be a pseudo-label. Only
+    # len(crane_status) is consumed downstream (gen_vlm_caption counts cranes).
+    cranes = [{'id': a['id'], 'state': 'gated' if a['activity_gate']
+               else 'none'} for a in agents if a['cls'] in _CRANE_IDS]
 
     return {
         'n_agents': len(agents),

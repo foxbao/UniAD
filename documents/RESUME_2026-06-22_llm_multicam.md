@@ -22,7 +22,7 @@ pkl后缀: _with_cam -> _geo -> _vlmcap. 字段名 geo_facts.
   LLM在__init__ eager构建(不能lazy否则LoRA进不了optimizer-真bug已修). bf16必须(fp16=nan). projector fp32算再cast bf16.
 - detectors/uniad_motion_lidar.py: llm_head/with_llm_head/_current_caption; forward_train接llm loss; simple_test接forward_test.
 - datasets/kl_dataset.py: KlTrackDataset._union2one(子类~1963)注入gt_caption到current frame; detector从整数键metas_map[max]取.
-- config: base_e2e_lidar_occ_llm.py(smoke) + base_e2e_lidar_occ_llm_full.py(正式).
+- config: base_e2e_lidar_occ_llm.py(smoke) + base_e2e_lidar_occ_llm_train.py(正式, train->train_vlmcap, val/test->v3子集). 旧_full.py已删.
 
 ## 评估 (tools/analysis_tools/eval_llm_caption.py)
 规则解析caption->语义命中率,主对geo_facts. template/teacher可跑; model/shuffle/noquery待checkpoint.
