@@ -120,36 +120,85 @@ def parse_caption(text):
     if not text:
         return dict(classes=set(), bearings=set(), ttc=None, advice=None,
                     activity_state=None)
-    classes = {cid for name, cid in _CLS_ZH.items() if name in text}
+    classes = _caption_classes(text)
     bearings = {canon for zh, canon in _BEARING_ZH.items() if zh in text}
     m = re.search(r'([0-9]+(?:\.[0-9]+)?)\s*秒', text)
     ttc = float(m.group(1)) if m else None
     advice = next((c for zh, c in _ADVICE_ZH if zh in text), None)
-    if ('作业' in text) or ('装卸' in text):
+    activity_state = _operation_state_from_text(text)
+    if activity_state == 'working':
         activity_state = 'busy'
-    elif '等待' in text:
-        activity_state = 'waiting'
-    elif '空闲' in text:
-        activity_state = 'idle'
-    else:
-        activity_state = None
     return dict(classes=classes, bearings=bearings, ttc=ttc,
                 advice=advice, activity_state=activity_state)
 
 
-def _caption_operation_state(text):
-    """Canonical operation state from a free-form Chinese caption."""
+def _caption_classes(text):
+    """Caption class mentions, longest names first.
+
+    Class names are not prefix-free: "集装箱叉车" contains "叉车". Naive
+    substring matching therefore creates false hallucinations. Consume longer
+    class names before shorter ones so a container-forklift mention does not
+    also become a generic-forklift mention.
+    """
+    remaining = text or ''
+    classes = set()
+    for name, cid in sorted(_CLS_ZH.items(), key=lambda kv: len(kv[0]),
+                            reverse=True):
+        if name in remaining:
+            classes.add(cid)
+            remaining = remaining.replace(name, '')
+    return classes
+
+
+def _strip_waiting_phrases(text):
+    """Remove waiting phrases before looking for active-operation words."""
+    return re.sub(r'等待(?:进行)?(?:装卸|取放|吊装)?(?:作业)?', '', text)
+
+
+def _operation_state_from_text(text):
+    """Canonical operation state from a Chinese text span."""
     if not text:
         return None
-    if ('作业' in text) or ('装卸' in text) or ('吊装' in text):
-        return 'working'
+    if '看不清' in text or '无法判断' in text or '不确定' in text:
+        return 'unknown'
     if '等待' in text:
         return 'waiting'
     if '空闲' in text or '停放' in text:
         return 'idle'
-    if '看不清' in text or '无法判断' in text or '不确定' in text:
-        return 'unknown'
+    work_text = _strip_waiting_phrases(text)
+    if ('正在装卸' in work_text or '装卸作业' in work_text
+            or '正在作业' in work_text or '作业中' in work_text
+            or '吊装' in work_text or '取放' in work_text):
+        return 'working'
     return None
+
+
+def _target_operation_span(text, agent):
+    """Return the caption span most likely describing one labeled target."""
+    if not text or not agent:
+        return ''
+    cls = _CLS_NAME.get(int(agent.get('cls', -1)), '')
+    bearing = _BEARING_NAME.get(agent.get('bearing'), '')
+    if not cls:
+        return ''
+    segments = [s.strip() for s in re.split(r'[，。；;,\n]', text) if s.strip()]
+    with_bearing = [s for s in segments if cls in s and bearing and bearing in s]
+    if with_bearing:
+        return with_bearing[0]
+    with_cls = [s for s in segments if cls in s]
+    if with_cls:
+        return with_cls[0]
+    return ''
+
+
+def _caption_operation_state(text, agent=None):
+    """Canonical operation state, optionally localized to one target."""
+    if agent is not None:
+        span = _target_operation_span(text, agent)
+        pred = _operation_state_from_text(span)
+        if pred is not None:
+            return pred
+    return _operation_state_from_text(text)
 
 
 def _ttc_bucket(t):
@@ -259,8 +308,10 @@ def aggregate_human_feedback(captions, infos, feedback):
         fb = feedback.get(token, {})
         if not fb:
             continue
-        pred = _caption_operation_state(caption)
+        agents = {str(a.get('id')): a
+                  for a in info.get('geo_facts', {}).get('agents', [])}
         for track_id, gt in fb.items():
+            pred = _caption_operation_state(caption, agents.get(str(track_id)))
             appl += 1
             hit = pred == gt
             hits += int(hit)

@@ -116,6 +116,8 @@ python tools/data_converter/make_subset.py \
 `#track_id 类别 距离` 辅助标注，帮助 VLM 把几何事实中点名的目标和图像实体对齐。
 同日增加 `--feedback-json`：把人工确认的 `motion_state` / `operation_state` 注入 prompt，
 优先级高于 VLM 自行判断，用于修正港口设备“静止但正在作业”的典型误判。
+`operation_state` 采用 `working/waiting/idle/unknown`，其中“等待作业”是 waiting，
+不能因为含“作业”二字被评测成 working。
 **关键产物是 JSON sidecar**（`<pkl去后缀>_summaries.json`，token→summary），pkl 输出可丢 /tmp。
 ```bash
 # 当前新 teacher（2026-06-25 后续新 caption 优先用）
@@ -396,9 +398,11 @@ motion track_query（仅 fallback/历史分支）┘                            
   挂车、侧后方目标。2 帧 pilot 中，带标注 Qwen3 已能把原 plain 版本漏掉的“正前方 22.8m 空挂车”
   写进 summary；但是否系统性提升，必须看 val v3 全量 A/B 指标。
 - **人工反馈版本**：`--feedback-json` 把人工确认的设备状态作为高优先级事实写进 prompt。
-  当前 pilot `documents/llm_teacher_feedback_pilot.json` 把两帧 #4 吊机标为
-  `motion_state=static, operation_state=working`，重跑后 Qwen3 summary 从“吊机空闲”改为
-  “吊机正在装卸作业”；`eval_llm_caption.py --feedback-json` 的 `operation_human_acc=1.000 (n=2)`。
+  当前 pilot `documents/llm_teacher_feedback_pilot.json` 包含 6 个标注目标：2 帧 #4 吊机
+  `motion_state=static, operation_state=working`，4 帧 #6 集装箱叉车
+  `motion_state=static, operation_state=waiting`。重跑后 Qwen3 summary 能把吊机改为
+  “正在装卸作业”，并把集装箱叉车写成“等待作业”；
+  `eval_llm_caption.py --feedback-json` 的 `operation_human_acc=1.000 (n=6)`。
 - **scene-level 字段**（几何步骤先算，作为 VLM 的 prompt 约束 + summary 的事实底料）：
   `agents_of_interest`（对 ego 最相关的 id）、`ego_advice`（keep/yield/slow/stop，由冲突导出）、
   `congestion`、`crane_status`、以及每个关键 agent 的 pos/motion/heading/load/conflict。
@@ -494,7 +498,8 @@ motion track_query（仅 fallback/历史分支）┘                            
     `projects/work_dirs/stage2_e2e_lidar/qwen3_teacher_deepening_vis/`。
 13. ✅ 人工反馈闭环已落地（2026-06-25）：`gen_vlm_caption.py --feedback-json` 支持
     `motion_state + operation_state`，并把人工确认状态注入 teacher prompt；`eval_llm_caption.py`
-    支持 `--feedback-json` 输出 `operation_human_acc`。2 帧吊机作业 pilot 验证通过。
+    支持 `--feedback-json` 输出按目标局部解析的 `operation_human_acc`。6 目标 pilot
+    （2 个吊机 working + 4 个集装箱叉车 waiting）验证通过。
 
 ### 4.2 经验教训（踩过的坑，复现必读）
 
@@ -619,6 +624,11 @@ annotated+feedback 并看 `operation_human_acc`。
      三选一（装卸/等待/空闲），"空闲"是有效判断。旧 14.3%~15.6% 严重低估了真实效果。
      已拆成两个指标：`activity_addressed`（gated 帧是否给出三态之一，衡量"VLM 有没有看图回应
      门控"）/ `activity_busy`（其中判"装卸作业"的比例，是 rate 不是命中分）。
+   - ⚠️ **人工反馈评测解析 bug（已修，2026-06-25）**：中文短语“等待作业”应是
+     `waiting`，不能先被“作业”命中为 `working`；同帧可能同时出现吊机 working 与集装箱叉车
+     waiting，因此 `operation_human_acc` 必须按 `track_id` 对应目标的类别/方位附近短语解析，
+     不能只做整句场景级解析。另一个细节是类别名要按长词优先解析，避免“集装箱叉车”同时被误算成
+     “叉车”并污染 hallucination 指标。
    - ✅ **多相机实测（val 子集 teacher）**：单 front → 6 路环视，`activity_addressed`
      **17.0% → 37.3% 翻倍**（gated 分母均=777）。根因证实：单 front 时后方/侧方 gate 目标
      （35-46m 外的吊机居多）看不到只能照搬几何；6 路按目标方位路由 CAM_BACK 后 VLM 才能看图判断。

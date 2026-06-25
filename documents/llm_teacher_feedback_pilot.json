@@ -14,5 +14,37 @@
       "source": "human",
       "note": "人工确认：图中吊机处于作业状态，不应标为空闲。"
     }
+  },
+  "95541720-5a20-4998-9d97-af6489f7b3e2": {
+    "6": {
+      "motion_state": "static",
+      "operation_state": "waiting",
+      "source": "human",
+      "note": "人工确认：集装箱叉车停在箱区作业位，更像等待作业，不是普通停放。"
+    }
+  },
+  "588e27bb-3008-460a-90d0-3f6fca715736": {
+    "6": {
+      "motion_state": "static",
+      "operation_state": "waiting",
+      "source": "human",
+      "note": "人工确认：集装箱叉车停在箱区作业位，更像等待作业，不是普通停放。"
+    }
+  },
+  "7c6c7f4b-5438-480c-b478-04a0d2122e00": {
+    "6": {
+      "motion_state": "static",
+      "operation_state": "waiting",
+      "source": "human",
+      "note": "人工确认：集装箱叉车停在箱区作业位，更像等待作业，不是普通停放。"
+    }
+  },
+  "9c8c5de1-ef2b-438c-8d2e-63406c91e63d": {
+    "6": {
+      "motion_state": "static",
+      "operation_state": "waiting",
+      "source": "human",
+      "note": "人工确认：集装箱叉车停在箱区作业位，更像等待作业，不是普通停放。"
+    }
   }
 }
