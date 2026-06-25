@@ -72,13 +72,9 @@ print(type(model).__name__, type(model.llm_head._llm).__name__)
 PY
 ```
 
-该环境的关键处理：
-- Python 3.9 独立环境放在 `/mnt/disk1/conda_envs`，避免根盘空间压力。
-- `PYTHONNOUSERSITE=1`，避免用户 site-packages 污染。
-- `mmcv-full==1.5.2` 与 `third_party/uniad_mmdet3d` 自定义 CUDA ops 已按 Python 3.9 重新编译。
-- 安装 `spconv-cu116==2.3.6` 及 `cumm-cu116/pccm/ccimport/ninja`。
-- 环境内 `sitecustomize.py` 为 torch1.12 提供 transformers>=4.51 import Qwen3 所需的少量 torch2 符号 shim；
-  只用于这个隔离环境，不改主 `uniad_train`。
+该环境配置比较脆：Python3.9、torch1.12、transformers4.51、mmcv/spconv/custom CUDA ops、以及
+`sitecustomize.py` shim 都要对齐。完整从零重建命令、验证命令和已知 `pip check` 警告见
+`documents/qwen3_student_env_runbook.md`。
 
 ## 0.3 数据集事实（KL 港口数据集，已核实）
 
