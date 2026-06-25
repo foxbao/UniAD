@@ -40,6 +40,7 @@ template/teacher modes need neither GPU, transformers, nor PYTHONPATH.
 See documents/llm_integration_plan.md sec 4.3-B.
 """
 import argparse
+import json
 import pickle
 import re
 
@@ -55,6 +56,56 @@ _CLS_ZH = {
 }
 _ADVICE_ZH = [('让行', 'yield'), ('停车', 'stop'), ('减速', 'slow'),
               ('保持', 'keep')]
+
+
+def _canonical_operation_state(value):
+    if value is None:
+        return None
+    value = str(value).strip().lower()
+    aliases = {
+        'busy': 'working',
+        'work': 'working',
+        'working': 'working',
+        'loading': 'working',
+        'unloading': 'working',
+        'loading_unloading': 'working',
+        'wait': 'waiting',
+        'waiting': 'waiting',
+        'idle': 'idle',
+        'none': 'idle',
+        'unclear': 'unknown',
+        'unknown': 'unknown',
+    }
+    return aliases.get(value, value)
+
+
+def _normalise_feedback(raw):
+    if not raw:
+        return {}
+    if isinstance(raw, dict) and 'frames' in raw and isinstance(raw['frames'], dict):
+        raw = raw['frames']
+    out = {}
+    for token, frame_fb in raw.items():
+        if not isinstance(frame_fb, dict):
+            continue
+        dst = {}
+        for track_id, entry in frame_fb.items():
+            if not isinstance(entry, dict):
+                entry = {'operation_state': entry}
+            operation = _canonical_operation_state(
+                entry.get('operation_state', entry.get('activity')))
+            if operation:
+                dst[str(track_id)] = operation
+        if dst:
+            out[str(token)] = dst
+    return out
+
+
+def _load_feedback(path):
+    if not path:
+        return {}
+    with open(path, 'r', encoding='utf-8') as f:
+        return _normalise_feedback(json.load(f))
 
 
 def parse_caption(text):
@@ -84,6 +135,21 @@ def parse_caption(text):
         activity_state = None
     return dict(classes=classes, bearings=bearings, ttc=ttc,
                 advice=advice, activity_state=activity_state)
+
+
+def _caption_operation_state(text):
+    """Canonical operation state from a free-form Chinese caption."""
+    if not text:
+        return None
+    if ('作业' in text) or ('装卸' in text) or ('吊装' in text):
+        return 'working'
+    if '等待' in text:
+        return 'waiting'
+    if '空闲' in text or '停放' in text:
+        return 'idle'
+    if '看不清' in text or '无法判断' in text or '不确定' in text:
+        return 'unknown'
+    return None
 
 
 def _ttc_bucket(t):
@@ -182,6 +248,31 @@ def aggregate(rows):
         appl = sum(1 for r in rows if r[k][1])
         out[k] = (hits / appl, appl) if appl else (float('nan'), 0)
     return out
+
+
+def aggregate_human_feedback(captions, infos, feedback):
+    """Score operation_state only on frames with human feedback labels."""
+    hits = appl = missing_pred = 0
+    examples = []
+    for caption, info in zip(captions, infos):
+        token = str(info.get('token'))
+        fb = feedback.get(token, {})
+        if not fb:
+            continue
+        pred = _caption_operation_state(caption)
+        for track_id, gt in fb.items():
+            appl += 1
+            hit = pred == gt
+            hits += int(hit)
+            if pred is None:
+                missing_pred += 1
+            if len(examples) < 5 and not hit:
+                examples.append(dict(
+                    token=token, track_id=track_id, gt=gt, pred=pred,
+                    caption=caption))
+    rate = hits / appl if appl else float('nan')
+    return dict(rate=rate, n=appl, missing_pred=missing_pred,
+                examples=examples)
 
 
 def _load_infos(pkl_path):
@@ -332,7 +423,11 @@ def main():
                         'frames (needs --config), so the frame set matches '
                         'model/shuffle/noquery for a fair same-denominator '
                         'comparison. No effect on model-family modes.')
+    p.add_argument('--feedback-json', default=None,
+                   help='Optional human feedback JSON. When provided, report '
+                        'operation_human_acc on labeled token/track_id entries.')
     args = p.parse_args()
+    feedback = _load_feedback(args.feedback_json)
 
     infos = _load_infos(args.pkl_path)
     infos = [i for i in infos if i.get('geo_facts')]
@@ -371,6 +466,12 @@ def main():
     print(f'mode={args.mode}  frames={len(rows)}')
     for k, (rate, n) in res.items():
         print(f'  {k:16s}: {rate:.3f}  (n={n})')
+    if feedback:
+        human = aggregate_human_feedback(captions, infos, feedback)
+        print(f'  operation_human_acc: {human["rate"]:.3f}  '
+              f'(n={human["n"]}, missing_pred={human["missing_pred"]})')
+        for ex in human['examples']:
+            print('    miss:', ex)
 
 
 if __name__ == '__main__':

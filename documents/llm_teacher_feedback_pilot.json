@@ -1,0 +1,18 @@
+{
+  "6a81fde5-aa1b-4a04-b915-f892358418ea": {
+    "4": {
+      "motion_state": "static",
+      "operation_state": "working",
+      "source": "human",
+      "note": "人工确认：图中吊机处于作业状态，不应标为空闲。"
+    }
+  },
+  "5673fe34-39be-4f62-a0b6-64345ee22837": {
+    "4": {
+      "motion_state": "static",
+      "operation_state": "working",
+      "source": "human",
+      "note": "人工确认：图中吊机处于作业状态，不应标为空闲。"
+    }
+  }
+}

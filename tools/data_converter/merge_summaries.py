@@ -24,7 +24,8 @@ def _infos(data):
     return data
 
 
-def merge(pkl_path, json_path, out_path=None, in_place=False):
+def merge(pkl_path, json_path, out_path=None, in_place=False,
+          clear_missing=False):
     with open(pkl_path, 'rb') as f:
         data = pickle.load(f)
     # json_path may be one path or several (e.g. one per VLM-caption shard); shards are
@@ -48,7 +49,10 @@ def merge(pkl_path, json_path, out_path=None, in_place=False):
             facts['summary'] = summaries[token]
             n_set += 1
         else:
-            facts.setdefault('summary', None)
+            if clear_missing:
+                facts['summary'] = None
+            else:
+                facts.setdefault('summary', None)
             n_miss += 1
 
     print(f'[{osp.basename(pkl_path)}] merged summaries: set={n_set} '
@@ -77,8 +81,13 @@ def main():
                         '(or a shell glob) to merge all VLM-caption shards at once.')
     p.add_argument('--out-path', default=None)
     p.add_argument('--in-place', action='store_true')
+    p.add_argument('--clear-missing', action='store_true',
+                   help='Set summary=None for tokens absent from the JSON. '
+                        'Use this when merging a partial/new-teacher sidecar '
+                        'into a pkl that may already contain old summaries.')
     args = p.parse_args()
-    merge(args.pkl_path, args.json_path, args.out_path, args.in_place)
+    merge(args.pkl_path, args.json_path, args.out_path, args.in_place,
+          clear_missing=args.clear_missing)
 
 
 if __name__ == '__main__':
