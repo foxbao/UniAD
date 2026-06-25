@@ -145,6 +145,10 @@ python tools/data_converter/make_subset.py \
 2026-06-25 追加相机兜底：若按目标方位路由的相机无效，回退到本帧任一有效相机；
 若本帧完全没有有效相机，则走 text-only summary，只允许依据 geo_facts，不补作业/载货视觉判断，
 并在 summary meta 标记 `no_valid_camera`。
+同日根据人工抽检收紧状态口径：移动/行驶中的吊机、轮胎吊、叉车、集装箱叉车只描述运动，
+不能仅因吊具/吊臂/叉臂抬起就判 `working/waiting`；`waiting` 必须有明确静止停靠、排队或
+作业位等待上下文；不可见设备必须写看不清或不提。`crane_status` 只是几何诊断门控，
+不再渲染到 prompt，避免诱导模型写图里没有的吊机。
 **关键产物是 JSON sidecar**（`<pkl去后缀>_summaries.json`，token→summary），pkl 输出可丢 /tmp。
 ```bash
 # 当前新 teacher（2026-06-25 后续新 caption 优先用）
@@ -238,8 +242,9 @@ python tools/data_converter/merge_summaries.py \
     Qwen3-VL-8B 已下载验证，后续新 caption 应先在 val v3 做 A/B，再决定是否重做 train 全量。
   - **Qwen3-VL-32B val teacher 已完成**：2×4GPU 分片跑完 805 帧，并修复相机兜底后
     `missing_summary=0`（3 帧无有效相机，text-only）。当前指标：
-    `advice=0.988`、`activity_addressed=0.896`、`activity_busy=0.081`、`halluc=0.991`。
-    结论：32B teacher 已可用，但 train 全量前仍建议先人工抽检作业/空闲状态。
+    `advice=0.988`、`activity_addressed=0.895`、`activity_busy=0.081`、`halluc=0.991`。
+    人工反馈已修正 4 个样本（移动设备不判等待/作业、不可见吊机不写入 summary），
+    `waiting` 计数从 6 降到 3。结论：32B teacher 已可用，但 train 全量前仍建议先人工抽检作业/空闲状态。
   - 模型：`LLMBridgeHead` 已支持两种接线：
     1) 历史 full-task 分支 `base_e2e_lidar_occ_llm*.py`，与 track/map/motion/occ 共训；
     2) 当前 Stage-1 纯探针 `base_e2e_lidar_llm_probe.py`，继承 `base_e2e_lidar.py`，冻结非 LLM 模块，
@@ -252,7 +257,7 @@ python tools/data_converter/merge_summaries.py \
   - (1) ✅ 7 卡分片 caption 已完成（~2.2h，43747 帧带 summary）。
   - (2) ✅ merge → `kl_infos_train_vlmcap.pkl`；训练/评测数据已就绪。
   - (2.5) ✅ Qwen3-VL-32B annotated teacher val 已完成：805/805 帧有 summary，
-    `activity_addressed=0.896`、`halluc=0.991`。下一步不是立刻 train 全量，而是人工抽检
+    `activity_addressed=0.895`、`halluc=0.991`。下一步不是立刻 train 全量，而是人工抽检
     作业/空闲状态；确认质量后再重做 train 全量 caption。
   - (3) ✅ 历史 full-task `base_e2e_lidar_occ_llm_train.py` 已跑 1 epoch，证明能输出中文 caption，
     但 `model≈shuffle`，没有证据表明它读到了同帧 query 语义；且主任务指标有退化。见 4.1 / 4.3-B。
@@ -560,7 +565,8 @@ motion track_query（仅 fallback/历史分支）┘                            
 15. ✅ Qwen3-VL-32B teacher val 已跑通（2026-06-25）：模型下载到
     `/mnt/disk1/models/Qwen3-VL-32B-Instruct`，4GPU `device_map=auto` 加载验证，8GPU
     2×4 shard 完成 805 帧 annotated caption。相机兜底修复后 `missing_summary=0`，
-    预览见 `outputs/qwen32b_val_preview/overview.jpg`。
+    并根据人工抽检收紧 moving/waiting/不可见吊机规则；预览见
+    `outputs/qwen32b_val_preview/overview.jpg` 和 `outputs/qwen32b_state_qa_preview/overview.jpg`。
 
 ### 4.2 经验教训（踩过的坑，复现必读）
 
@@ -609,7 +615,7 @@ motion track_query（仅 fallback/历史分支）┘                            
    仅作对照复现，不再作为当前建议入口。
 
 **A0. Qwen3-VL-32B teacher QA / train 全量闸门**。32B annotated val 已跑完，现阶段不要直接
-重做 train 全量；先确认作业/空闲状态质量。当前 val 指标：`activity_addressed=0.896`，
+重做 train 全量；先确认作业/空闲状态质量。当前 val 指标：`activity_addressed=0.895`，
 `activity_busy=0.081`，`halluc=0.991`。`activity_busy` 低不一定是坏事，可能是 32B 更常判空闲，
 但必须人工抽检 Crane/Forklift/ContainerForkLift 的 working/waiting/idle。
    ```bash
