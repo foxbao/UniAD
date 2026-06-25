@@ -70,6 +70,10 @@ UniADMotionLidar PeftModelForCausalLM
 4.66
 ```
 
+复核记录：2026-06-25 另建全新环境
+`/mnt/disk1/conda_envs/uniad_train_qwen3_py39_doccheck`，按本文流程从零安装并完成
+基础 import、`projects.mmdet3d_plugin` import、`LLMBridgeHead` loss smoke 和真实 config build。
+
 ## 从零重建命令
 
 放在 `/mnt/disk1/conda_envs`，避免根盘空间压力：
@@ -110,12 +114,15 @@ pip install --no-cache-dir \
   --extra-index-url https://download.pytorch.org/whl/cu116
 ```
 
-安装基础依赖：
+安装基础依赖。torch wheel 可能临时带入较新的 `numpy/Pillow`，这一步会固定回 UniAD
+旧栈可用版本；这里不要用 `--no-deps`，否则 `matplotlib/tensorboard/numba` 的传递依赖会缺失：
 
 ```bash
-pip install --no-deps \
-  'numpy==1.22.4' 'Pillow==9.5.0' packaging pyyaml six \
-  terminaltables prettytable tqdm einops shapely pyquaternion \
+pip install \
+  'numpy==1.22.4' 'Pillow==9.5.0' 'packaging==26.2' \
+  'PyYAML==6.0.3' 'six==1.17.0' 'terminaltables==3.1.10' \
+  'prettytable==3.16.0' 'tqdm==4.68.3' 'einops==0.8.2' \
+  'shapely==2.0.7' 'pyquaternion==0.9.9' \
   'scipy==1.10.1' 'opencv-python==4.7.0.72' 'matplotlib==3.5.3' \
   'pandas==1.4.4' 'numba==0.58.1' 'protobuf==5.29.6' \
   'tensorboard==2.14.0'
@@ -125,8 +132,11 @@ pip install --no-deps \
 
 ```bash
 pip install --no-deps --no-build-isolation 'mmcv-full==1.5.2'
+pip install --no-deps 'addict==2.4.0' 'pycocotools==2.0.7' \
+  'platformdirs==4.3.6'
 pip install --no-deps 'mmdet==2.25.1' 'mmsegmentation==0.29.1' \
-  'mmcls==0.25.0' 'mmdet3d==1.0.0rc4' 'yapf==0.40.1'
+  'mmcls==0.25.0' 'yapf==0.40.1' 'tomli==2.2.1'
+pip install --no-deps --no-build-isolation 'mmdet3d==1.0.0rc4'
 ```
 
 安装 UniAD import 链和 spconv 依赖：
@@ -140,7 +150,12 @@ pip install --no-deps \
   'tifffile==2023.7.10' 'lyft-dataset-sdk==0.0.8' \
   'spconv-cu116==2.3.6' 'cumm-cu116==0.4.11' 'pccm==0.4.16' \
   'ccimport==0.4.4' 'fire==0.6.0' 'pybind11==2.13.6' \
-  'ninja==1.11.1.4' 'portalocker==2.10.1' 'future==1.0.0'
+  'ninja==1.11.1.4' 'portalocker==2.10.1' 'future==1.0.0' \
+  'fsspec==2024.6.1' 'lark==1.1.9' 'termcolor==2.5.0' \
+  'nuscenes-devkit==1.1.9' 'scikit-learn==1.3.2' \
+  'joblib==1.4.2' 'threadpoolctl==3.5.0' 'cachetools==5.5.0' \
+  'descartes==1.1.0'
+pip install 'IPython==8.18.1'
 ```
 
 安装 Qwen3 student 所需 LLM 依赖，必须 `--no-deps`，避免 pip 升级 torch：
@@ -148,7 +163,9 @@ pip install --no-deps \
 ```bash
 pip install --no-deps \
   'transformers==4.51.3' 'peft==0.13.2' 'accelerate==1.1.1' \
-  'tokenizers==0.21.4' 'safetensors==0.6.2' 'huggingface-hub==0.33.5'
+  'tokenizers==0.21.4' 'safetensors==0.6.2' 'huggingface-hub==0.33.5' \
+  'filelock==3.18.0' 'regex==2024.11.6' 'hf-xet==1.1.5' \
+  'psutil==6.1.1'
 ```
 
 编译仓库自定义 CUDA ops：
@@ -314,6 +331,7 @@ conda activate /mnt/disk1/conda_envs/uniad_train_qwen3_py39
 python - <<'PY'
 import sys, os, site
 import torch, transformers, peft, mmcv, mmdet, mmseg, mmdet3d
+import spconv.pytorch, nuscenes, IPython
 print(sys.executable)
 print(os.environ.get('PYTHONNOUSERSITE'), site.ENABLE_USER_SITE)
 print(torch.__version__, transformers.__version__, peft.__version__, mmcv.__version__)
@@ -367,6 +385,7 @@ PY
 当前环境 `pip check` 仍会提示几类非阻塞问题：
 
 - `lyft-dataset-sdk` 缺 `black/flake8/plotly/pytest`：这些是开发/评估附属依赖，当前 build smoke 不需要。
+- `nuscenes-devkit` 缺 `jupyter`：它是 notebook 附属依赖，当前 UniAD import/build 不需要。
 - `mmdet3d` 声明要求 `networkx<2.3`、`numba==0.53.0`、旧 `trimesh`：Python3.9 下这些旧版本不现实；
   当前 UniAD build/import 已验证通过。
 - `peft 0.13.2` metadata 要求 `torch>=1.13.0`：实测 Qwen3-0.6B LoRA head build 与 loss smoke
