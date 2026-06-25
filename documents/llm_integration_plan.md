@@ -18,7 +18,7 @@
 跨模态蒸馏：用离线大 VLM（当前新 teacher：Qwen3-VL-8B；历史 baseline：Qwen2.5-VL-7B）
 看**环视相机图（6 路，按目标方位自动路由 2-4 路）**，
 结合 LiDAR 几何事实，生成中文场景 summary 作为监督；训练一个挂在 UniAD **LiDAR query** 上的小
-LLM（Qwen2.5-0.5B），让它**推理时仅凭 LiDAR query** 就能说出图像老师才看得到的语义。推理零图像依赖，
+LLM（默认 Qwen2.5-0.5B；Qwen3-0.6B 试验中），让它**推理时仅凭 LiDAR query** 就能说出图像老师才看得到的语义。推理零图像依赖，
 不动现有 LiDAR 链路。（注：早期落地先只用 front，后因后方/侧方作业目标看不见导致 activity 召回偏低，
 已改为 6 路环视，见 4.3-B。）
 
@@ -35,11 +35,14 @@ sidecar `*_vlmcap_summaries.json`、合并后 pkl 后缀 `_vlmcap`）。
 
 | env | torch | numpy | transformers | 用途 |
 |-----|-------|-------|--------------|------|
-| `uniad_train` | 1.12.1+cu116 | 1.22.4 | 4.46.3 (+peft 0.13.2) | 训练主环境；几何事实生成、子集抽样、读写 KL pkl、**LLMBridgeHead 训练**（Qwen0.5B）|
+| `uniad_train` | 1.12.1+cu116 | 1.22.4 | 4.46.3 (+peft 0.13.2) | 训练主环境；几何事实生成、子集抽样、读写 KL pkl、**LLMBridgeHead 训练**（默认 Qwen2.5-0.5B）|
 | `qwen_vl`（本方案新建） | 2.6.0+cu124 | 2.2.6 | 4.57.6 | 仅跑 VLM caption 离线推理；已验证可加载 Qwen2.5-VL-7B 与 Qwen3-VL-8B |
 
 > uniad_train 的 transformers/peft 是 LLMBridgeHead 训练所需，**后装**（原始环境无）。
 > ⚠️ 装时务必 `--no-deps` 锁 torch，否则 accelerate 会强升 torch→2.4 打断 mmcv.ops（见 4.2）。
+> Qwen3-0.6B student 已下载到 `/mnt/disk1/models/Qwen3-0.6B`，但它的 `model_type=qwen3`
+> 需要 transformers>=4.51；当前 `uniad_train` 的 4.46.3 会报 `KeyError: 'qwen3'`。先不要直接升级
+> 主训练环境，需单独做兼容环境或受控升级验证。
 
 ⚠️ **numpy 跨版本陷阱**：qwen_vl(numpy2.x) 直接 pickle 重写 KL pkl 后，uniad_train(numpy1.x)
 会因 `No module named numpy._core` **读不了**。因此 VLM caption 的产物通过 **token→summary 的 JSON sidecar**
@@ -200,6 +203,7 @@ python tools/data_converter/merge_summaries.py \
     1) 历史 full-task 分支 `base_e2e_lidar_occ_llm*.py`，与 track/map/motion/occ 共训；
     2) 当前 Stage-1 纯探针 `base_e2e_lidar_llm_probe.py`，继承 `base_e2e_lidar.py`，冻结非 LLM 模块，
     只训练 `llm_head.*`，并 `detach_inputs=True` 断开 LLM loss 到感知 query 的梯度。详见 3.3 / 3.4。
+    Qwen3-0.6B 试验配置 `base_e2e_lidar_llm_probe_qwen3_0p6b.py` 已加入，等待训练环境兼容。
   - 评估：`eval_llm_caption.py` template/teacher 可跑；activity 拆为 addressed/busy（见 4.3-B）。
     6 路 + gate 入 prompt + 排除非作业类后 teacher activity_addressed **74.5%**（单 front 17.0%）。
 - **训练状态 / 下一步**：
@@ -336,8 +340,11 @@ motion track_query（仅 fallback/历史分支）┘                            
                           [prompt tokens] ⊕ [object tokens] ─► LLM ─► 文本(老师标签)
 ```
 
-- **底座**：Qwen2.5-0.5B（d_llm=896），中文友好、单卡可 LoRA、最有上车可能（虽暂不上车）。
-- **Projector**：小 MLP，256 → 896，每个 agent 一个 token。
+- **默认底座**：Qwen2.5-0.5B（d_llm=896），中文友好、单卡可 LoRA、最稳。
+- **Qwen3-0.6B 试验分支**：`base_e2e_lidar_llm_probe_qwen3_0p6b.py`，`d_llm=1024`；
+  已在 `qwen_vl` 中验证可加载（`Qwen3ForCausalLM`，596M 参数），但当前 `uniad_train`
+  transformers 版本暂不兼容，需先解决环境。
+- **Projector**：小 MLP，256 → d_llm，每个 agent 一个 token。
 - **空间编码**：box 中心 (x,y,z)（来自 `track_bbox_results[0][0].gravity_center`）→ MLP → 加到 token，给 LLM 空间先验。
 - **训练**：冻结 LLM 主干，只训 Projector + LoRA。Stage-1 纯探针还会冻结 UniAD 感知栈并 detach 输入 query。
 - **token 数**：agent 数不定，截断/padding 到 `max_agents`，截断要 log。
@@ -466,7 +473,8 @@ motion track_query（仅 fallback/历史分支）┘                            
 
 ### 4.1 已完成（细节见第 0 部分复现手册 / 第 3 节设计）
 
-1. ✅ LLM 底座选定：Qwen2.5-0.5B（d_llm=896）。
+1. ✅ 默认 LLM 底座选定：Qwen2.5-0.5B（d_llm=896）。Qwen3-0.6B 试验底座已下载，
+   对应 `d_llm=1024`，但 `uniad_train` 需升级/隔离 transformers 后才能训练。
 2. ✅ 方案定调：VLM 图像老师 + 纯 LiDAR 推理（跨模态蒸馏）；几何模板互补。
 3. ✅ token 边界 + caption schema（scene-level summary）锁定。见 3.2.1 / 3.2.2。
 4. ✅ 图像↔LiDAR 同步：`add_cam_sync.py` → `kl_infos_{train,val}_with_cam.pkl`
