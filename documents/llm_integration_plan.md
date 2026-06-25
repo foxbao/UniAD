@@ -406,6 +406,7 @@ motion track_query（仅 fallback/历史分支）┘                            
 - **scene-level 字段**（几何步骤先算，作为 VLM 的 prompt 约束 + summary 的事实底料）：
   `agents_of_interest`（对 ego 最相关的 id）、`ego_advice`（keep/yield/slow/stop，由冲突导出）、
   `congestion`、`crane_status`、以及每个关键 agent 的 pos/motion/heading/load/conflict。
+  其中 `ego_advice` 是几何阶段已经算好的本车建议，teacher 只能照抄，不能按图像重新改写。
 - **作业状态门控阈值**：**不预设，数据驱动**。
   - 门控只做"宽松预筛"——挡掉几何上绝无可能作业的 agent（如高速行驶中），
     最终"是否装卸"由 VLM 看图裁决。故门控应**故意放松**。
