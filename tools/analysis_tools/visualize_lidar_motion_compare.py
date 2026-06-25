@@ -60,12 +60,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--config', required=True)
     parser.add_argument('--base-results', required=True)
     parser.add_argument('--compare-results', required=True)
+    parser.add_argument('--extra-results', default=None)
     parser.add_argument('--base-work-dir', default=None)
     parser.add_argument('--compare-work-dir', default=None)
     parser.add_argument('--base-turn-csv', default=None)
     parser.add_argument('--compare-turn-csv', default=None)
     parser.add_argument('--base-name', default='base_e2e_lidar')
     parser.add_argument('--compare-name', default='base_e2e_lidar_turnaware')
+    parser.add_argument('--extra-name', default='base_e2e_lidar_turnloss')
     parser.add_argument('--out-dir', required=True)
     parser.add_argument('--split', default='val', choices=['val', 'test'])
     parser.add_argument('--epoch', type=int, default=6)
@@ -114,7 +116,8 @@ def plot_overall_metrics(base: Dict[str, float],
                          compare: Dict[str, float],
                          base_name: str,
                          compare_name: str,
-                         out_path: str) -> None:
+                         out_path: str,
+                         epoch_label: str) -> None:
     keys = [
         ('motion_min_ade', 'minADE'),
         ('motion_min_fde', 'minFDE'),
@@ -141,7 +144,7 @@ def plot_overall_metrics(base: Dict[str, float],
                 continue
             ax.text(xx, value, f'{value:.3f}', ha='center', va='bottom',
                     fontsize=8)
-    ax.set_title('Epoch 6 Overall Validation Metrics')
+    ax.set_title(f'{epoch_label} Overall Validation Metrics')
     ax.set_xticks(x)
     ax.set_xticklabels(labels)
     ax.grid(axis='y', linestyle='--', alpha=0.35)
@@ -155,7 +158,8 @@ def plot_overall_improvement(base: Dict[str, float],
                              compare: Dict[str, float],
                              base_name: str,
                              compare_name: str,
-                             out_path: str) -> None:
+                             out_path: str,
+                             epoch_label: str) -> None:
     keys = [
         ('motion_min_ade', 'minADE', 'lower'),
         ('motion_min_fde', 'minFDE', 'lower'),
@@ -191,7 +195,7 @@ def plot_overall_improvement(base: Dict[str, float],
         offset = 0.04 if value >= 0 else -0.04
         ax.text(xx, value + offset, f'{value:+.2f}%', ha='center',
                 va=va, fontsize=8)
-    ax.set_title(f'{compare_name} Relative Improvement vs {base_name}')
+    ax.set_title(f'{compare_name} Relative Improvement vs {base_name} ({epoch_label})')
     ax.set_ylabel('Improvement (%)')
     ax.set_xticks(x)
     ax.set_xticklabels(labels)
@@ -226,7 +230,8 @@ def plot_turn_bucket_metrics(base_rows: Dict[str, Dict[str, float]],
                              compare_rows: Dict[str, Dict[str, float]],
                              base_name: str,
                              compare_name: str,
-                             out_path: str) -> None:
+                             out_path: str,
+                             epoch_label: str) -> None:
     buckets = ['static_slow', 'straight', 'mild_turn', 'sharp_turn']
     panels = [
         ('minFDE', 'Oracle minFDE'),
@@ -259,7 +264,7 @@ def plot_turn_bucket_metrics(base_rows: Dict[str, Dict[str, float]],
         ax.set_xticklabels(buckets, rotation=18, ha='right')
         ax.grid(axis='y', linestyle='--', alpha=0.35)
     axes[0].legend(fontsize=8)
-    fig.suptitle('Epoch 6 Turn-Bucket Motion Metrics', fontsize=13)
+    fig.suptitle(f'{epoch_label} Turn-Bucket Motion Metrics', fontsize=13)
     fig.tight_layout(rect=[0, 0, 1, 0.95])
     fig.savefig(out_path)
     plt.close(fig)
@@ -269,7 +274,8 @@ def plot_turn_bucket_improvement(base_rows: Dict[str, Dict[str, float]],
                                  compare_rows: Dict[str, Dict[str, float]],
                                  base_name: str,
                                  compare_name: str,
-                                 out_path: str) -> None:
+                                 out_path: str,
+                                 epoch_label: str) -> None:
     buckets = ['static_slow', 'straight', 'mild_turn', 'sharp_turn']
     panels = [
         ('minFDE', 'Oracle minFDE', 'lower'),
@@ -306,7 +312,7 @@ def plot_turn_bucket_improvement(base_rows: Dict[str, Dict[str, float]],
         ax.set_xticks(x)
         ax.set_xticklabels(buckets, rotation=18, ha='right')
         ax.grid(axis='y', linestyle='--', alpha=0.35)
-    fig.suptitle(f'{compare_name} Turn-Bucket Improvement vs {base_name}',
+    fig.suptitle(f'{compare_name} Turn-Bucket Improvement vs {base_name} ({epoch_label})',
                  fontsize=13)
     fig.tight_layout(rect=[0, 0, 1, 0.95])
     fig.savefig(out_path)
@@ -317,16 +323,20 @@ def render_compare_frame(points: np.ndarray,
                          gt_data: Dict[str, np.ndarray],
                          base_pred: Dict[str, np.ndarray],
                          compare_pred: Dict[str, np.ndarray],
+                         extra_pred: Optional[Dict[str, np.ndarray]],
                          class_names: Sequence[str],
                          pc_range: Sequence[float],
                          title: str,
                          base_name: str,
                          compare_name: str,
+                         extra_name: str,
                          out_path: str,
                          point_stride: int,
                          annotate_topk: int,
                          hdmap_lanes: Optional[Sequence[dict]] = None) -> None:
-    fig, axes = plt.subplots(1, 3, figsize=(16.8, 8.4), dpi=150)
+    num_panels = 4 if extra_pred is not None else 3
+    fig_width = 22.4 if extra_pred is not None else 16.8
+    fig, axes = plt.subplots(1, num_panels, figsize=(fig_width, 8.4), dpi=150)
     fig.patch.set_facecolor('black')
 
     gt_title = f'GT boxes + GT future ({len(gt_data["boxes"])})'
@@ -337,6 +347,8 @@ def render_compare_frame(points: np.ndarray,
         f'{base_name} pred ({len(base_pred["boxes"])})',
         f'{compare_name} pred ({len(compare_pred["boxes"])})',
     ]
+    if extra_pred is not None:
+        panel_titles.append(f'{extra_name} pred ({len(extra_pred["boxes"])})')
     for ax, panel_title in zip(axes, panel_titles):
         setup_axis(ax, pc_range, panel_title)
         draw_points(ax, points, point_stride)
@@ -353,6 +365,11 @@ def render_compare_frame(points: np.ndarray,
     draw_boxes(axes[2], compare_pred, class_names, 'T#', annotate_topk,
                alpha=0.95)
     draw_pred_traj(axes[2], compare_pred)
+
+    if extra_pred is not None:
+        draw_boxes(axes[3], extra_pred, class_names, 'L#', annotate_topk,
+                   alpha=0.95)
+        draw_pred_traj(axes[3], extra_pred)
 
     fig.suptitle(title, color='white', fontsize=11)
     fig.subplots_adjust(
@@ -379,6 +396,7 @@ def selected_indices(args: argparse.Namespace, dataset_len: int) -> List[int]:
 def main() -> None:
     args = parse_args()
     mmcv.mkdir_or_exist(args.out_dir)
+    epoch_tag = f'epoch{args.epoch}'
 
     cfg_path = resolve_repo_path(args.config)
     cfg = Config.fromfile(cfg_path)
@@ -393,30 +411,38 @@ def main() -> None:
 
     base_results = mmcv.load(resolve_repo_path(args.base_results))
     compare_results = mmcv.load(resolve_repo_path(args.compare_results))
-    if len(base_results) != len(dataset) or len(compare_results) != len(dataset):
+    extra_results = (mmcv.load(resolve_repo_path(args.extra_results))
+                     if args.extra_results else None)
+    if len(base_results) != len(dataset) or len(compare_results) != len(dataset) or (
+            extra_results is not None and len(extra_results) != len(dataset)):
         raise ValueError(
             f'Result length mismatch: dataset={len(dataset)}, '
-            f'base={len(base_results)}, compare={len(compare_results)}')
+            f'base={len(base_results)}, compare={len(compare_results)}, '
+            f'extra={None if extra_results is None else len(extra_results)}')
 
     base_metrics = read_latest_val_metrics(args.base_work_dir, args.epoch)
     compare_metrics = read_latest_val_metrics(args.compare_work_dir, args.epoch)
     if base_metrics and compare_metrics:
         plot_overall_metrics(
             base_metrics, compare_metrics, args.base_name, args.compare_name,
-            osp.join(args.out_dir, 'overall_epoch6_metrics.png'))
+            osp.join(args.out_dir, f'overall_{epoch_tag}_metrics.png'),
+            epoch_tag)
         plot_overall_improvement(
             base_metrics, compare_metrics, args.base_name, args.compare_name,
-            osp.join(args.out_dir, 'overall_epoch6_improvement.png'))
+            osp.join(args.out_dir, f'overall_{epoch_tag}_improvement.png'),
+            epoch_tag)
 
     base_turn = read_turn_csv(args.base_turn_csv)
     compare_turn = read_turn_csv(args.compare_turn_csv)
     if base_turn and compare_turn:
         plot_turn_bucket_metrics(
             base_turn, compare_turn, args.base_name, args.compare_name,
-            osp.join(args.out_dir, 'turn_bucket_epoch6_metrics.png'))
+            osp.join(args.out_dir, f'turn_bucket_{epoch_tag}_metrics.png'),
+            epoch_tag)
         plot_turn_bucket_improvement(
             base_turn, compare_turn, args.base_name, args.compare_name,
-            osp.join(args.out_dir, 'turn_bucket_epoch6_improvement.png'))
+            osp.join(args.out_dir, f'turn_bucket_{epoch_tag}_improvement.png'),
+            epoch_tag)
 
     hdmap_lanes = None
     hdmap_path = None
@@ -439,6 +465,10 @@ def main() -> None:
             unwrap_result(base_results[idx]), args.score_thr, args.topk)
         compare_pred = pred_from_result(
             unwrap_result(compare_results[idx]), args.score_thr, args.topk)
+        extra_pred = None
+        if extra_results is not None:
+            extra_pred = pred_from_result(
+                unwrap_result(extra_results[idx]), args.score_thr, args.topk)
 
         frame_hdmap = None
         if hdmap_lanes is not None:
@@ -455,9 +485,9 @@ def main() -> None:
             f'epoch={args.epoch} frame={frame_id} index={idx} '
             f'token={token[:8]} scene={scene[-8:]}')
         render_compare_frame(
-            points, gt_data, base_pred, compare_pred, class_names,
+            points, gt_data, base_pred, compare_pred, extra_pred, class_names,
             cfg.point_cloud_range, title, args.base_name, args.compare_name,
-            out_path, args.point_stride, args.annotate_topk,
+            args.extra_name, out_path, args.point_stride, args.annotate_topk,
             hdmap_lanes=frame_hdmap)
         frame_files.append(out_path)
         summary.append(dict(
@@ -469,6 +499,8 @@ def main() -> None:
             num_gt=int(len(gt_data['boxes'])),
             num_base_pred=int(len(base_pred['boxes'])),
             num_compare_pred=int(len(compare_pred['boxes'])),
+            num_extra_pred=None if extra_pred is None else int(
+                len(extra_pred['boxes'])),
             hdmap_path=hdmap_path,
             num_hdmap_lanes=0 if frame_hdmap is None else int(len(frame_hdmap)),
         ))
@@ -479,10 +511,10 @@ def main() -> None:
     write_html(frame_dir, frame_files)
     write_webm(frame_dir, args.webm_fps, args.webm_crf)
 
-    print(osp.join(args.out_dir, 'overall_epoch6_metrics.png'))
-    print(osp.join(args.out_dir, 'overall_epoch6_improvement.png'))
-    print(osp.join(args.out_dir, 'turn_bucket_epoch6_metrics.png'))
-    print(osp.join(args.out_dir, 'turn_bucket_epoch6_improvement.png'))
+    print(osp.join(args.out_dir, f'overall_{epoch_tag}_metrics.png'))
+    print(osp.join(args.out_dir, f'overall_{epoch_tag}_improvement.png'))
+    print(osp.join(args.out_dir, f'turn_bucket_{epoch_tag}_metrics.png'))
+    print(osp.join(args.out_dir, f'turn_bucket_{epoch_tag}_improvement.png'))
     print(osp.join(frame_dir, 'index.html'))
     print(osp.join(frame_dir, 'pytorch_bev_vis.webm'))
 

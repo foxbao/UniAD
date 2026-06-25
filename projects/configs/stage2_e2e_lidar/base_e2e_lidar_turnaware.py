@@ -19,9 +19,14 @@ _base_ = ['./base_e2e_lidar.py']
 # num_anchor_group = len(group_id_list)). Cone (id 9) gets its own static group,
 # matching base_e2e_lidar_HDMap. load_from is inherited (same stage-1 drivable
 # checkpoint as every other arm), so all four arms start from identical weights.
+pedestrian_id_list = [0]
+vehicle_id_list = [1, 2, 3, 4, 5, 6, 7, 8, 10, 11, 12]
+cone_id_list = [9]
+group_id_list = [pedestrian_id_list, vehicle_id_list, cone_id_list]
+
 model = dict(
     motion_head=dict(
-        group_id_list=[[0], [1, 2, 3, 4, 5, 6, 7, 8, 10, 11, 12], [9]],
+        group_id_list=group_id_list,
         anchor_info_path='data/others/motion_anchor_infos_kl_turnaware_3grp.pkl'))
 
 work_dir = './projects/work_dirs/stage2_e2e_lidar/base_e2e_lidar_turnaware'
