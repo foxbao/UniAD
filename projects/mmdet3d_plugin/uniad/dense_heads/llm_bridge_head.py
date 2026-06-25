@@ -14,11 +14,27 @@ frozen; only the projector (+ optional LoRA adapters) train.
 IMPORTANT (verified on uniad_train, torch1.12 + transformers 4.46.3):
   - Qwen2.5-0.5B must run in bf16 (or fp32); fp16 yields NaN LM loss.
 """
+import json
+import os
+
 import torch
 import torch.nn as nn
 
 from mmcv.runner import BaseModule
 from mmdet.models import HEADS
+
+
+def _is_qwen3_checkpoint(llm_name):
+    """Return True for local/HF Qwen3 checkpoints without importing HF code."""
+    name = str(llm_name)
+    cfg_path = os.path.join(name, 'config.json')
+    if os.path.isfile(cfg_path):
+        try:
+            with open(cfg_path, 'r') as f:
+                return json.load(f).get('model_type') == 'qwen3'
+        except (OSError, ValueError):
+            pass
+    return 'qwen3' in name.lower()
 
 
 @HEADS.register_module()
@@ -78,6 +94,7 @@ class LLMBridgeHead(BaseModule):
 
     def _build_llm(self):
         """Construct tokenizer + (LoRA-wrapped, bf16) causal LM in __init__."""
+        is_qwen3 = _is_qwen3_checkpoint(self.llm_name)
         try:
             from transformers import AutoModelForCausalLM, AutoTokenizer
         except ImportError as e:
@@ -89,8 +106,12 @@ class LLMBridgeHead(BaseModule):
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
         # bf16 is mandatory: fp16 gives NaN loss on this model (see module doc).
+        model_kwargs = dict(torch_dtype=torch.bfloat16)
+        if is_qwen3 and not hasattr(
+                torch.nn.functional, 'scaled_dot_product_attention'):
+            model_kwargs['attn_implementation'] = 'eager'
         llm = AutoModelForCausalLM.from_pretrained(
-            self.llm_name, torch_dtype=torch.bfloat16)
+            self.llm_name, **model_kwargs)
         if self.freeze_llm:
             llm.eval()
             for p in llm.parameters():
@@ -233,4 +254,3 @@ class LLMBridgeHead(BaseModule):
             eos_token_id=self.tokenizer.eos_token_id)
         return self.tokenizer.batch_decode(
             gen, skip_special_tokens=True)[0].strip()
-

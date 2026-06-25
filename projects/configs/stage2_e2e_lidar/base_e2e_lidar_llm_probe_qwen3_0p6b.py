@@ -3,10 +3,13 @@ _base_ = ['./base_e2e_lidar_llm_probe.py']
 # Stage-1 LLM probe variant with Qwen3-0.6B as the student language model.
 #
 # Important environment note:
-#   Qwen3 checkpoints use model_type='qwen3' and require transformers>=4.51.
-#   The current uniad_train env has transformers==4.46.3, so this config is
-#   intentionally a trial variant and will not build until that compatibility
-#   issue is handled in a separate environment or controlled package upgrade.
+#   Run this config in the isolated env:
+#     conda activate /mnt/disk1/conda_envs/uniad_train_qwen3_py39
+#   It keeps UniAD's torch1.12/mmcv stack, uses transformers==4.51.3 for
+#   model_type='qwen3', and has a sitecustomize.py shim for torch1.12 symbols
+#   imported by newer transformers. Do not upgrade the main uniad_train env.
+#   Smoke verified: build_model -> UniADMotionLidar + LLMBridgeHead +
+#   PeftModelForCausalLM, with only llm_head trainable in probe mode.
 
 model = dict(
     llm_head=dict(

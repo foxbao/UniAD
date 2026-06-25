@@ -36,13 +36,14 @@ sidecar `*_vlmcap_summaries.json`、合并后 pkl 后缀 `_vlmcap`）。
 | env | torch | numpy | transformers | 用途 |
 |-----|-------|-------|--------------|------|
 | `uniad_train` | 1.12.1+cu116 | 1.22.4 | 4.46.3 (+peft 0.13.2) | 训练主环境；几何事实生成、子集抽样、读写 KL pkl、**LLMBridgeHead 训练**（默认 Qwen2.5-0.5B）|
+| `/mnt/disk1/conda_envs/uniad_train_qwen3_py39` | 1.12.1+cu116 | 1.22.4 | 4.51.3 (+peft 0.13.2) | **Qwen3-0.6B student 隔离试验环境**；已验证 `base_e2e_lidar_llm_probe_qwen3_0p6b.py` 可 build + head loss smoke |
 | `qwen_vl`（本方案新建） | 2.6.0+cu124 | 2.2.6 | 4.57.6 | 仅跑 VLM caption 离线推理；已验证可加载 Qwen2.5-VL-7B 与 Qwen3-VL-8B |
 
 > uniad_train 的 transformers/peft 是 LLMBridgeHead 训练所需，**后装**（原始环境无）。
 > ⚠️ 装时务必 `--no-deps` 锁 torch，否则 accelerate 会强升 torch→2.4 打断 mmcv.ops（见 4.2）。
 > Qwen3-0.6B student 已下载到 `/mnt/disk1/models/Qwen3-0.6B`，但它的 `model_type=qwen3`
-> 需要 transformers>=4.51；当前 `uniad_train` 的 4.46.3 会报 `KeyError: 'qwen3'`。先不要直接升级
-> 主训练环境，需单独做兼容环境或受控升级验证。
+> 需要 transformers>=4.51；当前 `uniad_train` 的 4.46.3 会报 `KeyError: 'qwen3'`。已建立隔离环境
+> `/mnt/disk1/conda_envs/uniad_train_qwen3_py39`，不要直接升级主训练环境。
 
 ⚠️ **numpy 跨版本陷阱**：qwen_vl(numpy2.x) 直接 pickle 重写 KL pkl 后，uniad_train(numpy1.x)
 会因 `No module named numpy._core` **读不了**。因此 VLM caption 的产物通过 **token→summary 的 JSON sidecar**
@@ -55,6 +56,29 @@ conda activate qwen_vl
 pip install "torch==2.6.0" torchvision==0.21.0 --index-url https://download.pytorch.org/whl/cu124
 pip install "transformers==4.57.6" accelerate qwen-vl-utils modelscope pillow
 ```
+
+Qwen3-0.6B student 隔离环境使用方法（已建好）：
+```bash
+conda activate /mnt/disk1/conda_envs/uniad_train_qwen3_py39
+PYTHONPATH=$(pwd) python - <<'PY'
+from mmcv import Config
+import projects.mmdet3d_plugin
+from third_party.uniad_mmdet3d.models.builder import build_model
+
+cfg = Config.fromfile(
+    'projects/configs/stage2_e2e_lidar/base_e2e_lidar_llm_probe_qwen3_0p6b.py')
+model = build_model(cfg.model, test_cfg=cfg.get('test_cfg'))
+print(type(model).__name__, type(model.llm_head._llm).__name__)
+PY
+```
+
+该环境的关键处理：
+- Python 3.9 独立环境放在 `/mnt/disk1/conda_envs`，避免根盘空间压力。
+- `PYTHONNOUSERSITE=1`，避免用户 site-packages 污染。
+- `mmcv-full==1.5.2` 与 `third_party/uniad_mmdet3d` 自定义 CUDA ops 已按 Python 3.9 重新编译。
+- 安装 `spconv-cu116==2.3.6` 及 `cumm-cu116/pccm/ccimport/ninja`。
+- 环境内 `sitecustomize.py` 为 torch1.12 提供 transformers>=4.51 import Qwen3 所需的少量 torch2 符号 shim；
+  只用于这个隔离环境，不改主 `uniad_train`。
 
 ## 0.3 数据集事实（KL 港口数据集，已核实）
 
@@ -342,8 +366,9 @@ motion track_query（仅 fallback/历史分支）┘                            
 
 - **默认底座**：Qwen2.5-0.5B（d_llm=896），中文友好、单卡可 LoRA、最稳。
 - **Qwen3-0.6B 试验分支**：`base_e2e_lidar_llm_probe_qwen3_0p6b.py`，`d_llm=1024`；
-  已在 `qwen_vl` 中验证可加载（`Qwen3ForCausalLM`，596M 参数），但当前 `uniad_train`
-  transformers 版本暂不兼容，需先解决环境。
+  已在隔离环境 `/mnt/disk1/conda_envs/uniad_train_qwen3_py39` 中验证：
+  `UniADMotionLidar + LLMBridgeHead + PeftModelForCausalLM` 可 build，head loss smoke 有限，
+  probe 模式可训练参数约 4.66M（Projector + LoRA）。
 - **Projector**：小 MLP，256 → d_llm，每个 agent 一个 token。
 - **空间编码**：box 中心 (x,y,z)（来自 `track_bbox_results[0][0].gravity_center`）→ MLP → 加到 token，给 LLM 空间先验。
 - **训练**：冻结 LLM 主干，只训 Projector + LoRA。Stage-1 纯探针还会冻结 UniAD 感知栈并 detach 输入 query。
@@ -474,7 +499,8 @@ motion track_query（仅 fallback/历史分支）┘                            
 ### 4.1 已完成（细节见第 0 部分复现手册 / 第 3 节设计）
 
 1. ✅ 默认 LLM 底座选定：Qwen2.5-0.5B（d_llm=896）。Qwen3-0.6B 试验底座已下载，
-   对应 `d_llm=1024`，但 `uniad_train` 需升级/隔离 transformers 后才能训练。
+   对应 `d_llm=1024`，并已在隔离环境 `/mnt/disk1/conda_envs/uniad_train_qwen3_py39`
+   中 build/smoke 通过。
 2. ✅ 方案定调：VLM 图像老师 + 纯 LiDAR 推理（跨模态蒸馏）；几何模板互补。
 3. ✅ token 边界 + caption schema（scene-level summary）锁定。见 3.2.1 / 3.2.2。
 4. ✅ 图像↔LiDAR 同步：`add_cam_sync.py` → `kl_infos_{train,val}_with_cam.pkl`
@@ -509,6 +535,10 @@ motion track_query（仅 fallback/历史分支）┘                            
     `motion_state + operation_state`，并把人工确认状态注入 teacher prompt；`eval_llm_caption.py`
     支持 `--feedback-json` 输出按目标局部解析的 `operation_human_acc`。6 目标 pilot
     （2 个吊机 working + 4 个集装箱叉车 waiting）验证通过。
+14. ✅ Qwen3-0.6B student 隔离环境已落地（2026-06-25）：`/mnt/disk1/conda_envs/uniad_train_qwen3_py39`
+    使用 Python 3.9、torch1.12.1+cu116、transformers4.51.3、peft0.13.2、mmcv1.5.2；
+    `LLMBridgeHead` 单独 loss smoke 通过，`base_e2e_lidar_llm_probe_qwen3_0p6b.py`
+    经真实 `third_party.uniad_mmdet3d.models.builder.build_model` 验证可构建。
 
 ### 4.2 经验教训（踩过的坑，复现必读）
 
@@ -517,6 +547,9 @@ motion track_query（仅 fallback/历史分支）┘                            
 - **装包别动 torch**：pip 装 transformers 时 accelerate 会强升 torch→2.4，打断 mmcv.ops
   CUDA 扩展。装 LLM 依赖用 `transformers==4.46.3 peft==0.13.2`，并 `--no-deps` 锁
   `torch==1.12.1+cu116 torchvision==0.13.1+cu116`。
+- **Qwen3 student 不进主 env**：Qwen3-0.6B 需要 transformers>=4.51，但该版本会 import
+  torch2-only 符号。当前解法是独立 Python3.9 环境 + `sitecustomize.py` shim，且已验证
+  `build_model` 和 head loss；不要直接把主 `uniad_train` 升到 transformers4.51+。
 - **numpy 跨版本交接**：qwen_vl(numpy2.x) 不能重写训练 pkl（uniad_train numpy1.x 读不了），
   故 VLM caption 只导出 `*_summaries.json`、训练侧 merge。见 0.2。
 - **conflict 锥桶修正**（港口特性）：初版 conflict=轨迹最近距<4m，冲突目标多为静止锥桶，
