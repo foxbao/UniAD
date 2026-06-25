@@ -196,7 +196,8 @@ _SYSTEM = (
     '不得根据图像改写；\n'
     '2. 你的任务是结合图像，补充“几何无法判断、但图像能看出”的语义，仅限：'
     '目标是否正在装卸作业、是否等待作业、是否空闲、满载/空载的目视确认；'
-    '判断某目标时，请看与其方位一致的那张相机图（如右后方的目标看【右后方相机】）；\n'
+    '判断某目标时，请看与其方位一致的那张相机图（如右后方的目标看【右后方相机】）；'
+    '若本帧没有有效相机图像，只能依据几何事实输出，不得补充作业/载货等视觉判断；\n'
     '3. 必须区分“运动状态”和“作业状态”：设备本体静止不等于空闲。吊机/轮胎吊静止但吊具、吊臂、'
     '下方车辆或箱体处于装卸上下文时，应判为正在装卸作业；叉车/集装箱叉车静止但叉臂/夹具正在取放货，'
     '也应判为正在作业。对图像看不清或不确定的，不要猜测；\n'
@@ -309,11 +310,16 @@ def _infer_one(model, processor, views, facts_text, max_new_tokens=96,
                annotated=False):
     """views: [(cam, zh_label, path), ...]. Feeds each labeled view so the VLM
     aligns activity/load judgements to the correct bearing."""
-    from qwen_vl_utils import process_vision_info
     content = []
     for _, zh, path in views:
         content.append({'type': 'text', 'text': f'【{zh}相机】'})
         content.append({'type': 'image', 'image': path})
+    if not views:
+        content.append({
+            'type': 'text',
+            'text': '【无有效相机图像】本帧没有可用同步相机；请只依据几何事实生成summary，'
+                    '涉及作业状态、载货状态等视觉语义时写看不清或不要提及。'
+        })
     if annotated:
         facts_text = (
             '注意：图像中的彩色圆点/文字是由激光雷达目标中心投影得到的辅助标注，'
@@ -326,9 +332,12 @@ def _infer_one(model, processor, views, facts_text, max_new_tokens=96,
     ]
     text = processor.apply_chat_template(
         messages, tokenize=False, add_generation_prompt=True)
-    images, videos = process_vision_info(messages)
-    inputs = processor(text=[text], images=images, videos=videos,
-                       padding=True, return_tensors='pt').to(model.device)
+    processor_kwargs = dict(text=[text], padding=True, return_tensors='pt')
+    if views:
+        from qwen_vl_utils import process_vision_info
+        images, videos = process_vision_info(messages)
+        processor_kwargs.update(images=images, videos=videos)
+    inputs = processor(**processor_kwargs).to(model.device)
     import torch
     with torch.no_grad():
         out = model.generate(**inputs, max_new_tokens=max_new_tokens,
@@ -353,6 +362,10 @@ _CAM_ZH = {
     'CAM_FRONT_RIGHT': '右前方', 'CAM_BACK': '后方',
     'CAM_BACK_LEFT': '左后方', 'CAM_BACK_RIGHT': '右后方',
 }
+_CAM_FALLBACK_ORDER = (
+    'CAM_FRONT', 'CAM_FRONT_LEFT', 'CAM_FRONT_RIGHT',
+    'CAM_BACK', 'CAM_BACK_LEFT', 'CAM_BACK_RIGHT',
+)
 _CAM_TO_DISK = {
     'CAM_FRONT': 'front',
     'CAM_FRONT_LEFT': 'left_front',
@@ -371,6 +384,19 @@ def _cam_path(info, cam, data_root):
         return None
     p = e['path']
     return p if osp.isabs(p) or osp.exists(p) else osp.join(data_root, p)
+
+
+def _valid_views(info, data_root, cams):
+    out = []
+    seen = set()
+    for c in cams:
+        if c in seen:
+            continue
+        seen.add(c)
+        p = _cam_path(info, c, data_root)
+        if p is not None:
+            out.append((c, _CAM_ZH.get(c, c), p))
+    return out
 
 
 def _quat_to_rot(x, y, z, w):
@@ -562,8 +588,12 @@ def _annotate_image(path, cam, facts, info, annotated_dir):
 
 def _resolve_views(facts, info, data_root):
     """Cameras covering this frame's relevant agents (AOI/conflict/gate),
-    deduped; returns [(cam, zh_label, path), ...] for valid views; falls back
-    to CAM_FRONT."""
+    deduped; returns [(cam, zh_label, path), ...] for valid views.
+
+    Some KL frames only have a subset of synced cameras. If the bearing-routed
+    cameras are unavailable, fall back to any valid camera instead of dropping
+    the frame to a None summary.
+    """
     aoi = set(facts.get('agents_of_interest', []))
     cams = []
     for a in facts.get('agents', []):
@@ -573,12 +603,10 @@ def _resolve_views(facts, info, data_root):
                 cams.append(c)
     if not cams:
         cams = ['CAM_FRONT']
-    out = []
-    for c in cams:
-        p = _cam_path(info, c, data_root)
-        if p is not None:
-            out.append((c, _CAM_ZH.get(c, c), p))
-    return out
+    out = _valid_views(info, data_root, cams)
+    if out:
+        return out
+    return _valid_views(info, data_root, _CAM_FALLBACK_ORDER)
 
 
 def _maybe_annotate_views(views, facts, info, annotated_dir=None):
@@ -637,17 +665,17 @@ def gen_vlm_to_pkl(pkl_path, model_path, out_path=None, in_place=False,
             print(facts_text)
             n_done += 1
             continue
-        if not views:
-            facts['summary'] = None
-            summaries[token] = None
-            n_skip += 1
-            continue
         facts['summary'] = _infer_one(
             model, processor, views, facts_text, max_new_tokens,
-            annotated=bool(annotated_dir))
+            annotated=bool(annotated_dir and views))
         summaries[token] = facts['summary']
+        meta = {}
         if frame_feedback:
-            summary_meta[token] = {'human_feedback': frame_feedback}
+            meta['human_feedback'] = frame_feedback
+        if not views:
+            meta['no_valid_camera'] = True
+        if meta:
+            summary_meta[token] = meta
         n_done += 1
 
     print(f'[{osp.basename(pkl_path)}] summaries={n_done} skipped={n_skip}'

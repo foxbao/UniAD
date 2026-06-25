@@ -3,8 +3,9 @@
 > 讨论记录 / 2026-06-19。基线 config: `projects/configs/stage2_e2e_lidar/base_e2e_lidar_occ.py`。
 > 当前主线 / 2026-06-23：Stage-1 纯探针 `projects/configs/stage2_e2e_lidar/base_e2e_lidar_llm_probe.py`。
 > 旧 `base_e2e_lidar_occ_llm_train.py` 是 full-task 共训历史实验，不再作为当前首选训练入口。
-> VLM teacher / 2026-06-25：后续新 caption 优先用 `Qwen3-VL-8B-Instruct`；既有 pkl 是
-> `Qwen2.5-VL-7B-Instruct` 生成的历史 baseline，保留用于 A/B 和回退。
+> VLM teacher / 2026-06-25：后续新 caption 优先用 Qwen3-VL 系；`8B` 单卡快迭代，
+> `32B` 走 2×4GPU 分片做高质量 teacher。既有 train pkl 是 `Qwen2.5-VL-7B-Instruct`
+> 生成的历史 baseline，保留用于 A/B 和回退。
 > 目标场景：自有数据集（港口 / 集装箱场），13 类（IGV、Crane、Forklift、Truck 等）。
 
 ---
@@ -15,7 +16,7 @@
 
 ## 0.1 一句话目标
 
-跨模态蒸馏：用离线大 VLM（当前新 teacher：Qwen3-VL-8B；历史 baseline：Qwen2.5-VL-7B）
+跨模态蒸馏：用离线大 VLM（当前新 teacher：Qwen3-VL-8B/32B；历史 baseline：Qwen2.5-VL-7B）
 看**环视相机图（6 路，按目标方位自动路由 2-4 路）**，
 结合 LiDAR 几何事实，生成中文场景 summary 作为监督；训练一个挂在 UniAD **LiDAR query** 上的小
 LLM（默认 Qwen2.5-0.5B；Qwen3-0.6B 试验中），让它**推理时仅凭 LiDAR query** 就能说出图像老师才看得到的语义。推理零图像依赖，
@@ -37,7 +38,7 @@ sidecar `*_vlmcap_summaries.json`、合并后 pkl 后缀 `_vlmcap`）。
 |-----|-------|-------|--------------|------|
 | `uniad_train` | 1.12.1+cu116 | 1.22.4 | 4.46.3 (+peft 0.13.2) | 训练主环境；几何事实生成、子集抽样、读写 KL pkl、**LLMBridgeHead 训练**（默认 Qwen2.5-0.5B）|
 | `/mnt/disk1/conda_envs/uniad_train_qwen3_py39` | 1.12.1+cu116 | 1.22.4 | 4.51.3 (+peft 0.13.2) | **Qwen3-0.6B student 隔离试验环境**；已验证 `base_e2e_lidar_llm_probe_qwen3_0p6b.py` 可 build + head loss smoke |
-| `qwen_vl`（本方案新建） | 2.6.0+cu124 | 2.2.6 | 4.57.6 | 仅跑 VLM caption 离线推理；已验证可加载 Qwen2.5-VL-7B 与 Qwen3-VL-8B |
+| `qwen_vl`（本方案新建） | 2.6.0+cu124 | 2.2.6 | 4.57.6 | 仅跑 VLM caption 离线推理；已验证可加载 Qwen2.5-VL-7B、Qwen3-VL-8B 与 Qwen3-VL-32B（`device_map=auto`） |
 
 > uniad_train 的 transformers/peft 是 LLMBridgeHead 训练所需，**后装**（原始环境无）。
 > ⚠️ 装时务必 `--no-deps` 锁 torch，否则 accelerate 会强升 torch→2.4 打断 mmcv.ops（见 4.2）。
@@ -141,6 +142,9 @@ python tools/data_converter/make_subset.py \
 优先级高于 VLM 自行判断，用于修正港口设备“静止但正在作业”的典型误判。
 `operation_state` 采用 `working/waiting/idle/unknown`，其中“等待作业”是 waiting，
 不能因为含“作业”二字被评测成 working。
+2026-06-25 追加相机兜底：若按目标方位路由的相机无效，回退到本帧任一有效相机；
+若本帧完全没有有效相机，则走 text-only summary，只允许依据 geo_facts，不补作业/载货视觉判断，
+并在 summary meta 标记 `no_valid_camera`。
 **关键产物是 JSON sidecar**（`<pkl去后缀>_summaries.json`，token→summary），pkl 输出可丢 /tmp。
 ```bash
 # 当前新 teacher（2026-06-25 后续新 caption 优先用）
@@ -170,6 +174,12 @@ CUDA_VISIBLE_DEVICES=0 python tools/data_converter/gen_vlm_caption.py \
 # 输入 pkl 须已含 6 路 sync_info（add_cam_sync 用 6 路 --views 生成）；无则只路由到 front。
 # train 全量请用 7 卡分片：bash tools/run_vlm_caption_train_7gpu.sh（见第 8 步），
 #   --num-shards N --shard-id i 把数据切 N 份并行，各写 *_summaries.shard{i}ofN.json
+
+# 高质量 Qwen3-VL-32B teacher（8×4090：两个进程，每进程 4GPU 模型并行）
+bash tools/run_vlm_caption_qwen32b_val_2x4gpu.sh
+# val 已验证产物:
+# data/kl_8/kl_infos_val_sub6cam_qwen3vl32b_annotated_vlmcap.pkl
+# 805/805 帧有 summary；其中 3 帧无有效相机，退化为 text-only summary。
 ```
 
 **Step 5 — summary 合并回训练 pkl**（env: uniad_train）
@@ -199,11 +209,18 @@ python tools/data_converter/merge_summaries.py \
   `Qwen3VLForConditionalGeneration`，单卡 GPU0 `device_map={'': 0}` 可加载。
   下载命令：
   `modelscope download --model Qwen/Qwen3-VL-8B-Instruct --local_dir /mnt/disk1/models/Qwen3-VL-8B-Instruct`
+- **高质量 teacher**：Qwen3-VL-32B-Instruct，已下载到
+  **`/mnt/disk1/models/Qwen3-VL-32B-Instruct`**（63G，14 分片）。`qwen_vl` 环境可用
+  `AutoModelForImageTextToText + device_map=auto` 在 4 张 4090 上加载；8 卡全量生成时用
+  `tools/run_vlm_caption_qwen32b_val_2x4gpu.sh` 启两个 4GPU shard。
+  已完成 val 805 帧 annotated caption：
+  `data/kl_8/kl_infos_val_sub6cam_qwen3vl32b_annotated_vlmcap.pkl`。
 - **历史 baseline teacher**：Qwen2.5-VL-7B-Instruct，modelscope 下载到
   **`/mnt/disk1/models/Qwen2.5-VL-7B-Instruct`**（16G，5 分片）。不要立即删除；用于复现既有
   `*_vlmcap.pkl`、teacher 指标 A/B 和回退。
   ⚠️ 系统盘 `/` 仅剩 ~46G，模型与缓存**必须放 disk1**（`export MODELSCOPE_CACHE=/mnt/disk1/...`）。
-- GPU：本机 8×RTX4090(24G)；Qwen2.5-VL-7B 与 Qwen3-VL-8B 单卡可加载。用空闲卡（如 GPU0），勿占训练卡。
+- GPU：本机 8×RTX4090(24G)；Qwen2.5-VL-7B 与 Qwen3-VL-8B 单卡可加载，Qwen3-VL-32B
+  需要多卡 `device_map=auto`。用空闲卡，勿占训练卡。
 
 ## 0.6 已知问题 / 待办
 
@@ -219,6 +236,10 @@ python tools/data_converter/merge_summaries.py \
   - **train 全量 caption 已完成**：7 卡分片跑 ~2.2h → merge → `kl_infos_train_vlmcap.pkl`
     （43747/43981=99.5% 带 summary）。注意：该 pkl 是 Qwen2.5-VL-7B 历史 teacher 生成。
     Qwen3-VL-8B 已下载验证，后续新 caption 应先在 val v3 做 A/B，再决定是否重做 train 全量。
+  - **Qwen3-VL-32B val teacher 已完成**：2×4GPU 分片跑完 805 帧，并修复相机兜底后
+    `missing_summary=0`（3 帧无有效相机，text-only）。当前指标：
+    `advice=0.988`、`activity_addressed=0.896`、`activity_busy=0.081`、`halluc=0.991`。
+    结论：32B teacher 已可用，但 train 全量前仍建议先人工抽检作业/空闲状态。
   - 模型：`LLMBridgeHead` 已支持两种接线：
     1) 历史 full-task 分支 `base_e2e_lidar_occ_llm*.py`，与 track/map/motion/occ 共训；
     2) 当前 Stage-1 纯探针 `base_e2e_lidar_llm_probe.py`，继承 `base_e2e_lidar.py`，冻结非 LLM 模块，
@@ -230,9 +251,9 @@ python tools/data_converter/merge_summaries.py \
   - (0) ✅ train pkl 已重做 6 相机 + gate 清理（2026-06-22）。
   - (1) ✅ 7 卡分片 caption 已完成（~2.2h，43747 帧带 summary）。
   - (2) ✅ merge → `kl_infos_train_vlmcap.pkl`；训练/评测数据已就绪。
-  - (2.5) ⏳ Qwen3-VL-8B teacher A/B：先跑 val v3 805 帧，并比较 **Qwen3 plain** 与
-    **Qwen3 + LiDAR 投影辅助标注** 两种 teacher，对比 Qwen2.5 baseline 的
-    `activity_addressed/advice/conflict/ttc/halluc`，不要直接重做 train 全量。
+  - (2.5) ✅ Qwen3-VL-32B annotated teacher val 已完成：805/805 帧有 summary，
+    `activity_addressed=0.896`、`halluc=0.991`。下一步不是立刻 train 全量，而是人工抽检
+    作业/空闲状态；确认质量后再重做 train 全量 caption。
   - (3) ✅ 历史 full-task `base_e2e_lidar_occ_llm_train.py` 已跑 1 epoch，证明能输出中文 caption，
     但 `model≈shuffle`，没有证据表明它读到了同帧 query 语义；且主任务指标有退化。见 4.1 / 4.3-B。
   - (4) ✅ 当前 Stage-1 纯探针代码已落地并 smoke 通过：`base_e2e_lidar_llm_probe.py` 只训练
@@ -241,6 +262,7 @@ python tools/data_converter/merge_summaries.py \
 - 文件清单（本方案新增）：
   `tools/data_converter/{add_cam_sync,gen_geo_facts,make_subset,gen_vlm_caption,merge_summaries}.py`、
   `tools/run_vlm_caption_train_7gpu.sh`（7 卡并行 VLM caption）、
+  `tools/run_vlm_caption_qwen32b_val_2x4gpu.sh`（Qwen3-VL-32B 两个 4GPU shard）、
   `tools/analysis_tools/eval_llm_caption.py`（caption 质量评测）、
   `projects/mmdet3d_plugin/uniad/dense_heads/llm_bridge_head.py`、
   `projects/configs/stage2_e2e_lidar/base_e2e_lidar_occ_llm.py`（smoke）、
@@ -535,6 +557,10 @@ motion track_query（仅 fallback/历史分支）┘                            
     使用 Python 3.9、torch1.12.1+cu116、transformers4.51.3、peft0.13.2、mmcv1.5.2；
     `LLMBridgeHead` 单独 loss smoke 通过，`base_e2e_lidar_llm_probe_qwen3_0p6b.py`
     经真实 `third_party.uniad_mmdet3d.models.builder.build_model` 验证可构建。
+15. ✅ Qwen3-VL-32B teacher val 已跑通（2026-06-25）：模型下载到
+    `/mnt/disk1/models/Qwen3-VL-32B-Instruct`，4GPU `device_map=auto` 加载验证，8GPU
+    2×4 shard 完成 805 帧 annotated caption。相机兜底修复后 `missing_summary=0`，
+    预览见 `outputs/qwen32b_val_preview/overview.jpg`。
 
 ### 4.2 经验教训（踩过的坑，复现必读）
 
@@ -582,69 +608,29 @@ motion track_query（仅 fallback/历史分支）┘                            
    `uniad_dist_train.sh projects/configs/stage2_e2e_lidar/base_e2e_lidar_occ_llm_train.py <GPUS>`
    仅作对照复现，不再作为当前建议入口。
 
-**A0. Qwen3-VL-8B teacher A/B（建议先于重做 train 全量）**。Qwen3 已可加载，但现有 train/val caption
-仍是 Qwen2.5 历史 teacher。下一步先用同一批 val v3 805 帧跑两组 Qwen3：
-plain 与 `--annotate-targets`，再和 Qwen2.5 teacher 指标比较。若使用人工反馈子集，再额外跑
-annotated+feedback 并看 `operation_human_acc`。
+**A0. Qwen3-VL-32B teacher QA / train 全量闸门**。32B annotated val 已跑完，现阶段不要直接
+重做 train 全量；先确认作业/空闲状态质量。当前 val 指标：`activity_addressed=0.896`，
+`activity_busy=0.081`，`halluc=0.991`。`activity_busy` 低不一定是坏事，可能是 32B 更常判空闲，
+但必须人工抽检 Crane/Forklift/ContainerForkLift 的 working/waiting/idle。
    ```bash
-   # 1) Qwen3 plain
-   CUDA_VISIBLE_DEVICES=0 python tools/data_converter/gen_vlm_caption.py \
-     --pkl-path data/kl_8/kl_infos_val_sub6cam_v3_vlmcap.pkl \
-     --model-path /mnt/disk1/models/Qwen3-VL-8B-Instruct \
-     --device cuda:0 \
-     --out-path /tmp/val_sub6cam_v3_qwen3vl8b_vlmcap.pkl
-
-   # 2) Qwen3 + LiDAR 投影辅助标注
-   CUDA_VISIBLE_DEVICES=0 python tools/data_converter/gen_vlm_caption.py \
-     --pkl-path data/kl_8/kl_infos_val_sub6cam_v3_vlmcap.pkl \
-     --model-path /mnt/disk1/models/Qwen3-VL-8B-Instruct \
-     --device cuda:0 \
-     --out-path /tmp/val_sub6cam_v3_qwen3vl8b_annotated_vlmcap.pkl \
-     --annotate-targets --annotated-dir /tmp/val_sub6cam_v3_qwen3_annotated_imgs
-
-   # 2.5) Qwen3 + LiDAR 投影辅助标注 + 人工状态反馈（有反馈子集时跑）
-   CUDA_VISIBLE_DEVICES=0 python tools/data_converter/gen_vlm_caption.py \
-     --pkl-path data/kl_8/kl_infos_val_sub6cam_v3_vlmcap.pkl \
-     --model-path /mnt/disk1/models/Qwen3-VL-8B-Instruct \
-     --device cuda:0 \
-     --out-path /tmp/val_sub6cam_v3_qwen3vl8b_feedback_vlmcap.pkl \
-     --annotate-targets --annotated-dir /tmp/val_sub6cam_v3_qwen3_feedback_imgs \
-     --feedback-json documents/llm_teacher_feedback_pilot.json
-
-   # 3) 回 uniad_train merge sidecar；不要直接拿 qwen_vl 写出的 pkl 做训练/评测
+   # 1) 指标复核
    conda activate uniad_train
-   python tools/data_converter/merge_summaries.py \
-     --pkl-path data/kl_8/kl_infos_val_sub6cam_v3_vlmcap.pkl \
-     --json-path /tmp/val_sub6cam_v3_qwen3vl8b_vlmcap_summaries.json \
-     --out-path /tmp/val_sub6cam_v3_qwen3vl8b_eval.pkl \
-     --clear-missing
-   python tools/data_converter/merge_summaries.py \
-     --pkl-path data/kl_8/kl_infos_val_sub6cam_v3_vlmcap.pkl \
-     --json-path /tmp/val_sub6cam_v3_qwen3vl8b_annotated_vlmcap_summaries.json \
-     --out-path /tmp/val_sub6cam_v3_qwen3vl8b_annotated_eval.pkl \
-     --clear-missing
-   python tools/data_converter/merge_summaries.py \
-     --pkl-path data/kl_8/kl_infos_val_sub6cam_v3_vlmcap.pkl \
-     --json-path /tmp/val_sub6cam_v3_qwen3vl8b_feedback_vlmcap_summaries.json \
-     --out-path /tmp/val_sub6cam_v3_qwen3vl8b_feedback_eval.pkl \
-     --clear-missing
+   python tools/analysis_tools/eval_llm_caption.py \
+     --pkl-path data/kl_8/kl_infos_val_sub6cam_qwen3vl32b_annotated_vlmcap.pkl \
+     --mode teacher
 
-   # 4) 对比 teacher 指标
-   python tools/analysis_tools/eval_llm_caption.py \
-     --pkl-path data/kl_8/kl_infos_val_sub6cam_v3_vlmcap.pkl --mode teacher
-   python tools/analysis_tools/eval_llm_caption.py \
-     --pkl-path /tmp/val_sub6cam_v3_qwen3vl8b_eval.pkl --mode teacher
-   python tools/analysis_tools/eval_llm_caption.py \
-     --pkl-path /tmp/val_sub6cam_v3_qwen3vl8b_annotated_eval.pkl --mode teacher
-   python tools/analysis_tools/eval_llm_caption.py \
-     --pkl-path /tmp/val_sub6cam_v3_qwen3vl8b_feedback_eval.pkl --mode teacher \
-     --feedback-json documents/llm_teacher_feedback_pilot.json
+   # 2) 人工看图抽检
+   # 打开 outputs/qwen32b_val_preview/overview.jpg 和 captions.md。
+
+   # 3) 质量确认后再跑 train 全量（估算约 40+ 小时，8GPU）
+   PKL=data/kl_8/kl_infos_train_with_cam_geo.pkl \
+   OUT_PREFIX=/mnt/disk1/tmp/train_qwen3vl32b_annotated_vlmcap \
+   ANNOTATED_DIR=/mnt/disk1/tmp/train_qwen3vl32b_annotated_imgs \
+   MERGED_OUT=data/kl_8/kl_infos_train_qwen3vl32b_annotated_vlmcap.pkl \
+   bash tools/run_vlm_caption_qwen32b_val_2x4gpu.sh
    ```
-   v3 没有单独保留 `*_geo.pkl`，但 `kl_infos_val_sub6cam_v3_vlmcap.pkl` 仍保留 `geo_facts` 和
-   6 路 `sync_info`，可作为 Qwen3 重跑输入；输出到新路径，避免覆盖 Qwen2.5 baseline。
-   评估时重点看 `activity_addressed/advice/conflict_cls/conflict_bearing/ttc/halluc`。只有 Qwen3（尤其是
-   annotated）明显优于 Qwen2.5 且幻觉不恶化，才重跑 train 全量 caption；否则继续用现有 Qwen2.5 pkl
-   做 Stage-1 probe。
+   注意：`run_vlm_caption_qwen32b_val_2x4gpu.sh` 名字里带 val，但通过上面的环境变量可跑 train；
+   它输出两个 shard sidecar，按脚本结尾提示用 `merge_summaries.py` 合并。
 
 **B. 评估指标**（已落地 `tools/analysis_tools/eval_llm_caption.py`）：
    规则解析 caption → 关键语义命中率（conflict 类别/方位、TTC 桶、ego_advice、activity、幻觉），
