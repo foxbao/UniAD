@@ -21,8 +21,9 @@ This is offline data generation: run it in the `qwen_vl` conda env (torch 2.6
 + transformers 4.57.6), NOT in uniad_train. It only reads images + the geo-facts pkl
 and writes the summary field back; the model is never part of inference.
 
-Runs on a single GPU (Qwen2.5-VL-7B / Qwen3-VL-8B fit in 24G).
-Use --device cuda:0 to pin.
+Runs on a single GPU by default (Qwen2.5-VL-7B / Qwen3-VL-8B fit in
+24G). Larger teachers can be sharded across the visible GPUs with
+--device-map auto.
 """
 
 import argparse
@@ -256,13 +257,47 @@ def _render_facts(facts):
     return '\n'.join(lines)
 
 
-def _load_model(model_path, device):
+def _parse_max_memory(spec):
+    if not spec:
+        return None
+    import torch
+    if ':' not in spec:
+        return {i: spec for i in range(torch.cuda.device_count())}
+    memory = {}
+    for item in spec.split(','):
+        if not item:
+            continue
+        key, value = item.split(':', 1)
+        key = key.strip()
+        value = value.strip()
+        memory[int(key) if key.isdigit() else key] = value
+    return memory
+
+
+def _load_model(model_path, device, device_map=None, max_memory=None):
     import torch
     from transformers import AutoModelForImageTextToText, AutoProcessor
+    if device_map in (None, '', 'single'):
+        resolved_device_map = {'': device}
+    elif device_map == 'auto':
+        resolved_device_map = 'auto'
+    else:
+        raise ValueError(
+            f'Unsupported --device-map {device_map!r}; use single or auto.')
+    kwargs = dict(
+        dtype=torch.bfloat16,
+        attn_implementation='sdpa',
+        device_map=resolved_device_map,
+        trust_remote_code=True,
+        low_cpu_mem_usage=True)
+    parsed_max_memory = _parse_max_memory(max_memory)
+    if parsed_max_memory is not None:
+        kwargs['max_memory'] = parsed_max_memory
     model = AutoModelForImageTextToText.from_pretrained(
-        model_path, dtype=torch.bfloat16, attn_implementation='sdpa',
-        device_map={'': device}, trust_remote_code=True)
+        model_path, **kwargs)
     model.eval()
+    if hasattr(model, 'hf_device_map'):
+        print(f'  -> model device_map: {model.hf_device_map}')
     # Keep image preprocessing stable across transformers releases. In 4.57,
     # Qwen2.5-VL defaults to a fast processor with slightly different output.
     processor = AutoProcessor.from_pretrained(
@@ -559,7 +594,8 @@ def gen_vlm_to_pkl(pkl_path, model_path, out_path=None, in_place=False,
                   data_root='', device='cuda:0', limit=0,
                   max_new_tokens=96, dry_run=False,
                   num_shards=1, shard_id=0, annotated_dir=None,
-                  feedback=None):
+                  feedback=None, device_map='single', max_memory=None,
+                  load_only=False):
     with open(pkl_path, 'rb') as f:
         data = pickle.load(f)
     infos = (data['data_list'] if isinstance(data, dict) and 'data_list' in data
@@ -572,7 +608,12 @@ def gen_vlm_to_pkl(pkl_path, model_path, out_path=None, in_place=False,
         infos = infos[shard_id::num_shards]
     model = processor = None
     if not dry_run:
-        model, processor = _load_model(model_path, device)
+        model, processor = _load_model(
+            model_path, device, device_map=device_map,
+            max_memory=max_memory)
+        if load_only:
+            print('load-only smoke passed.')
+            return
 
     n_done = n_skip = 0
     summaries = {}  # token -> summary, numpy-version-safe sidecar
@@ -675,11 +716,23 @@ def main():
     parser.add_argument('--data-root', default='',
                         help='Prefix for relative image paths (usually cwd).')
     parser.add_argument('--device', default='cuda:0')
+    parser.add_argument('--device-map', default='single',
+                        choices=['single', 'auto'],
+                        help='single: put the whole model on --device. auto: '
+                        'let Transformers/Accelerate shard the model across '
+                        'visible GPUs, e.g. CUDA_VISIBLE_DEVICES=0,1,2,3.')
+    parser.add_argument('--max-memory', default=None,
+                        help='Optional max_memory for --device-map auto. '
+                        'Use one value for every visible GPU, e.g. 22GiB, or '
+                        'comma items such as 0:22GiB,1:22GiB,cpu:64GiB.')
     parser.add_argument('--limit', type=int, default=0,
                         help='Only process first N frames (0=all).')
     parser.add_argument('--max-new-tokens', type=int, default=96)
     parser.add_argument('--dry-run', action='store_true',
                         help='Render prompts only; do not load the model.')
+    parser.add_argument('--load-only', action='store_true',
+                        help='Load model/processor and exit. Useful for '
+                        'multi-GPU memory smoke tests.')
     parser.add_argument('--num-shards', type=int, default=1,
                         help='Data-parallel shards (one process/GPU each).')
     parser.add_argument('--shard-id', type=int, default=0,
@@ -706,7 +759,8 @@ def main():
             max_new_tokens=args.max_new_tokens, dry_run=args.dry_run,
             num_shards=args.num_shards, shard_id=args.shard_id,
             annotated_dir=(args.annotated_dir if args.annotate_targets else None),
-            feedback=feedback)
+            feedback=feedback, device_map=args.device_map,
+            max_memory=args.max_memory, load_only=args.load_only)
 
 
 if __name__ == '__main__':
