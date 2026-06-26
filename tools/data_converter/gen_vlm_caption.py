@@ -658,26 +658,16 @@ def _ego_direction_cams(info):
     fut = _ego_future_xy(info)
     if fut.size == 0:
         return []
-    dx, dy = fut[-1]
-    if float(math.hypot(dx, dy)) < 0.3:
+    dx = float(fut[-1][0])
+    dy = float(fut[-1][1])
+    if math.hypot(dx, dy) < 0.3:
         return []
-    cams = []
-    if dx >= 0:
-        cams.append('CAM_FRONT')
-        if dy > 0.5:
-            cams.append('CAM_FRONT_LEFT')
-        elif dy < -0.5:
-            cams.append('CAM_FRONT_RIGHT')
-    else:
-        cams.append('CAM_BACK')
-        if dy > 0.5:
-            cams.append('CAM_BACK_LEFT')
-        elif dy < -0.5:
-            cams.append('CAM_BACK_RIGHT')
-    return cams
+    return ['CAM_BACK'] if dx < -0.3 else ['CAM_FRONT']
 
 
 def _draw_ego_future(draw, image, cam, info, calib, small_font):
+    if cam not in ('CAM_FRONT', 'CAM_BACK'):
+        return False
     import numpy as np
     fut = _ego_future_xy(info)
     if fut.size == 0:
