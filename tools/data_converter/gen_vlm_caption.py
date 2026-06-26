@@ -382,8 +382,9 @@ def _infer_one(model, processor, views, facts_text, max_new_tokens=96,
         })
     if annotated:
         facts_text = (
-            '注意：图像中的彩色圆点/文字是由激光雷达目标中心投影得到的辅助标注，'
-            '格式为“#目标ID 类别 距离”；黄色线段/箭头是本车前进未来轨迹投影，'
+            '注意：图像中的彩色圆点/文字和线框是由数据集GT label投影得到的辅助标注，'
+            '圆点为目标中心，线框为3D标注框，格式为“#目标ID 类别 距离”；'
+            '黄色线段/箭头是本车前进未来轨迹投影，'
             '青色线段/箭头是本车后退未来轨迹投影，'
             '用于理解本车前进、倒车或转弯方向。请优先结合这些标注定位事实中点名的目标，'
             '但本车建议仍必须照抄几何事实。\n'
@@ -574,6 +575,49 @@ def _project_point(point_lidar, cam, image_size, calib):
     if not (-40 <= u <= width + 40 and -40 <= v <= height + 40):
         return None
     return u, v
+
+
+def _box3d_corners(box):
+    import numpy as np
+    if len(box) < 7:
+        return np.zeros((0, 3), dtype=np.float64)
+    x, y, z, length, width, height, yaw = [float(v) for v in box[:7]]
+    c = math.cos(yaw)
+    s = math.sin(yaw)
+    rot = np.array([[c, -s], [s, c]], dtype=np.float64)
+    local_xy = np.array([
+        [length / 2.0, width / 2.0],
+        [length / 2.0, -width / 2.0],
+        [-length / 2.0, -width / 2.0],
+        [-length / 2.0, width / 2.0],
+    ], dtype=np.float64)
+    xy = local_xy @ rot.T + np.array([x, y], dtype=np.float64)
+    z_top = z + height / 2.0
+    z_bottom = z - height / 2.0
+    top = np.column_stack([xy, np.full(4, z_top, dtype=np.float64)])
+    bottom = np.column_stack([xy, np.full(4, z_bottom, dtype=np.float64)])
+    return np.vstack([top, bottom])
+
+
+_BOX3D_EDGES = (
+    (0, 1), (1, 2), (2, 3), (3, 0),
+    (4, 5), (5, 6), (6, 7), (7, 4),
+    (0, 4), (1, 5), (2, 6), (3, 7),
+)
+
+
+def _draw_box3d(draw, image, box, cam, calib, color):
+    corners = _box3d_corners(box)
+    if len(corners) != 8:
+        return False
+    pts = [_project_point(corner, cam, image.size, calib) for corner in corners]
+    n_edges = 0
+    for i, j in _BOX3D_EDGES:
+        if pts[i] is None or pts[j] is None:
+            continue
+        draw.line([pts[i], pts[j]], fill=color, width=3)
+        n_edges += 1
+    return n_edges >= 2
 
 
 def _ego_future_xy(info):
@@ -772,10 +816,15 @@ def _annotate_image(path, cam, facts, info, annotated_dir,
         if inst is None or agent is None:
             continue
         uv = _project_point(inst['bbox_3d'][:3], cam, image.size, calib)
+        color = colors[idx % len(colors)]
+        drew_box = _draw_box3d(
+            draw, image, inst['bbox_3d'], cam, calib, color)
+        if uv is None and not drew_box:
+            continue
         if uv is None:
+            n_drawn += 1
             continue
         u, v = uv
-        color = colors[idx % len(colors)]
         r = 8
         draw.ellipse((u - r, v - r, u + r, v + r), fill=color,
                      outline=(255, 255, 255), width=2)
@@ -795,7 +844,7 @@ def _annotate_image(path, cam, facts, info, annotated_dir,
     draw.rectangle((0, image.height - 30, image.width, image.height),
                    fill=(0, 0, 0))
     draw.text((8, image.height - 27),
-              'LiDAR投影辅助标注：彩色点为目标中心；黄=本车前进，青=本车后退',
+              'GT label投影：彩色点=目标中心，线框=3D框；黄=本车前进，青=本车后退',
               font=small_font, fill=(255, 255, 255))
     annotated_dir = Path(annotated_dir)
     annotated_dir.mkdir(parents=True, exist_ok=True)
