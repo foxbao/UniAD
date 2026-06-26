@@ -12,9 +12,10 @@ See documents/llm_integration_plan.md (3.2). Pipeline per frame:
        output ONE fluent Chinese summary sentence
     -> info['geo_facts']['summary']
 
-Each image is labeled by its calibrated optical viewing direction
-(【前方相机】/【右后方相机】...) so the VLM aligns activity/load judgements
-to the correct direction. Multi-camera fixes the single-front blind spot:
+Each image is labeled with its CAM_* id plus the calibrated optical viewing
+direction so the VLM aligns activity/load judgements to the correct target.
+The final caption must still use the ego-centric geometry bearing from
+geo_facts, not the camera id. Multi-camera fixes the single-front blind spot:
 rear/side targets that front-only could not see (and so were never captioned
 with an activity state — see plan 4.2/4.3).
 
@@ -196,15 +197,17 @@ def _render_feedback(feedback_for_frame, facts):
 
 _SYSTEM = (
     '你是港口自动驾驶场景的标注助手。下面给你若干张本车环视相机图像（每张图前'
-    '都标注了它的方位，如【前方相机】【右后方相机】），'
+    '都标注了摄像机名和按外参计算的实际视线方向，如【CAM_FRONT_RIGHT相机，实际视线：右后方】），'
     '以及一份由激光雷达几何计算得到的、准确无误的场景事实。'
     '请严格遵守：\n'
     '1. 事实中的数量、类别、方位、距离、运动、冲突均为准确数据，不得改动或编造；'
     '其中 ego_advice 是几何步骤已经算好的本车建议，必须原样保留为“保持/减速/让行/停车”，'
-    '不得根据图像改写；\n'
+    '不得根据图像改写；最终summary里的所有目标方位词必须来自场景事实，'
+    '不得根据摄像机名、安装位置或目标在图像中的左右位置自行改写；\n'
     '2. 你的任务是结合图像，补充“几何无法判断、但图像能看出”的语义，仅限：'
     '目标是否正在装卸作业、是否等待作业、是否空闲、满载/空载的目视确认；'
-    '判断某目标时，请看与其方位一致的那张相机图（如右后方的目标看【右后方相机】）；'
+    '判断某目标时，请看“实际视线方向”与该目标几何方位一致的相机图；'
+    '注意 CAM_FRONT_RIGHT / CAM_BACK_RIGHT 等只是摄像机文件名或安装位置名，不等于目标相对本车方位；'
     '若本帧没有有效相机图像，只能依据几何事实输出，不得补充作业/载货等视觉判断；\n'
     '3. 必须区分“运动状态”和“作业状态”：设备本体静止不等于空闲，但事实里写明缓行/行驶的'
     '正面吊、轮胎吊、叉车、集装箱叉车只能描述为移动/行驶，不得用图像覆盖成正在装卸或等待作业。'
@@ -375,7 +378,8 @@ def _infer_one(model, processor, views, facts_text, max_new_tokens=96,
     plus optional BEV GT view so the VLM aligns targets to the facts."""
     content = []
     for view_id, zh, path in views:
-        title = f'【{zh}】' if view_id == 'BEV_GT' else f'【{zh}相机】'
+        title = f'【{zh}】' if view_id == 'BEV_GT' \
+            else f'【{view_id}相机，实际视线：{zh}】'
         content.append({'type': 'text', 'text': title})
         content.append({'type': 'image', 'image': path})
     if not has_camera_views:
