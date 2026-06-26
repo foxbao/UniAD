@@ -367,14 +367,15 @@ def _load_model(model_path, device, device_map=None, max_memory=None):
 
 
 def _infer_one(model, processor, views, facts_text, max_new_tokens=96,
-               annotated=False):
-    """views: [(cam, zh_label, path), ...]. Feeds each labeled view so the VLM
-    aligns activity/load judgements to the correct bearing."""
+               annotated=False, has_camera_views=True):
+    """views: [(view_id, zh_label, path), ...]. Feeds each labeled camera view
+    plus optional BEV GT view so the VLM aligns targets to the facts."""
     content = []
-    for _, zh, path in views:
-        content.append({'type': 'text', 'text': f'【{zh}相机】'})
+    for view_id, zh, path in views:
+        title = f'【{zh}】' if view_id == 'BEV_GT' else f'【{zh}相机】'
+        content.append({'type': 'text', 'text': title})
         content.append({'type': 'image', 'image': path})
-    if not views:
+    if not has_camera_views:
         content.append({
             'type': 'text',
             'text': '【无有效相机图像】本帧没有可用同步相机；请只依据几何事实生成summary，'
@@ -382,8 +383,9 @@ def _infer_one(model, processor, views, facts_text, max_new_tokens=96,
         })
     if annotated:
         facts_text = (
-            '注意：图像中的彩色圆点/文字和线框是由数据集GT label投影得到的辅助标注，'
-            '圆点为目标中心，线框为3D标注框，格式为“#目标ID 类别 距离”；'
+            '注意：相机图中的彩色圆点/文字是由数据集GT label目标中心投影得到的辅助标注，'
+            '格式为“#目标ID 类别 距离”；俯视GT图中的矩形框是数据集GT 3D box的俯视图，'
+            '只能用于核对目标ID、类别、位置、距离和本车未来方向，不能用于判断装卸/等待作业；'
             '黄色线段/箭头是本车前进未来轨迹投影，'
             '青色线段/箭头是本车后退未来轨迹投影，'
             '用于理解本车前进、倒车或转弯方向。请优先结合这些标注定位事实中点名的目标，'
@@ -599,27 +601,6 @@ def _box3d_corners(box):
     return np.vstack([top, bottom])
 
 
-_BOX3D_EDGES = (
-    (0, 1), (1, 2), (2, 3), (3, 0),
-    (4, 5), (5, 6), (6, 7), (7, 4),
-    (0, 4), (1, 5), (2, 6), (3, 7),
-)
-
-
-def _draw_box3d(draw, image, box, cam, calib, color):
-    corners = _box3d_corners(box)
-    if len(corners) != 8:
-        return False
-    pts = [_project_point(corner, cam, image.size, calib) for corner in corners]
-    n_edges = 0
-    for i, j in _BOX3D_EDGES:
-        if pts[i] is None or pts[j] is None:
-            continue
-        draw.line([pts[i], pts[j]], fill=color, width=3)
-        n_edges += 1
-    return n_edges >= 2
-
-
 def _ego_future_xy(info):
     import numpy as np
     fut = np.asarray(info.get('gt_sdc_fut_traj', []), dtype=np.float64)
@@ -816,15 +797,10 @@ def _annotate_image(path, cam, facts, info, annotated_dir,
         if inst is None or agent is None:
             continue
         uv = _project_point(inst['bbox_3d'][:3], cam, image.size, calib)
-        color = colors[idx % len(colors)]
-        drew_box = _draw_box3d(
-            draw, image, inst['bbox_3d'], cam, calib, color)
-        if uv is None and not drew_box:
-            continue
         if uv is None:
-            n_drawn += 1
             continue
         u, v = uv
+        color = colors[idx % len(colors)]
         r = 8
         draw.ellipse((u - r, v - r, u + r, v + r), fill=color,
                      outline=(255, 255, 255), width=2)
@@ -844,11 +820,141 @@ def _annotate_image(path, cam, facts, info, annotated_dir,
     draw.rectangle((0, image.height - 30, image.width, image.height),
                    fill=(0, 0, 0))
     draw.text((8, image.height - 27),
-              'GT label投影：彩色点=目标中心，线框=3D框；黄=本车前进，青=本车后退',
+              'GT label投影：彩色点=目标中心；黄=本车前进，青=本车后退',
               font=small_font, fill=(255, 255, 255))
     annotated_dir = Path(annotated_dir)
     annotated_dir.mkdir(parents=True, exist_ok=True)
     out_path = annotated_dir / f'{info.get("token", "no_token")}_{cam}.jpg'
+    image.save(out_path, quality=92)
+    return str(out_path)
+
+
+def _lidar_xy_to_bev(xy, center, scale):
+    x, y = float(xy[0]), float(xy[1])
+    cx, cy = center
+    return cx - y * scale, cy - x * scale
+
+
+def _draw_bev_arrow(draw, pts, color, width=5):
+    if len(pts) < 2:
+        return
+    draw.line(pts, fill=color, width=width, joint='curve')
+    end = pts[-1]
+    prev = pts[-2]
+    ang = math.atan2(end[1] - prev[1], end[0] - prev[0])
+    head_len = 18.0
+    head_ang = math.radians(32.0)
+    arrow = [
+        end,
+        (end[0] - head_len * math.cos(ang - head_ang),
+         end[1] - head_len * math.sin(ang - head_ang)),
+        (end[0] - head_len * math.cos(ang + head_ang),
+         end[1] - head_len * math.sin(ang + head_ang)),
+    ]
+    draw.polygon(arrow, fill=color, outline=(0, 0, 0))
+
+
+def _draw_bev_gt(facts, info, annotated_dir, feedback_for_frame=None):
+    from PIL import Image, ImageDraw, ImageFont
+    import numpy as np
+    agent_by_id = {agent['id']: agent for agent in facts.get('agents', [])}
+    inst_by_id = {
+        inst.get('track_id'): inst
+        for inst in info.get('instances', [])
+        if 'track_id' in inst and 'bbox_3d' in inst
+    }
+    relevant_ids = _relevant_agent_ids(facts, feedback_for_frame)
+    if not relevant_ids:
+        return None
+    try:
+        font = ImageFont.truetype(
+            '/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc', 20)
+        small_font = ImageFont.truetype(
+            '/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc', 16)
+    except OSError:
+        font = small_font = ImageFont.load_default()
+    width, height = 900, 900
+    center = (width / 2.0, height / 2.0 + 90.0)
+    scale = 7.0
+    image = Image.new('RGB', (width, height), (28, 31, 35))
+    draw = ImageDraw.Draw(image)
+
+    # Grid: LiDAR frame uses +x forward, +y left.
+    for m in range(-60, 101, 10):
+        x0, y0 = _lidar_xy_to_bev((m, -60), center, scale)
+        x1, y1 = _lidar_xy_to_bev((m, 60), center, scale)
+        draw.line([(x0, y0), (x1, y1)], fill=(48, 54, 62), width=1)
+        x0, y0 = _lidar_xy_to_bev((-30, m), center, scale)
+        x1, y1 = _lidar_xy_to_bev((100, m), center, scale)
+        draw.line([(x0, y0), (x1, y1)], fill=(48, 54, 62), width=1)
+    draw.line([
+        _lidar_xy_to_bev((-30, 0), center, scale),
+        _lidar_xy_to_bev((100, 0), center, scale),
+    ], fill=(95, 105, 118), width=2)
+    draw.line([
+        _lidar_xy_to_bev((0, -60), center, scale),
+        _lidar_xy_to_bev((0, 60), center, scale),
+    ], fill=(95, 105, 118), width=2)
+
+    ego_w, ego_l = 2.4, 5.0
+    ego_xy = np.array([
+        [ego_l / 2.0, ego_w / 2.0],
+        [ego_l / 2.0, -ego_w / 2.0],
+        [-ego_l / 2.0, -ego_w / 2.0],
+        [-ego_l / 2.0, ego_w / 2.0],
+    ], dtype=np.float64)
+    ego_pts = [_lidar_xy_to_bev(p, center, scale) for p in ego_xy]
+    draw.polygon(ego_pts, fill=(235, 235, 235), outline=(0, 0, 0))
+    nose = [_lidar_xy_to_bev(p, center, scale) for p in
+            [(ego_l / 2.0, 0.0), (ego_l / 2.0 - 1.2, 0.8),
+             (ego_l / 2.0 - 1.2, -0.8)]]
+    draw.polygon(nose, fill=(255, 214, 64), outline=(0, 0, 0))
+    draw.text((center[0] + 10, center[1] + 10), 'EGO', font=font,
+              fill=(255, 255, 255))
+
+    fut = _ego_future_xy(info)
+    if fut.size:
+        fut_pts = [_lidar_xy_to_bev(p, center, scale) for p in fut]
+        _draw_bev_arrow(draw, fut_pts, _ego_traj_color(info), width=6)
+
+    colors = [(255, 48, 48), (0, 160, 255), (255, 180, 0), (0, 190, 90),
+              (180, 70, 255), (255, 80, 180)]
+    n_drawn = 0
+    for idx, track_id in enumerate(sorted(relevant_ids)):
+        inst = inst_by_id.get(track_id)
+        agent = agent_by_id.get(track_id)
+        if inst is None or agent is None:
+            continue
+        corners = _box3d_corners(inst['bbox_3d'])
+        if len(corners) != 8:
+            continue
+        color = colors[idx % len(colors)]
+        bev_corners = corners[:4, :2]
+        pts = [_lidar_xy_to_bev(p, center, scale) for p in bev_corners]
+        draw.polygon(pts, outline=color)
+        for a, b in zip(pts, pts[1:] + pts[:1]):
+            draw.line([a, b], fill=color, width=4)
+        x, y = inst['bbox_3d'][:2]
+        cxy = _lidar_xy_to_bev((x, y), center, scale)
+        r = 5
+        draw.ellipse((cxy[0] - r, cxy[1] - r, cxy[0] + r, cxy[1] + r),
+                     fill=color, outline=(255, 255, 255), width=1)
+        label = f'#{track_id} {_cls_name(agent["cls"])} {agent["range"]}m'
+        box = draw.textbbox((cxy[0] + 8, cxy[1] - 10), label, font=font)
+        draw.rectangle((box[0] - 4, box[1] - 2, box[2] + 4, box[3] + 2),
+                       fill=(0, 0, 0))
+        draw.text((cxy[0] + 8, cxy[1] - 10), label, font=font, fill=color)
+        n_drawn += 1
+    if n_drawn == 0:
+        return None
+    title = '俯视GT图：x前方，y左方；矩形=GT 3D框，点=中心；黄=本车前进，青=本车后退'
+    box = draw.textbbox((12, 12), title, font=small_font)
+    draw.rectangle((box[0] - 6, box[1] - 4, box[2] + 6, box[3] + 4),
+                   fill=(0, 0, 0))
+    draw.text((12, 12), title, font=small_font, fill=(255, 255, 255))
+    annotated_dir = Path(annotated_dir)
+    annotated_dir.mkdir(parents=True, exist_ok=True)
+    out_path = annotated_dir / f'{info.get("token", "no_token")}_BEV_GT.jpg'
     image.save(out_path, quality=92)
     return str(out_path)
 
@@ -883,11 +989,15 @@ def _maybe_annotate_views(views, facts, info, annotated_dir=None,
                           feedback_for_frame=None):
     if not annotated_dir:
         return views
-    return [
+    annotated_views = [
         (cam, zh, _annotate_image(path, cam, facts, info, annotated_dir,
                                   feedback_for_frame))
         for cam, zh, path in views
     ]
+    bev_path = _draw_bev_gt(facts, info, annotated_dir, feedback_for_frame)
+    if bev_path:
+        annotated_views.append(('BEV_GT', '俯视GT图', bev_path))
+    return annotated_views
 
 
 def gen_vlm_to_pkl(pkl_path, model_path, out_path=None, in_place=False,
@@ -926,9 +1036,9 @@ def gen_vlm_to_pkl(pkl_path, model_path, out_path=None, in_place=False,
             continue
         token = info.get('token')
         frame_feedback = _feedback_for_info(feedback, info)
-        views = _resolve_views(facts, info, data_root, frame_feedback)
+        camera_views = _resolve_views(facts, info, data_root, frame_feedback)
         views = _maybe_annotate_views(
-            views, facts, info, annotated_dir, frame_feedback)
+            camera_views, facts, info, annotated_dir, frame_feedback)
         facts_text = _render_facts(facts, frame_feedback)
         feedback_text = _render_feedback(frame_feedback, facts)
         if feedback_text:
@@ -940,12 +1050,13 @@ def gen_vlm_to_pkl(pkl_path, model_path, out_path=None, in_place=False,
             continue
         facts['summary'] = _infer_one(
             model, processor, views, facts_text, max_new_tokens,
-            annotated=bool(annotated_dir and views))
+            annotated=bool(annotated_dir and views),
+            has_camera_views=bool(camera_views))
         summaries[token] = facts['summary']
         meta = {}
         if frame_feedback:
             meta['human_feedback'] = frame_feedback
-        if not views:
+        if not camera_views:
             meta['no_valid_camera'] = True
         if meta:
             summary_meta[token] = meta
@@ -1039,8 +1150,9 @@ def main():
     parser.add_argument('--shard-id', type=int, default=0,
                         help='This process shard index in [0, num_shards).')
     parser.add_argument('--annotate-targets', action='store_true',
-                        help='Draw LiDAR-projected relevant target points/labels '
-                        'on camera images before sending them to the VLM.')
+                        help='Draw LiDAR-projected relevant target centers/labels '
+                        'on camera images and add a BEV GT image with relevant '
+                        '3D boxes before sending them to the VLM.')
     parser.add_argument('--annotated-dir', default='/tmp/vlmcap_annotated',
                         help='Where --annotate-targets writes temporary images.')
     parser.add_argument('--feedback-json', default=None,
