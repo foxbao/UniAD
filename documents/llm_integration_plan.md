@@ -138,7 +138,7 @@ python tools/data_converter/make_subset.py \
 2026-06-25 起增加 **teacher 深化开关 `--annotate-targets`**：利用每个 scene 的
 `camera_extrinsics.json` / `intrinsics.json`，把相关 LiDAR 目标中心投影到相机图上，画出
 `#track_id 类别 距离` 辅助标注，帮助 VLM 把几何事实中点名的目标和图像实体对齐；
-同时把 `gt_sdc_fut_traj` 投影成黄色未来轨迹/箭头，并按本车未来方向补充 FRONT/BACK/侧向相机，
+同时把 `gt_sdc_fut_traj` 投影成未来轨迹/箭头（黄色=前进，青色=后退），并按本车未来方向补充 FRONT/BACK/侧向相机，
 便于人工判断“保持/减速/让行”是否符合前进、倒车或转弯方向。
 同日增加 `--feedback-json`：把人工确认的 `motion_state` / `operation_state` 注入 prompt，
 优先级高于 VLM 自行判断，用于修正港口设备“静止但正在作业”的典型误判。
@@ -457,8 +457,8 @@ motion track_query（仅 fallback/历史分支）┘                            
 - **生成方式 (a)**：几何模板拼几何事实 → Qwen3-VL-8B 看 6 路环视路由图 **改写润色 + 补作业/载货语义** →
   自然中文 summary。VLM 只负责"看图补语义 + 说人话"，几何事实由几何步骤保证准确，防幻觉。
   注：既有 `kl_infos_train_vlmcap.pkl` / v3 val caption 是 Qwen2.5-VL-7B 生成的历史版本。
-- **teacher 深化版本**：在相机图上额外画 LiDAR 投影目标点与 `#ID 类别 距离` 标签，并用黄色箭头
-  画本车 `gt_sdc_fut_traj` 未来轨迹，再送给 Qwen3-VL。
+- **teacher 深化版本**：在相机图上额外画 LiDAR 投影目标点与 `#ID 类别 距离` 标签，并用方向箭头
+  画本车 `gt_sdc_fut_traj` 未来轨迹（黄色=前进，青色=后退），再送给 Qwen3-VL。
   目标是缓解多相机图像里“事实点名的目标”和“图中具体实体”对不上的问题，尤其是港口远处吊机、
   挂车、侧后方目标。2 帧 pilot 中，带标注 Qwen3 已能把原 plain 版本漏掉的“正前方 22.8m 空挂车”
   写进 summary；但是否系统性提升，必须看 val v3 全量 A/B 指标。

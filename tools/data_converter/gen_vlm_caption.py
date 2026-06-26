@@ -67,7 +67,8 @@ _LOAD_IN_NAME = {2, 4, 5, 6}  # 满载IGV/空挂车/满载挂车/空载IGV
 _HANDLER_IDS = {7, 10, 11, 12}  # 正面吊/集装箱叉车/叉车/轮胎吊
 _NEAR_MOVING_HANDLER_M = 30.0
 _GATE_RENDER_MAX_RANGE_M = 35.0
-_EGO_TRAJ_COLOR = (255, 214, 64)
+_EGO_FORWARD_COLOR = (255, 214, 64)
+_EGO_BACKWARD_COLOR = (0, 210, 255)
 
 
 def _cls_name(cid):
@@ -382,7 +383,8 @@ def _infer_one(model, processor, views, facts_text, max_new_tokens=96,
     if annotated:
         facts_text = (
             '注意：图像中的彩色圆点/文字是由激光雷达目标中心投影得到的辅助标注，'
-            '格式为“#目标ID 类别 距离”；黄色线段/箭头是本车未来轨迹投影，'
+            '格式为“#目标ID 类别 距离”；黄色线段/箭头是本车前进未来轨迹投影，'
+            '青色线段/箭头是本车后退未来轨迹投影，'
             '用于理解本车前进、倒车或转弯方向。请优先结合这些标注定位事实中点名的目标，'
             '但本车建议仍必须照抄几何事实。\n'
             + facts_text)
@@ -619,6 +621,14 @@ def _ego_motion_label(info, min_disp=0.3):
     return f'本车未来轨迹：{direction}'
 
 
+def _ego_traj_color(info):
+    fut = _ego_future_xy(info)
+    if fut.size == 0:
+        return _EGO_FORWARD_COLOR
+    dx = float(fut[-1][0])
+    return _EGO_BACKWARD_COLOR if dx < -0.3 else _EGO_FORWARD_COLOR
+
+
 def _ego_direction_cams(info):
     fut = _ego_future_xy(info)
     if fut.size == 0:
@@ -657,7 +667,8 @@ def _draw_ego_future(draw, image, cam, info, calib, small_font):
             pts.append(uv)
     if len(pts) < 2:
         return _draw_ego_direction_fallback(draw, image, cam, info, small_font)
-    draw.line(pts, fill=_EGO_TRAJ_COLOR, width=5, joint='curve')
+    color = _ego_traj_color(info)
+    draw.line(pts, fill=color, width=5, joint='curve')
     end = pts[-1]
     prev = pts[-2]
     ang = math.atan2(end[1] - prev[1], end[0] - prev[0])
@@ -670,17 +681,17 @@ def _draw_ego_future(draw, image, cam, info, calib, small_font):
         (end[0] - head_len * math.cos(ang + head_ang),
          end[1] - head_len * math.sin(ang + head_ang)),
     ]
-    draw.polygon(arrow, fill=_EGO_TRAJ_COLOR, outline=(0, 0, 0))
+    draw.polygon(arrow, fill=color, outline=(0, 0, 0))
     for u, v in pts:
         r = 4
-        draw.ellipse((u - r, v - r, u + r, v + r), fill=_EGO_TRAJ_COLOR,
+        draw.ellipse((u - r, v - r, u + r, v + r), fill=color,
                      outline=(0, 0, 0), width=1)
     label = _ego_motion_label(info)
     if label:
         box = draw.textbbox((8, 8), label, font=small_font)
         draw.rectangle((box[0] - 5, box[1] - 3, box[2] + 5, box[3] + 3),
                        fill=(0, 0, 0))
-        draw.text((8, 8), label, font=small_font, fill=_EGO_TRAJ_COLOR)
+        draw.text((8, 8), label, font=small_font, fill=color)
     return True
 
 
@@ -690,6 +701,7 @@ def _draw_ego_direction_fallback(draw, image, cam, info, small_font):
     label = _ego_motion_label(info)
     if not label:
         return False
+    color = _ego_traj_color(info)
     width, height = image.size
     start = (width * 0.5, height * 0.78)
     end = (width * 0.5, height * 0.46)
@@ -697,7 +709,7 @@ def _draw_ego_direction_fallback(draw, image, cam, info, small_font):
         end = (width * 0.35, height * 0.46)
     elif cam.endswith('_RIGHT'):
         end = (width * 0.65, height * 0.46)
-    draw.line([start, end], fill=_EGO_TRAJ_COLOR, width=8)
+    draw.line([start, end], fill=color, width=8)
     ang = math.atan2(end[1] - start[1], end[0] - start[0])
     head_len = 26.0
     head_ang = math.radians(34.0)
@@ -708,12 +720,12 @@ def _draw_ego_direction_fallback(draw, image, cam, info, small_font):
         (end[0] - head_len * math.cos(ang + head_ang),
          end[1] - head_len * math.sin(ang + head_ang)),
     ]
-    draw.polygon(arrow, fill=_EGO_TRAJ_COLOR, outline=(0, 0, 0))
+    draw.polygon(arrow, fill=color, outline=(0, 0, 0))
     note = label + '（方向示意）'
     box = draw.textbbox((8, 8), note, font=small_font)
     draw.rectangle((box[0] - 5, box[1] - 3, box[2] + 5, box[3] + 3),
                    fill=(0, 0, 0))
-    draw.text((8, 8), note, font=small_font, fill=_EGO_TRAJ_COLOR)
+    draw.text((8, 8), note, font=small_font, fill=color)
     return True
 
 
@@ -783,7 +795,7 @@ def _annotate_image(path, cam, facts, info, annotated_dir,
     draw.rectangle((0, image.height - 30, image.width, image.height),
                    fill=(0, 0, 0))
     draw.text((8, image.height - 27),
-              'LiDAR投影辅助标注：彩色点为目标中心；黄色箭头为本车未来轨迹',
+              'LiDAR投影辅助标注：彩色点为目标中心；黄=本车前进，青=本车后退',
               font=small_font, fill=(255, 255, 255))
     annotated_dir = Path(annotated_dir)
     annotated_dir.mkdir(parents=True, exist_ok=True)
