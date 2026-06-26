@@ -67,6 +67,7 @@ _LOAD_IN_NAME = {2, 4, 5, 6}  # 满载IGV/空挂车/满载挂车/空载IGV
 _HANDLER_IDS = {7, 10, 11, 12}  # 正面吊/集装箱叉车/叉车/轮胎吊
 _NEAR_MOVING_HANDLER_M = 30.0
 _GATE_RENDER_MAX_RANGE_M = 35.0
+_EGO_TRAJ_COLOR = (255, 214, 64)
 
 
 def _cls_name(cid):
@@ -381,7 +382,9 @@ def _infer_one(model, processor, views, facts_text, max_new_tokens=96,
     if annotated:
         facts_text = (
             '注意：图像中的彩色圆点/文字是由激光雷达目标中心投影得到的辅助标注，'
-            '格式为“#目标ID 类别 距离”。请优先结合这些标注定位事实中点名的目标。\n'
+            '格式为“#目标ID 类别 距离”；黄色线段/箭头是本车未来轨迹投影，'
+            '用于理解本车前进、倒车或转弯方向。请优先结合这些标注定位事实中点名的目标，'
+            '但本车建议仍必须照抄几何事实。\n'
             + facts_text)
     content.append({'type': 'text', 'text': '场景事实：\n' + facts_text})
     messages = [
@@ -571,6 +574,149 @@ def _project_point(point_lidar, cam, image_size, calib):
     return u, v
 
 
+def _ego_future_xy(info):
+    import numpy as np
+    fut = np.asarray(info.get('gt_sdc_fut_traj', []), dtype=np.float64)
+    if fut.ndim == 3:
+        fut = fut[0]
+    if fut.ndim != 2 or fut.shape[1] < 2:
+        return np.zeros((0, 2), dtype=np.float64)
+    mask = np.ones((fut.shape[0],), dtype=bool)
+    raw_mask = np.asarray(info.get('gt_sdc_fut_traj_mask', []))
+    if raw_mask.size:
+        if raw_mask.ndim == 3:
+            raw_mask = raw_mask[0]
+        if raw_mask.ndim == 2:
+            mask = raw_mask[:, :2].any(axis=1)
+        elif raw_mask.ndim == 1:
+            mask = raw_mask.astype(bool)
+        mask = mask[:fut.shape[0]]
+    fut = fut[:mask.shape[0]][mask]
+    return fut[:, :2]
+
+
+def _ego_motion_label(info, min_disp=0.3):
+    fut = _ego_future_xy(info)
+    if fut.size == 0:
+        return ''
+    xy = fut[-1]
+    dist = float(math.hypot(xy[0], xy[1]))
+    if dist < min_disp:
+        return '本车未来轨迹：基本静止'
+    dx, dy = float(xy[0]), float(xy[1])
+    if abs(dx) >= 1.5 * abs(dy):
+        direction = '前进' if dx > 0 else '后退'
+    elif abs(dy) >= 1.5 * abs(dx):
+        direction = '向左' if dy > 0 else '向右'
+    elif dx >= 0 and dy >= 0:
+        direction = '前进左转'
+    elif dx >= 0 and dy < 0:
+        direction = '前进右转'
+    elif dx < 0 and dy >= 0:
+        direction = '倒车左转'
+    else:
+        direction = '倒车右转'
+    return f'本车未来轨迹：{direction}'
+
+
+def _ego_direction_cams(info):
+    fut = _ego_future_xy(info)
+    if fut.size == 0:
+        return []
+    dx, dy = fut[-1]
+    if float(math.hypot(dx, dy)) < 0.3:
+        return []
+    cams = []
+    if dx >= 0:
+        cams.append('CAM_FRONT')
+        if dy > 0.5:
+            cams.append('CAM_FRONT_LEFT')
+        elif dy < -0.5:
+            cams.append('CAM_FRONT_RIGHT')
+    else:
+        cams.append('CAM_BACK')
+        if dy > 0.5:
+            cams.append('CAM_BACK_LEFT')
+        elif dy < -0.5:
+            cams.append('CAM_BACK_RIGHT')
+    return cams
+
+
+def _draw_ego_future(draw, image, cam, info, calib, small_font):
+    import numpy as np
+    fut = _ego_future_xy(info)
+    if fut.size == 0:
+        return False
+    pts = []
+    for xy in fut:
+        if float(np.linalg.norm(xy)) < 0.05:
+            continue
+        point = np.array([xy[0], xy[1], 0.0], dtype=np.float64)
+        uv = _project_point(point, cam, image.size, calib)
+        if uv is not None:
+            pts.append(uv)
+    if len(pts) < 2:
+        return _draw_ego_direction_fallback(draw, image, cam, info, small_font)
+    draw.line(pts, fill=_EGO_TRAJ_COLOR, width=5, joint='curve')
+    end = pts[-1]
+    prev = pts[-2]
+    ang = math.atan2(end[1] - prev[1], end[0] - prev[0])
+    head_len = 18.0
+    head_ang = math.radians(32.0)
+    arrow = [
+        end,
+        (end[0] - head_len * math.cos(ang - head_ang),
+         end[1] - head_len * math.sin(ang - head_ang)),
+        (end[0] - head_len * math.cos(ang + head_ang),
+         end[1] - head_len * math.sin(ang + head_ang)),
+    ]
+    draw.polygon(arrow, fill=_EGO_TRAJ_COLOR, outline=(0, 0, 0))
+    for u, v in pts:
+        r = 4
+        draw.ellipse((u - r, v - r, u + r, v + r), fill=_EGO_TRAJ_COLOR,
+                     outline=(0, 0, 0), width=1)
+    label = _ego_motion_label(info)
+    if label:
+        box = draw.textbbox((8, 8), label, font=small_font)
+        draw.rectangle((box[0] - 5, box[1] - 3, box[2] + 5, box[3] + 3),
+                       fill=(0, 0, 0))
+        draw.text((8, 8), label, font=small_font, fill=_EGO_TRAJ_COLOR)
+    return True
+
+
+def _draw_ego_direction_fallback(draw, image, cam, info, small_font):
+    if cam not in _ego_direction_cams(info):
+        return False
+    label = _ego_motion_label(info)
+    if not label:
+        return False
+    width, height = image.size
+    start = (width * 0.5, height * 0.78)
+    end = (width * 0.5, height * 0.46)
+    if cam.endswith('_LEFT'):
+        end = (width * 0.35, height * 0.46)
+    elif cam.endswith('_RIGHT'):
+        end = (width * 0.65, height * 0.46)
+    draw.line([start, end], fill=_EGO_TRAJ_COLOR, width=8)
+    ang = math.atan2(end[1] - start[1], end[0] - start[0])
+    head_len = 26.0
+    head_ang = math.radians(34.0)
+    arrow = [
+        end,
+        (end[0] - head_len * math.cos(ang - head_ang),
+         end[1] - head_len * math.sin(ang - head_ang)),
+        (end[0] - head_len * math.cos(ang + head_ang),
+         end[1] - head_len * math.sin(ang + head_ang)),
+    ]
+    draw.polygon(arrow, fill=_EGO_TRAJ_COLOR, outline=(0, 0, 0))
+    note = label + '（方向示意）'
+    box = draw.textbbox((8, 8), note, font=small_font)
+    draw.rectangle((box[0] - 5, box[1] - 3, box[2] + 5, box[3] + 3),
+                   fill=(0, 0, 0))
+    draw.text((8, 8), note, font=small_font, fill=_EGO_TRAJ_COLOR)
+    return True
+
+
 def _relevant_agent_ids(facts, feedback_for_frame=None):
     aoi = set(facts.get('agents_of_interest', []))
     ids = []
@@ -607,6 +753,7 @@ def _annotate_image(path, cam, facts, info, annotated_dir,
               (180, 70, 255), (255, 80, 180)]
     draw = ImageDraw.Draw(image)
     n_drawn = 0
+    drew_ego = _draw_ego_future(draw, image, cam, info, calib, small_font)
     for idx, track_id in enumerate(sorted(relevant_ids)):
         inst = inst_by_id.get(track_id)
         agent = agent_by_id.get(track_id)
@@ -631,11 +778,12 @@ def _annotate_image(path, cam, facts, info, annotated_dir,
                        fill=(0, 0, 0))
         draw.text(text_xy, label, font=font, fill=color)
         n_drawn += 1
-    if n_drawn == 0:
+    if n_drawn == 0 and not drew_ego:
         return path
     draw.rectangle((0, image.height - 30, image.width, image.height),
                    fill=(0, 0, 0))
-    draw.text((8, image.height - 27), 'LiDAR投影辅助标注：彩色点为目标中心',
+    draw.text((8, image.height - 27),
+              'LiDAR投影辅助标注：彩色点为目标中心；黄色箭头为本车未来轨迹',
               font=small_font, fill=(255, 255, 255))
     annotated_dir = Path(annotated_dir)
     annotated_dir.mkdir(parents=True, exist_ok=True)
@@ -661,6 +809,9 @@ def _resolve_views(facts, info, data_root, feedback_for_frame=None):
                 cams.append(c)
     if not cams:
         cams = ['CAM_FRONT']
+    for c in _ego_direction_cams(info):
+        if c not in cams:
+            cams.append(c)
     out = _valid_views(info, data_root, cams)
     if out:
         return out
