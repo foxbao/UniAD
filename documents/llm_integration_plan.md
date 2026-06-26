@@ -90,7 +90,7 @@ PY
   ~87 万张。**但原始 pkl 未关联相机**（建库 cfg `projects/KL8/configs/kl8_lidar_bevformer.py`
   里 `camera_processing_cfg.enable=False`）。早期只用 **front**，当前 VLM caption 已改为 6 路环视按目标方位路由。
 - 13 类（post label_mapping）：0 行人 / 1 小车 / 2 满载IGV / 3 卡车 / 4 空挂车 / 5 满载挂车 /
-  6 空载IGV / 7 吊机 / 8 其他车辆 / 9 锥桶 / 10 集装箱叉车 / 11 叉车 / 12 轮胎吊。
+  6 空载IGV / 7 正面吊（Crane） / 8 其他车辆 / 9 锥桶 / 10 集装箱叉车 / 11 叉车 / 12 轮胎吊。
 - `gt_fut_traj_locs` / `gt_track_traj_locs` 约定（已验证）：**相对自身当前位置的累积位移**，
   LiDAR 帧，步长 0.5s。agent 未来绝对 xy = `bbox_xy + fut_traj[t]`；ego 在原点，未来绝对 xy = `sdc_fut_traj[t]`。
 
@@ -145,10 +145,11 @@ python tools/data_converter/make_subset.py \
 2026-06-25 追加相机兜底：若按目标方位路由的相机无效，回退到本帧任一有效相机；
 若本帧完全没有有效相机，则走 text-only summary，只允许依据 geo_facts，不补作业/载货视觉判断，
 并在 summary meta 标记 `no_valid_camera`。
-同日根据人工抽检收紧状态口径：移动/行驶中的吊机、轮胎吊、叉车、集装箱叉车只描述运动，
+同日根据人工抽检收紧状态口径：移动/行驶中的正面吊、轮胎吊、叉车、集装箱叉车只描述运动，
 不能仅因吊具/吊臂/叉臂抬起就判 `working/waiting`；`waiting` 必须极保守，只有目标清楚可见且
 明确处于作业位排队/等待装卸才使用；车辆/IGV/挂车/卡车只是停着、靠近箱区或靠近其他车辆，
-一律按静止/空闲描述。不可见设备必须写看不清或不提。`crane_status` 只是几何诊断门控，
+一律按静止/空闲描述。正面吊例外：静止、吊具/吊臂抬起并近距离正对集装箱/挂车/集卡时，
+应判为正在装卸作业，不要求已经接触箱体。不可见设备必须写看不清或不提。`crane_status` 只是几何诊断门控，
 不再渲染到 prompt，避免诱导模型写图里没有的吊机。
 **关键产物是 JSON sidecar**（`<pkl去后缀>_summaries.json`，token→summary），pkl 输出可丢 /tmp。
 ```bash
@@ -243,7 +244,7 @@ python tools/data_converter/merge_summaries.py \
     Qwen3-VL-8B 已下载验证，后续新 caption 应先在 val v3 做 A/B，再决定是否重做 train 全量。
   - **Qwen3-VL-32B val teacher 已完成**：2×4GPU 分片跑完 805 帧，并修复相机兜底后
     `missing_summary=0`（3 帧无有效相机，text-only）。当前指标：
-    `advice=0.988`、`activity_addressed=0.895`、`activity_busy=0.082`、`halluc=0.991`。
+    `advice=0.988`、`activity_addressed=0.895`、`activity_busy=0.084`、`halluc=0.991`。
     人工反馈已修正 7 个样本（移动设备不判等待/作业、不可见吊机不写入 summary、普通静止车辆/IGV
     不判等待作业），`waiting` 计数从 6 降到 0。结论：32B teacher 已可用，但 train 全量前仍建议先人工抽检作业/空闲状态。
   - 模型：`LLMBridgeHead` 已支持两种接线：
@@ -617,7 +618,7 @@ motion track_query（仅 fallback/历史分支）┘                            
 
 **A0. Qwen3-VL-32B teacher QA / train 全量闸门**。32B annotated val 已跑完，现阶段不要直接
 重做 train 全量；先确认作业/空闲状态质量。当前 val 指标：`activity_addressed=0.895`，
-`activity_busy=0.082`，`halluc=0.991`。`activity_busy` 低不一定是坏事，可能是 32B 更常判空闲，
+`activity_busy=0.084`，`halluc=0.991`。`activity_busy` 低不一定是坏事，可能是 32B 更常判空闲，
 但必须人工抽检 Crane/Forklift/ContainerForkLift 的 working/waiting/idle。
    ```bash
    # 1) 指标复核
