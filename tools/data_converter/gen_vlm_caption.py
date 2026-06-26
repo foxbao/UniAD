@@ -69,6 +69,8 @@ _NEAR_MOVING_HANDLER_M = 30.0
 _GATE_RENDER_MAX_RANGE_M = 35.0
 _EGO_FORWARD_COLOR = (255, 214, 64)
 _EGO_BACKWARD_COLOR = (0, 210, 255)
+_EGO_LENGTH_M = 14.6
+_EGO_WIDTH_M = 3.0
 
 
 def _cls_name(cid):
@@ -886,7 +888,7 @@ def _draw_bev_gt(facts, info, annotated_dir, feedback_for_frame=None):
         _lidar_xy_to_bev((0, 60), center, scale),
     ], fill=(95, 105, 118), width=2)
 
-    ego_w, ego_l = 2.4, 5.0
+    ego_w, ego_l = _EGO_WIDTH_M, _EGO_LENGTH_M
     ego_xy = np.array([
         [ego_l / 2.0, ego_w / 2.0],
         [ego_l / 2.0, -ego_w / 2.0],
@@ -937,7 +939,8 @@ def _draw_bev_gt(facts, info, annotated_dir, feedback_for_frame=None):
         n_drawn += 1
     if n_drawn == 0:
         return None
-    title = '俯视GT图：x前方，y左方；矩形=GT 3D框，点=中心；黄=本车前进，青=本车后退'
+    title = ('俯视GT图：x前方，y左方；矩形=GT 3D框，点=中心；'
+             'EGO=14.6m x 3.0m；黄=本车前进，青=本车后退')
     box = draw.textbbox((12, 12), title, font=small_font)
     draw.rectangle((box[0] - 6, box[1] - 4, box[2] + 6, box[3] + 4),
                    fill=(0, 0, 0))
