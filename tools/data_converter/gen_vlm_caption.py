@@ -64,6 +64,7 @@ _MOTION_STATE_ZH = {
 }
 # Classes whose Chinese name already encodes load state -> don't prefix _LOAD_ZH.
 _LOAD_IN_NAME = {2, 4, 5, 6}  # 满载IGV/空挂车/满载挂车/空载IGV
+_HANDLER_IDS = {7, 10, 11, 12}  # 正面吊/集装箱叉车/叉车/轮胎吊
 
 
 def _cls_name(cid):
@@ -200,14 +201,16 @@ _SYSTEM = (
     '若本帧没有有效相机图像，只能依据几何事实输出，不得补充作业/载货等视觉判断；\n'
     '3. 必须区分“运动状态”和“作业状态”：设备本体静止不等于空闲，但事实里写明缓行/行驶的'
     '正面吊、轮胎吊、叉车、集装箱叉车只能描述为移动/行驶，不得用图像覆盖成正在装卸或等待作业。'
+    '卡车、挂车、IGV、小车本身不能写成“正在装卸作业”；只有图中清楚看到正面吊/轮胎吊/叉车等'
+    '处理设备与其发生明确交互时，才可说“正在接受装卸”，否则静止车辆/挂车一律按空闲描述。'
     'Crane 在本场景中是正面吊：正面吊静止、吊具/吊臂抬起，且吊具轴线/车身朝向与近距离'
     '集装箱、挂车或集卡有明确空间对齐时，应判为正在装卸作业，不要求已经接触箱体；'
-    '若只是邻近黄车/挂车、吊臂抬起但没有明确对齐，不得写“正对”或判作业。其他设备只有目标静止，'
-    '且图像中明确看到吊具/叉臂正在对准或接触箱体、下方有正在停靠装卸的车辆/箱体上下文，'
-    '才判为正在装卸作业；仅吊具悬空、吊臂抬起、'
-    '周围有箱但没有停靠/排队上下文，不算等待作业，通常判为空闲或看不清。'
-    '等待作业必须非常保守：目标必须在图像中清楚可见，并明显处于作业位排队或等待装卸；'
-    '车辆/IGV/挂车/卡车只是停在那里、靠近箱区或靠近其他车辆，一律不算等待作业，按静止/空闲描述。'
+    '若下方没有集装箱/车辆，或只是邻近黄车/挂车、吊臂抬起但没有明确对齐，不得写“正对”或判作业。'
+    '轮胎吊只有在图像中清楚看到吊具下方有停靠的卡车/挂车/集装箱，且形成垂直装卸上下文时，'
+    '才判为正在装卸作业；仅吊具悬空、吊臂抬起、周围有箱但下方没有车辆/箱体，不算作业，'
+    '通常判为空闲或看不清。等待作业必须非常保守：目标必须在图像中清楚可见，并明显处于作业位'
+    '排队或等待装卸；车辆/IGV/挂车/卡车只是停在那里、靠近箱区或靠近其他车辆，一律不算等待作业，'
+    '按静止/空闲描述。'
     '对图像看不清或不确定的，不要猜测；\n'
     '4. 若事实中标注了“与本车规划路径冲突”的目标，summary 必须明确点出'
     '是哪个目标（方位+类别）、以及预计多少秒后冲突，并给出建议（减速/让行）。'
@@ -220,11 +223,18 @@ _SYSTEM = (
     '7. 最终只输出一句通顺的中文场景描述（不超过60字），面向本车视角，'
     '突出对本车行驶最相关的目标与建议。不要分点，不要复述全部目标。\n'
     '示例（含冲突）：右前方12米处一台满载IGV缓行，预计3秒后与本车路径冲突，建议让行。\n'
-    '示例（含作业）：右后方吊机正在装卸作业，正前方空挂车等待，本车可保持。'
+    '示例（含作业）：右后方正面吊正对集装箱装卸，正前方空挂车静止空闲，本车可保持。'
 )
 
 
-def _render_facts(facts):
+def _feedback_ids(feedback_for_frame):
+    return {
+        int(track_id) for track_id in feedback_for_frame
+        if str(track_id).lstrip('-').isdigit()
+    }
+
+
+def _render_facts(facts, feedback_for_frame=None):
     """geo_facts dict -> Chinese constraint text fed alongside the image.
 
     Renders agents that are AOI OR conflict OR activity_gate -- the SAME set
@@ -236,9 +246,11 @@ def _render_facts(facts):
     """
     lines = [f'场景共有 {facts.get("n_agents", 0)} 个目标。']
     aoi = set(facts.get('agents_of_interest', []))
+    feedback_ids = _feedback_ids(feedback_for_frame or {})
 
     def _relevant(a):
-        return a['id'] in aoi or a.get('conflict') or a.get('activity_gate')
+        return (a['id'] in aoi or a['id'] in feedback_ids or
+                a.get('conflict') or a.get('activity_gate'))
 
     agents = [a for a in facts.get('agents', []) if _relevant(a)]
     # AOI first, then conflict/gate-only; stable within each group.
@@ -255,7 +267,10 @@ def _render_facts(facts):
             ttc = a['ttc']
             seg.append(f'约{ttc}秒后与本车规划路径冲突' if ttc else '与本车路径冲突')
         if a['activity_gate']:
-            seg.append('（请判断作业状态）')
+            if a['cls'] in _HANDLER_IDS:
+                seg.append('（请判断作业状态）')
+            else:
+                seg.append('（请判断是否只是静止停放；除非图中有处理设备明确交互，否则不得写正在装卸）')
         lines.append('- ' + '，'.join(seg) + '。')
     advice = _ADVICE_ZH.get(facts.get('ego_advice', 'keep'), '保持')
     lines.append(f'本车建议（几何事实，必须照抄）：{advice}。')
@@ -521,17 +536,20 @@ def _project_point(point_lidar, cam, image_size, calib):
     return u, v
 
 
-def _relevant_agent_ids(facts):
+def _relevant_agent_ids(facts, feedback_for_frame=None):
     aoi = set(facts.get('agents_of_interest', []))
+    feedback_ids = _feedback_ids(feedback_for_frame or {})
     ids = []
     for agent in facts.get('agents', []):
-        if (agent['id'] in aoi or agent.get('conflict') or
+        if (agent['id'] in aoi or agent['id'] in feedback_ids or
+                agent.get('conflict') or
                 agent.get('activity_gate')):
             ids.append(agent['id'])
     return set(ids)
 
 
-def _annotate_image(path, cam, facts, info, annotated_dir):
+def _annotate_image(path, cam, facts, info, annotated_dir,
+                    feedback_for_frame=None):
     from PIL import Image, ImageDraw, ImageFont
     image = Image.open(path).convert('RGB')
     calib = _load_calib(info, path)
@@ -543,7 +561,7 @@ def _annotate_image(path, cam, facts, info, annotated_dir):
         if 'track_id' in inst and 'bbox_3d' in inst
     }
     agent_by_id = {agent['id']: agent for agent in facts.get('agents', [])}
-    relevant_ids = _relevant_agent_ids(facts)
+    relevant_ids = _relevant_agent_ids(facts, feedback_for_frame)
     if not relevant_ids:
         return path
     try:
@@ -594,7 +612,7 @@ def _annotate_image(path, cam, facts, info, annotated_dir):
     return str(out_path)
 
 
-def _resolve_views(facts, info, data_root):
+def _resolve_views(facts, info, data_root, feedback_for_frame=None):
     """Cameras covering this frame's relevant agents (AOI/conflict/gate),
     deduped; returns [(cam, zh_label, path), ...] for valid views.
 
@@ -603,9 +621,11 @@ def _resolve_views(facts, info, data_root):
     the frame to a None summary.
     """
     aoi = set(facts.get('agents_of_interest', []))
+    feedback_ids = _feedback_ids(feedback_for_frame or {})
     cams = []
     for a in facts.get('agents', []):
-        if a['id'] in aoi or a.get('conflict') or a.get('activity_gate'):
+        if (a['id'] in aoi or a['id'] in feedback_ids or a.get('conflict')
+                or a.get('activity_gate')):
             c = _BEARING_CAM.get(a['bearing'])
             if c and c not in cams:
                 cams.append(c)
@@ -617,11 +637,13 @@ def _resolve_views(facts, info, data_root):
     return _valid_views(info, data_root, _CAM_FALLBACK_ORDER)
 
 
-def _maybe_annotate_views(views, facts, info, annotated_dir=None):
+def _maybe_annotate_views(views, facts, info, annotated_dir=None,
+                          feedback_for_frame=None):
     if not annotated_dir:
         return views
     return [
-        (cam, zh, _annotate_image(path, cam, facts, info, annotated_dir))
+        (cam, zh, _annotate_image(path, cam, facts, info, annotated_dir,
+                                  feedback_for_frame))
         for cam, zh, path in views
     ]
 
@@ -660,11 +682,12 @@ def gen_vlm_to_pkl(pkl_path, model_path, out_path=None, in_place=False,
         if facts is None:
             n_skip += 1
             continue
-        views = _resolve_views(facts, info, data_root)
-        views = _maybe_annotate_views(views, facts, info, annotated_dir)
-        facts_text = _render_facts(facts)
         token = info.get('token')
         frame_feedback = _feedback_for_info(feedback, info)
+        views = _resolve_views(facts, info, data_root, frame_feedback)
+        views = _maybe_annotate_views(
+            views, facts, info, annotated_dir, frame_feedback)
+        facts_text = _render_facts(facts, frame_feedback)
         feedback_text = _render_feedback(frame_feedback, facts)
         if feedback_text:
             facts_text = facts_text + '\n\n' + feedback_text
