@@ -12,10 +12,11 @@ See documents/llm_integration_plan.md (3.2). Pipeline per frame:
        output ONE fluent Chinese summary sentence
     -> info['geo_facts']['summary']
 
-Each image is labeled with its bearing (【前方相机】/【右后方相机】...) so the VLM
-aligns activity/load judgements to the correct direction. Multi-camera fixes the
-single-front blind spot: rear/side targets that front-only could not see (and so
-were never captioned with an activity state — see plan 4.2/4.3).
+Each image is labeled by its calibrated optical viewing direction
+(【前方相机】/【右后方相机】...) so the VLM aligns activity/load judgements
+to the correct direction. Multi-camera fixes the single-front blind spot:
+rear/side targets that front-only could not see (and so were never captioned
+with an activity state — see plan 4.2/4.3).
 
 This is offline data generation: run it in the `qwen_vl` conda env (torch 2.6
 + transformers 4.57.6), NOT in uniad_train. It only reads images + the geo-facts pkl
@@ -416,23 +417,30 @@ def _infer_one(model, processor, views, facts_text, max_new_tokens=96,
         clean_up_tokenization_spaces=True)[0].strip()
 
 
-# 8-way bearing sector -> surround camera that best sees it (nuScenes layout,
-# confirmed from camera_extrinsics). Routes only cameras covering this frame's
-# relevant agents to the VLM (cost ~2x, not 6x).
-_BEARING_CAM = {
-    'front': 'CAM_FRONT', 'left-front': 'CAM_FRONT_LEFT',
-    'left': 'CAM_FRONT_LEFT', 'left-rear': 'CAM_BACK_LEFT',
-    'rear': 'CAM_BACK', 'right-rear': 'CAM_BACK_RIGHT',
-    'right': 'CAM_FRONT_RIGHT', 'right-front': 'CAM_FRONT_RIGHT',
+# 8-way bearing sector -> calibrated optical view direction. CAM_* ids are kept
+# as dataset/file ids, but corner cameras are named by mounting position, not by
+# where they look. camera_extrinsics shows:
+#   CAM_FRONT_LEFT  looks left-rear,  CAM_BACK_LEFT  looks left-front
+#   CAM_FRONT_RIGHT looks right-rear, CAM_BACK_RIGHT looks right-front
+# Route targets by actual viewing direction, not by the mount/file name.
+_BEARING_CAMS = {
+    'front': ('CAM_FRONT',),
+    'left-front': ('CAM_BACK_LEFT',),
+    'left': ('CAM_BACK_LEFT', 'CAM_FRONT_LEFT'),
+    'left-rear': ('CAM_FRONT_LEFT',),
+    'rear': ('CAM_BACK',),
+    'right-rear': ('CAM_FRONT_RIGHT',),
+    'right': ('CAM_BACK_RIGHT', 'CAM_FRONT_RIGHT'),
+    'right-front': ('CAM_BACK_RIGHT',),
 }
 _CAM_ZH = {
-    'CAM_FRONT': '前方', 'CAM_FRONT_LEFT': '左前方',
-    'CAM_FRONT_RIGHT': '右前方', 'CAM_BACK': '后方',
-    'CAM_BACK_LEFT': '左后方', 'CAM_BACK_RIGHT': '右后方',
+    'CAM_FRONT': '前方', 'CAM_FRONT_LEFT': '左后方',
+    'CAM_FRONT_RIGHT': '右后方', 'CAM_BACK': '后方',
+    'CAM_BACK_LEFT': '左前方', 'CAM_BACK_RIGHT': '右前方',
 }
 _CAM_FALLBACK_ORDER = (
-    'CAM_FRONT', 'CAM_FRONT_LEFT', 'CAM_FRONT_RIGHT',
-    'CAM_BACK', 'CAM_BACK_LEFT', 'CAM_BACK_RIGHT',
+    'CAM_FRONT', 'CAM_BACK_LEFT', 'CAM_BACK_RIGHT',
+    'CAM_BACK', 'CAM_FRONT_LEFT', 'CAM_FRONT_RIGHT',
 )
 _CAM_TO_DISK = {
     'CAM_FRONT': 'front',
@@ -964,9 +972,9 @@ def _resolve_views(facts, info, data_root, feedback_for_frame=None):
     cams = []
     for a in facts.get('agents', []):
         if _agent_relevant(a, aoi, feedback_for_frame):
-            c = _BEARING_CAM.get(a['bearing'])
-            if c and c not in cams:
-                cams.append(c)
+            for c in _BEARING_CAMS.get(a['bearing'], ()):
+                if c and c not in cams:
+                    cams.append(c)
     if not cams:
         cams = ['CAM_FRONT']
     for c in _ego_direction_cams(info):

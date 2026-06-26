@@ -109,6 +109,10 @@ python tools/data_converter/add_cam_sync.py \
   --views front left_front left_rear rear right_front right_rear
 # 磁盘视角名 -> CAM_*: front=CAM_FRONT, left_front=CAM_FRONT_LEFT, left_rear=CAM_BACK_LEFT,
 #   rear=CAM_BACK, right_front=CAM_FRONT_RIGHT, right_rear=CAM_BACK_RIGHT
+# 注意：CAM_* 保留的是磁盘/安装位置命名，不等于光轴视线方向。
+# camera_extrinsics 校验：CAM_FRONT_RIGHT 实际看右后，CAM_BACK_RIGHT 实际看右前；
+# CAM_FRONT_LEFT 实际看左后，CAM_BACK_LEFT 实际看左前。
+# VLM prompt 和目标方位路由按实际视线方向标注/选图。
 # 产物（保留副本，不覆盖原 pkl）: data/kl_8/kl_infos_{train,val}_with_cam.pkl
 # 命中率(front): train 98.58% / val 98.19%（<50ms）; 缺帧标 valid=False
 ```
@@ -134,7 +138,8 @@ python tools/data_converter/make_subset.py \
 
 **Step 4 — VLM caption 生成**（env: qwen_vl）
 `gen_vlm_caption.py`：读 geo_facts + 渲染中文事实约束文本 + **按目标方位自动路由的 2-4 路环视图**
-（`_resolve_views` 按帧内 AOI/conflict/gate 目标方位选相机，每图标【方位相机】）→ VLM → 一句中文 summary。
+（`_resolve_views` 按帧内 AOI/conflict/gate 目标方位选相机；方位标签按 `camera_extrinsics.json`
+校验后的光轴视线方向，而不是 CAM_* 安装位置命名）→ VLM → 一句中文 summary。
 2026-06-25 起增加 **teacher 深化开关 `--annotate-targets`**：利用每个 scene 的
 `camera_extrinsics.json` / `intrinsics.json`，把相关数据集 GT label 的目标中心投影到相机图上，画出
 `#track_id 类别 距离` 辅助标注，帮助 VLM 把几何事实中点名的目标和图像实体对齐；
