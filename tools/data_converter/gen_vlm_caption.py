@@ -65,6 +65,8 @@ _MOTION_STATE_ZH = {
 # Classes whose Chinese name already encodes load state -> don't prefix _LOAD_ZH.
 _LOAD_IN_NAME = {2, 4, 5, 6}  # 满载IGV/空挂车/满载挂车/空载IGV
 _HANDLER_IDS = {7, 10, 11, 12}  # 正面吊/集装箱叉车/叉车/轮胎吊
+_NEAR_MOVING_HANDLER_M = 30.0
+_GATE_RENDER_MAX_RANGE_M = 35.0
 
 
 def _cls_name(cid):
@@ -221,7 +223,8 @@ _SYSTEM = (
     '不要把“场景中有N台吊机”当成某台吊机正在作业的证据；\n'
     '6. 若有人类确认反馈，则该反馈优先级高于你对图像的自行判断，summary 必须服从；\n'
     '7. 最终只输出一句通顺的中文场景描述（不超过60字），面向本车视角，'
-    '突出对本车行驶最相关的目标与建议。不要分点，不要复述全部目标。\n'
+    '突出对本车行驶最相关的目标与建议。近距离移动中的正面吊/轮胎吊可写“行驶中/缓行”，'
+    '但远处、看不清、无冲突且无明确作业关系的设备不要硬写进最终 summary。不要分点，不要复述全部目标。\n'
     '示例（含冲突）：右前方12米处一台满载IGV缓行，预计3秒后与本车路径冲突，建议让行。\n'
     '示例（含作业）：右后方正面吊正对集装箱装卸，正前方空挂车静止空闲，本车可保持。'
 )
@@ -232,6 +235,40 @@ def _feedback_ids(feedback_for_frame):
         int(track_id) for track_id in feedback_for_frame
         if str(track_id).lstrip('-').isdigit()
     }
+
+
+def _agent_feedback(agent, feedback_for_frame):
+    return (feedback_for_frame or {}).get(str(agent['id']), {})
+
+
+def _near_moving_handler(agent):
+    return (agent.get('cls') in _HANDLER_IDS
+            and agent.get('motion') != 'static'
+            and float(agent.get('range', 1e9)) <= _NEAR_MOVING_HANDLER_M)
+
+
+def _feedback_promotes_agent(agent, feedback_for_frame):
+    fb = _agent_feedback(agent, feedback_for_frame)
+    if not fb:
+        return False
+    if fb.get('operation_state') in ('working', 'waiting'):
+        return True
+    return float(agent.get('range', 1e9)) <= _GATE_RENDER_MAX_RANGE_M
+
+
+def _render_activity_gate(agent, feedback_for_frame):
+    if not agent.get('activity_gate'):
+        return False
+    if _feedback_promotes_agent(agent, feedback_for_frame):
+        return True
+    return float(agent.get('range', 1e9)) <= _GATE_RENDER_MAX_RANGE_M
+
+
+def _agent_relevant(agent, aoi, feedback_for_frame=None):
+    return (agent['id'] in aoi or agent.get('conflict')
+            or _near_moving_handler(agent)
+            or _feedback_promotes_agent(agent, feedback_for_frame)
+            or _render_activity_gate(agent, feedback_for_frame))
 
 
 def _render_facts(facts, feedback_for_frame=None):
@@ -246,11 +283,9 @@ def _render_facts(facts, feedback_for_frame=None):
     """
     lines = [f'场景共有 {facts.get("n_agents", 0)} 个目标。']
     aoi = set(facts.get('agents_of_interest', []))
-    feedback_ids = _feedback_ids(feedback_for_frame or {})
 
     def _relevant(a):
-        return (a['id'] in aoi or a['id'] in feedback_ids or
-                a.get('conflict') or a.get('activity_gate'))
+        return _agent_relevant(a, aoi, feedback_for_frame)
 
     agents = [a for a in facts.get('agents', []) if _relevant(a)]
     # AOI first, then conflict/gate-only; stable within each group.
@@ -266,7 +301,7 @@ def _render_facts(facts, feedback_for_frame=None):
         if a['conflict']:
             ttc = a['ttc']
             seg.append(f'约{ttc}秒后与本车规划路径冲突' if ttc else '与本车路径冲突')
-        if a['activity_gate']:
+        if _render_activity_gate(a, feedback_for_frame):
             if a['cls'] in _HANDLER_IDS:
                 seg.append('（请判断作业状态）')
             else:
@@ -538,12 +573,9 @@ def _project_point(point_lidar, cam, image_size, calib):
 
 def _relevant_agent_ids(facts, feedback_for_frame=None):
     aoi = set(facts.get('agents_of_interest', []))
-    feedback_ids = _feedback_ids(feedback_for_frame or {})
     ids = []
     for agent in facts.get('agents', []):
-        if (agent['id'] in aoi or agent['id'] in feedback_ids or
-                agent.get('conflict') or
-                agent.get('activity_gate')):
+        if _agent_relevant(agent, aoi, feedback_for_frame):
             ids.append(agent['id'])
     return set(ids)
 
@@ -621,11 +653,9 @@ def _resolve_views(facts, info, data_root, feedback_for_frame=None):
     the frame to a None summary.
     """
     aoi = set(facts.get('agents_of_interest', []))
-    feedback_ids = _feedback_ids(feedback_for_frame or {})
     cams = []
     for a in facts.get('agents', []):
-        if (a['id'] in aoi or a['id'] in feedback_ids or a.get('conflict')
-                or a.get('activity_gate')):
+        if _agent_relevant(a, aoi, feedback_for_frame):
             c = _BEARING_CAM.get(a['bearing'])
             if c and c not in cams:
                 cams.append(c)

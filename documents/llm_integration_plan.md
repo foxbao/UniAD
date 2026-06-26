@@ -152,6 +152,10 @@ python tools/data_converter/make_subset.py \
 集装箱/挂车/集卡有明确空间对齐时，应判为正在装卸作业，不要求已经接触箱体；若只是邻近黄车/挂车、
 吊臂抬起但没有明确对齐，不得写“正对”或判作业。不可见设备必须写看不清或不提。`crane_status` 只是几何诊断门控，
 不再渲染到 prompt，避免诱导模型写图里没有的吊机。
+2026-06-26 继续按人工抽检修正目标筛选：近距离（默认 30m 内）移动中的正面吊/轮胎吊/叉车也进入
+caption 候选，但只能描述“行驶/缓行”，不能判作业；远距离、非冲突、且只是 idle/moving 反馈或
+普通 activity gate 的设备不强行写进最终 summary，避免 card_43/card_45/card_55 这类肉眼看不到的远处设备
+污染描述。prompt、相机路由、LiDAR 投影标注统一使用同一套相关目标筛选。
 **关键产物是 JSON sidecar**（`<pkl去后缀>_summaries.json`，token→summary），pkl 输出可丢 /tmp。
 ```bash
 # 当前新 teacher（2026-06-25 后续新 caption 优先用）
