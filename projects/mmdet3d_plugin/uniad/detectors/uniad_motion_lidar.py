@@ -296,6 +296,7 @@ class UniADMotionLidar(UniADTrackLidar):
 
         bev_embed = None
         outs_motion = dict()
+        outs_map = None
         if self.with_motion_head:
             bev_embed = self._bev_for_motion_head(outs_track['bev_embed'])
             # Pass ego2global so motion head can encode HD map lanes
@@ -304,6 +305,8 @@ class UniADMotionLidar(UniADTrackLidar):
                 if e2g is not None:
                     outs_track['ego2global'] = torch.as_tensor(
                         e2g, device=bev_embed.device, dtype=torch.float32)
+            outs_map = self._build_outs_map(
+                bev_embed, outs_track.get('ego2global'))
             ret_dict_motion = self.motion_head.forward_train(
                 bev_embed,
                 gt_bboxes_3d,
@@ -314,8 +317,7 @@ class UniADMotionLidar(UniADTrackLidar):
                 gt_sdc_fut_traj_mask=gt_sdc_fut_traj_mask,
                 outs_track=outs_track,
                 outs_seg=outs_seg,
-                outs_map=self._build_outs_map(
-                    bev_embed, outs_track.get('ego2global')))
+                outs_map=outs_map)
             outs_motion = ret_dict_motion['outs_motion']
             outs_motion['bev_pos'] = outs_track.get('bev_pos')
             losses.update(
@@ -352,7 +354,8 @@ class UniADMotionLidar(UniADTrackLidar):
                 sdc_planning=sdc_planning,
                 sdc_planning_mask=sdc_planning_mask,
                 command=command,
-                gt_future_boxes=gt_future_boxes)
+                gt_future_boxes=gt_future_boxes,
+                outs_map=outs_map)
             losses.update(
                 self.loss_weighted_and_prefixed(
                     outs_planning['losses'], prefix='planning'))
@@ -387,9 +390,9 @@ class UniADMotionLidar(UniADTrackLidar):
         if e2g is not None:
             result['ego2global'] = torch.as_tensor(
                 e2g, device=bev_embed.device, dtype=torch.float32)
+        outs_map = self._build_outs_map(bev_embed, result.get('ego2global'))
         result_motion, outs_motion = self.motion_head.forward_test(
-            bev_embed, outs_track=result,
-            outs_map=self._build_outs_map(bev_embed, result.get('ego2global')))
+            bev_embed, outs_track=result, outs_map=outs_map)
         result.update(result_motion[0])
 
         if self.with_occ_head and kwargs.get('gt_segmentation') is not None:
@@ -434,7 +437,8 @@ class UniADMotionLidar(UniADTrackLidar):
             occ_for_plan = outs_occ if 'seg_out' in outs_occ else {
                 'seg_out': bev_embed.new_zeros((1, 1, 1, 1, 1)).long()}
             result_planning = self.planning_head.forward_test(
-                bev_embed, outs_motion, occ_for_plan, command)
+                bev_embed, outs_motion, occ_for_plan, command,
+                outs_map=outs_map)
             results[0]['planning'] = dict(
                 planning_gt=dict(
                     segmentation=kwargs.get('gt_segmentation'),

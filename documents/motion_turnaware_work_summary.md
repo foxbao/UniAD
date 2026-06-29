@@ -1,7 +1,9 @@
 # KL LiDAR Motion Turn-Aware 工作总结
 
-更新时间：2026-06-23  
-对应提交：`dd632f7 feat(motion): add turn-aware training and analysis tooling`
+更新时间：2026-06-29
+主要相关提交：`dd632f7 feat(motion): add turn-aware training and analysis tooling`，
+`d904ca8 feat(motion): add turnloss ablation configs and comparison tooling`，
+`b63c4af feat(motion): add focused turn-aware comparison visualizers`
 
 ## 1. 背景
 
@@ -120,6 +122,80 @@ epoch6 validation 总体指标：
 - hard HDMap 对 Forklift、ContainerForklift 这类小样本/低速作业类可能有局部帮助，但对 Truck、Trailer、Crane 等主力类别没有形成稳定正收益。
 - 更合理的后续方向不是继续强化 hard HDMap，而是验证 weak-map gate，让地图作为可学习弱先验。
 
+### 2.4 turnloss 与 turn-aware + turnloss epoch6 结果
+
+2026-06-26 补充完成以下 4 个 no-map 配置的 6 epoch 对比：
+
+```text
+base_e2e_lidar
+base_e2e_lidar_turnaware
+base_e2e_lidar_turnloss
+base_e2e_lidar_turnaware_turnloss
+```
+
+epoch6 validation 总体指标：
+
+| 配置 | anchor | loss | minADE | minFDE | MR | Recall | mAP | AMOTA | NDS |
+|---|---|---|---:|---:|---:|---:|---:|---:|---:|
+| `base_e2e_lidar` | old 2grp | 原始 | 0.33683 | 0.59741 | 0.08124 | **0.92837** | 0.84523 | 0.80039 | 0.84994 |
+| `base_e2e_lidar_turnaware` | turn-aware 3grp | 原始 | 0.33708 | 0.59263 | 0.08227 | 0.92705 | 0.84096 | 0.80758 | 0.84783 |
+| `base_e2e_lidar_turnloss` | old 2grp | ADE+FDE + turn weighting | **0.32767** | **0.57616** | **0.07821** | 0.92605 | 0.84045 | 0.81009 | 0.84745 |
+| `base_e2e_lidar_turnaware_turnloss` | turn-aware 3grp | ADE+FDE + turn weighting | 0.32822 | 0.58010 | 0.08124 | **0.92837** | **0.85473** | **0.81174** | **0.85593** |
+
+结论：
+
+- `turnloss` 是当前 motion 单项最强配置，`minFDE=0.57616`、`MR=0.07821` 最好。
+- `turnaware_turnloss` 的 motion 只略弱于 `turnloss`，但 `mAP/AMOTA/NDS` 最好，是当前综合最均衡配置。
+- 单看总体 `minADE/minFDE` 会低估问题，因为它们是 multi-mode 的 best-of-6 指标，不能说明实际推理时最高分轨迹是否选对。
+
+### 2.5 epoch6 turn-bucket 与 top1/oracle 诊断
+
+epoch6 加权 Overall turn-bucket 汇总：
+
+| 配置 | minFDE | top1FDE | MR | top1MR | Recall |
+|---|---:|---:|---:|---:|---:|
+| `base_e2e_lidar` | 0.6092 | 1.2884 | 0.0831 | 0.1662 | 0.9297 |
+| `base_e2e_lidar_turnaware` | 0.6032 | **1.2738** | 0.0838 | **0.1657** | 0.9284 |
+| `base_e2e_lidar_turnloss` | **0.5875** | 1.3137 | **0.0801** | 0.1664 | 0.9269 |
+| `base_e2e_lidar_turnaware_turnloss` | 0.5915 | 1.2929 | 0.0831 | 0.1698 | 0.9295 |
+
+sharp turn 的 top1FDE：
+
+| 范围 | base | turnaware | turnloss | turnaware_turnloss |
+|---|---:|---:|---:|---:|
+| Overall sharp_turn | 7.9891 | 7.6969 | 7.6445 | **7.6010** |
+| CoreVehicle sharp_turn | 9.0630 | 8.6630 | 8.6627 | **8.6171** |
+
+这里的 `oracle` 指从模型输出的多个 motion mode 中，事后根据 GT 选择误差最小的一条轨迹；它只用于诊断，不是实际推理结果。实际推理只能用模型自己打分最高的 `top1` mode。
+
+因此：
+
+| 现象 | 含义 | 优先处理 |
+|---|---|---|
+| top1FDE 差，minFDE 好 | 候选轨迹里有对的，但分类分数选错 | mode scoring / assignment |
+| top1FDE 差，minFDE 也差 | 候选本身覆盖不足 | anchor / regression |
+| missed track | motion head 没拿到正确目标 | tracking / detection |
+
+当前最关键的问题是第一类：不少转弯样本 `minFDE` 明显好于 `top1FDE`，说明“轨迹有了，但没选中”。继续只改 anchor 的边际收益可能有限，下一步应优先改 mode scoring / assignment。
+
+### 2.6 epoch6 可视化复查结论
+
+已生成对比可视化：
+
+```text
+projects/work_dirs/stage2_e2e_lidar/visual_compare_epoch6_turnaware_turnloss/focus/index.html
+projects/work_dirs/stage2_e2e_lidar/visual_compare_epoch6_turnaware_turnloss/full_bev/frames/index.html
+projects/work_dirs/stage2_e2e_lidar/visual_compare_epoch6_turnaware_turnloss/full_bev/frames/pytorch_bev_vis.webm
+```
+
+代表样本中可以看到三类情况：
+
+- `turnaware_turnloss` 在部分 sharp turn 上能补到其他模型 missed 的目标，或给出更接近 GT 的候选。
+- 部分 sharp turn 中 `turnaware_turnloss` 的 `minFDE` 不差，但 `top1FDE` 很差，典型是 mode 选择错误。
+- mild turn / straight 上存在回退样本，说明转弯加权不能继续无约束加大，否则会牺牲常规移动样本。
+
+这支持一个更细的判断：`turnaware_turnloss` 是值得保留的综合候选，但当前主要瓶颈已经从“有没有转弯候选”转向“能不能把正确候选排到 top1”。
+
 ## 3. 本轮代码改动
 
 ### 3.1 TrajLoss 支持新的 mode assignment
@@ -181,7 +257,34 @@ turn_loss_weights=dict(
 - 让模型在训练时真正更重视转弯样本；
 - 配合 turn-aware anchor 使用，而不是只在 anchor 生成阶段加权。
 
-### 3.3 新增 stratified K=6 anchor 生成
+### 3.3 TrajLoss 支持只作用于 mode classification 的 turn 权重
+
+2026-06-26 进一步新增参数：
+
+```python
+turn_cls_loss_weights=dict(
+    static_slow=1.0,
+    straight=1.0,
+    mild_turn=1.5,
+    sharp_turn=2.5)
+```
+
+它和 `turn_loss_weights` 的区别：
+
+| 参数 | 作用范围 | 目的 |
+|---|---|---|
+| `turn_loss_weights` | 分类、回归、minADE/minFDE 统计都会加权 | 让整个 motion loss 更重视转弯样本 |
+| `turn_cls_loss_weights` | 只额外作用于 `l_class` mode classification | 让正确转弯候选更容易排到 top1 |
+
+新增配置：
+
+```text
+projects/configs/stage2_e2e_lidar/base_e2e_lidar_turnaware_modescore.py
+```
+
+该配置继承 `base_e2e_lidar_turnaware_turnloss.py`，保持 turn-aware anchor、ADE+FDE best-mode 选择和基础 turn loss 不变，只额外加强转弯样本的 mode classification。这个实验专门验证 `top1FDE - minFDE` gap 是否能缩小。
+
+### 3.4 新增 stratified K=6 anchor 生成
 
 新增脚本：
 
@@ -216,7 +319,7 @@ vehicle 组 6 个 mode：
 - stratified K=6 保证 6 个 mode 中一定有左右转和 maneuver/sharp；
 - `num_anchor=6` 不变，网络输出形状不变，消融更干净。
 
-### 3.4 新增 weak-map 配置
+### 3.5 新增 weak-map 配置
 
 新增配置：
 
@@ -243,6 +346,156 @@ transformerlayers=dict(map_gate_init=-4.0)
 - 其他车辆、吊车、叉车、作业车辆不一定受导航地图约束；
 - 即使 IGV 也可能被遥控，不总是按地图走。
 
+### 3.6 新增 planning-only HDMap fusion B 方案
+
+2026-06-29 补充了一个更贴合港口规控场景的地图使用方式：
+
+```text
+projects/configs/stage2_e2e_lidar/base_e2e_lidar_plan_mapfuse.py
+```
+
+背景判断：
+
+- 前面的 2x2 消融说明，导航 HDMap 对所有 agent 的 motion prediction 没有稳定正收益；
+- 这不代表地图对自车 planning 没有价值，因为港口规控模块本来就会参考导航地图；
+- 港口其他车辆、作业车辆、遥控 IGV 不一定按地图行驶，因此地图不适合继续作为所有 actor 的强 motion 约束；
+- 更合理的拆法是：motion 默认不吃地图或只做弱先验，planning 单独融合地图作为自车路径先验。
+
+新方案的核心设置：
+
+```python
+model = dict(
+    map_lane_encoder=dict(
+        map_path='data/kl_8/map/base_map.txt',
+        num_lanes=64,
+        num_points_per_lane=20,
+    ),
+    motion_head=dict(
+        map_agent_scope='none',
+    ),
+    planning_head=dict(
+        use_map_lane=True,
+        map_local_k=16,
+        map_attn_layers=1,
+        map_gate_init=-2.0,
+    ))
+```
+
+也就是说，地图仍然由 detector 里的 `MapLaneEncoder` 编码，但只给 `PlanningHeadSingleMode`
+使用；`motion_head.map_agent_scope='none'` 显式关闭 motion 对地图的使用，避免把地图对 planning
+的影响和 motion 分支混在一起。
+
+融合流程：
+
+```text
+base_map.txt
+  -> MapLaneEncoder
+     -> 按当前帧 ego2global 转到自车坐标系
+     -> 裁剪 pc_range 内最近 64 条 lane
+     -> 每条 lane 重采样 20 个点
+     -> outs_map:
+        lane_query / lane_query_pos / lane_valid / lane_centroids
+
+sdc_traj_query + sdc_track_query + command embedding
+  -> 原始 plan_query
+  -> 对最近 map_local_k=16 条 lane 做 cross-attention
+  -> residual map delta
+  -> 原 UniAD planning BEV cross-attention
+  -> reg_branch
+  -> 6-step SDC planning trajectory
+```
+
+代码入口：
+
+| 文件 | 作用 |
+|---|---|
+| `projects/mmdet3d_plugin/uniad/detectors/uniad_motion_lidar.py` | `_build_outs_map()` 编码 HDMap，并在 train/test 中把 `outs_map` 传给 planning head |
+| `projects/mmdet3d_plugin/uniad/dense_heads/planning_head.py` | 新增 `use_map_lane`、`_lane_memory()` 和 `_apply_map_lane_attention()` |
+| `projects/configs/stage2_e2e_lidar/base_e2e_lidar_plan_mapfuse.py` | planning-only HDMap fusion 配置 |
+
+实现上的保护：
+
+- `PlanningHeadSingleMode` 默认 `use_map_lane=False`，旧配置不受影响；
+- 新增 `map_delta_proj` 初始化为 0，所以从旧 no-map planner checkpoint warm-start 时，初始输出近似原 planner；
+- `map_gate_init=-2.0` 让地图初始是弱影响，再由 planning loss 学会何时使用；
+- 只选最近 `map_local_k=16` 条 lane，避免全局地图 lane 对 planning query 造成过多噪声。
+
+当前 `base_e2e_lidar_plan.py` 的 no-map planning baseline 是 6 步、约 3 秒规划。`epoch_1`
+评估结果记录如下，后续 map-fuse 需要按同 epoch 对齐比较：
+
+| 指标 | no-map planner epoch1 |
+|---|---:|
+| L2 @ 1s | 0.562 m |
+| L2 @ 2s | 1.239 m |
+| L2 @ 3s | 2.180 m |
+| avg.L2 | 1.327 m |
+| avg.Collision | 5.47% |
+| Left avg.L2 / Collision | 0.893 m / 0.66% |
+| Right avg.L2 / Collision | 1.174 m / 1.55% |
+| Straight avg.L2 / Collision | 1.365 m / 6.10% |
+
+### 3.7 SDC planning GT 分布诊断
+
+2026-06-29 增加了 planning GT 分布统计脚本：
+
+```text
+tools/analysis_tools/analyze_sdc_planning_distribution.py
+```
+
+运行命令：
+
+```bash
+conda activate uniad_train
+python tools/analysis_tools/analyze_sdc_planning_distribution.py \
+  --infos data/kl_8/kl_infos_train.pkl data/kl_8/kl_infos_val.pkl \
+  --splits train val \
+  --out-dir projects/work_dirs/stage2_e2e_lidar/planning_gt_distribution
+```
+
+统计口径：
+
+- `sdc_planning`: `[1, 6, 3]`，6 步约 3 秒；
+- 有效步沿用 planning eval 口径：`sdc_planning_mask[..., 0] > 0`；
+- `static`: 3 秒终点位移 `< 0.5 m`；
+- `slow`: `0.5 m <= 3 秒终点位移 < 2.0 m`；
+- `moving`: 3 秒终点位移 `>= 2.0 m`；
+- `turning`: 终点位移不低速，且 heading/yaw 变化 `>= 15 deg` 或横向比例较大；
+- command 沿用 `Right=0, Left=1, Straight=2`。
+
+当前统计结果：
+
+| split | N | static | slow | moving | turning | final disp p50 | avg speed p50 | Straight cmd |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| train | 41912 | 14.5% | 15.7% | 69.8% | 3.5% | 4.82 m | 1.70 m/s | 89.8% |
+| val | 4963 | 16.3% | 24.1% | 59.6% | 2.9% | 3.54 m | 1.34 m/s | 87.4% |
+
+更细的观察：
+
+- `static + slow` 在 train 是 30.2%，在 val 是 40.4%，val 的低速偏置更重；
+- 静止样本几乎全部属于 `Straight` command；
+- 多个 scene 是 100% static，例如 `20251105_007/202511050952_record`、
+  `20251108_007/202511080934_record`、`20251105_007/202511050951_record`；
+- 这很像“自车停在固定位置采集检测/作业目标”的片段，对 planning 会形成保守低速偏置；
+- 但 train 仍有约 69.8% moving，不能简单说数据集绝大多数都是停车，问题主要是平均指标会被静止/低速样本稀释。
+
+输出文件：
+
+```text
+projects/work_dirs/stage2_e2e_lidar/planning_gt_distribution/summary.csv
+projects/work_dirs/stage2_e2e_lidar/planning_gt_distribution/top_static_scenes.csv
+projects/work_dirs/stage2_e2e_lidar/planning_gt_distribution/train_samples.csv
+projects/work_dirs/stage2_e2e_lidar/planning_gt_distribution/val_samples.csv
+projects/work_dirs/stage2_e2e_lidar/planning_gt_distribution/train/*.png
+projects/work_dirs/stage2_e2e_lidar/planning_gt_distribution/val/*.png
+```
+
+对 planning 实验的影响：
+
+- 不能只看 overall `avg.L2`，否则大量静止/低速样本会让指标看起来偏好；
+- 需要额外报告 `static / slow / moving / turning` 分桶指标；
+- 如果模型在 moving/turning 上明显偏慢或停住，即使 overall L2 不差，也说明 planning 没学好；
+- 后续可考虑训练时对明显采集式 static scene 降权，或对 moving/turning 样本加权，但不要直接删除所有停车样本，因为港口等待停车也是真实场景。
+
 ## 4. 新增配置矩阵
 
 ### 4.1 已有 baseline
@@ -261,6 +514,7 @@ transformerlayers=dict(map_gate_init=-4.0)
 |---|---|---|---|
 | `base_e2e_lidar_turnloss.py` | 无 | old 2grp | ADE+FDE + turn weighting |
 | `base_e2e_lidar_turnaware_turnloss.py` | 无 | turn-aware 3grp | ADE+FDE + turn weighting |
+| `base_e2e_lidar_turnaware_modescore.py` | 无 | turn-aware 3grp | ADE+FDE + turn weighting + turn mode scoring |
 | `deferred/base_e2e_lidar_HDMap_turnloss.py` | hard map | turn-aware 3grp | ADE+FDE + turn weighting |
 | `deferred/base_e2e_lidar_HDMap_weak_turnloss.py` | weak map | turn-aware 3grp | ADE+FDE + turn weighting |
 
@@ -271,6 +525,20 @@ transformerlayers=dict(map_gate_init=-4.0)
 | `deferred/base_e2e_lidar_stratified_k6_turnloss.py` | 无 | stratified K=6 | ADE+FDE + turn weighting |
 | `deferred/base_e2e_lidar_HDMap_stratified_k6_turnloss.py` | hard map | stratified K=6 | ADE+FDE + turn weighting |
 | `deferred/base_e2e_lidar_HDMap_weak_stratified_k6_turnloss.py` | weak map | stratified K=6 | ADE+FDE + turn weighting |
+
+### 4.4 planning 地图融合实验
+
+| 配置 | planning 地图 | motion 地图 | 起点 |
+|---|---|---|---|
+| `base_e2e_lidar_plan.py` | 无 | 无 | `base_e2e_lidar/latest.pth` |
+| `base_e2e_lidar_plan_mapfuse.py` | planning-only HDMap lane attention | 关闭，`map_agent_scope='none'` | `base_e2e_lidar_plan/latest.pth` |
+| `base_e2e_lidar_plan_mapfuse_balanced.py` | planning-only HDMap lane attention + GT bucket reweight | 关闭，`map_agent_scope='none'` | `base_e2e_lidar_plan/latest.pth` |
+
+这组实验不要和 motion HDMap 实验混在一起解读。它回答的是：导航 HDMap 作为自车规控先验，能否改善
+SDC planning 的 L2 和 collision；不是回答“地图能否约束所有 agent 的 motion prediction”。
+
+`base_e2e_lidar_plan_mapfuse_balanced.py` 是训练侧去偏实验：不删样本，只在 planning loss 上降低
+采集式静止/低速样本权重，提高转弯样本权重。
 
 ## 5. 推荐训练顺序
 
@@ -327,7 +595,77 @@ deferred/base_e2e_lidar_HDMap_weak_turnloss.py
 
 这样可以判断地图到底是帮助 motion，还是对非地图约束车辆造成干扰。
 
-### 5.3 第三组：验证 stratified K=6 anchor
+### 5.3 第三组：验证 planning-only HDMap fusion
+
+新增 B 方案后，建议先跑：
+
+```text
+projects/configs/stage2_e2e_lidar/base_e2e_lidar_plan_mapfuse.py
+```
+
+训练命令：
+
+```bash
+conda activate uniad_train
+./tools/uniad_dist_train.sh projects/configs/stage2_e2e_lidar/base_e2e_lidar_plan_mapfuse.py 4
+```
+
+对比：
+
+```text
+base_e2e_lidar_plan.py
+base_e2e_lidar_plan_mapfuse.py
+```
+
+重点观察：
+
+- L2 @ 1s / 2s / 3s；
+- avg.L2；
+- avg.Collision；
+- Left / Right / Straight 分桶；
+- Static / Slow / MovingStraight / Turning GT 运动分桶；
+- 可视化中自车轨迹是否更贴近地图方向，尤其是中后段是否少发散。
+
+2026-06-29 已把 GT 运动分桶接进 `KlTrackDataset._evaluate_planning()`，正常 eval 会额外输出：
+
+```text
+planning/Static/avg.L2
+planning/Slow/avg.L2
+planning/MovingStraight/avg.L2
+planning/Turning/avg.L2
+planning/<Bucket>/avg.Collision
+planning/<Bucket>/N
+```
+
+分桶口径与 `analyze_sdc_planning_distribution.py` 对齐：`Static` 是 3 秒终点位移小于
+0.5 m，`Slow` 是 0.5-2.0 m，`MovingStraight` 是移动但不明显转弯，`Turning` 是移动且
+heading/yaw 变化或横向偏移明显。
+
+这一步应按相同 epoch 对齐比较。如果从 `base_e2e_lidar_plan/latest.pth` warm-start，
+则要单独记录“map-fuse fine-tune 了几轮”，不要直接和从零开始的 no-map planning epoch 数混淆。
+
+如果 mapfuse 的分桶结果显示 `Static/Slow` 好看但 `MovingStraight/Turning` 不理想，再跑训练侧去偏配置：
+
+```text
+projects/configs/stage2_e2e_lidar/base_e2e_lidar_plan_mapfuse_balanced.py
+```
+
+核心权重：
+
+```python
+planning_motion_loss_weights=dict(
+    static=0.3,
+    slow=0.7,
+    moving_straight=1.0,
+    turning=1.5,
+)
+```
+
+它只影响 `planning.loss_ade` 和 `planning.loss_collision_*`，不影响 track、map、motion、occ，也不改变数据
+pipeline。该配置和 `base_e2e_lidar_plan_mapfuse.py` 一样从 `base_e2e_lidar_plan/latest.pth`
+开始，方便做同起点消融：一个是纯 map-fuse，一个是 map-fuse + planning GT bucket reweight。
+
+### 5.4 第四组：验证 stratified K=6 anchor
 
 如果 loss 方向正确，再跑：
 
@@ -469,29 +807,96 @@ base_e2e_lidar.py vs base_e2e_lidar_HDMap.py
 
 1. 原始 anchor 对港口转弯车辆覆盖不足。
 2. weighted turn-aware anchor 对 `mild_turn` 有明确收益，但对 `sharp_turn` 还不稳定。
-3. 单纯换 anchor 不够，必须配合 loss 的 mode assignment 和 turn 样本加权。
+3. 单纯换 anchor 不够，必须配合 loss 的 mode assignment、mode scoring 和 turn 样本加权。
 4. 当前这版 hard HDMap 没有给 motion 带来稳定正收益，尤其在 turn-aware anchor 下还会拉大 minFDE；更合理的是把地图作为弱先验继续试。
 5. 后续判断改动是否有效，不能只看整体 minADE/minFDE，必须结合 turn-bucket 和 failure mining。
+6. `base_e2e_lidar_turnloss` 当前 motion 单项最好；`base_e2e_lidar_turnaware_turnloss` 当前综合指标最好，并且 sharp turn top1FDE 最好，但整体 top1FDE 仍未明显领先。
+7. 可视化和 top1/oracle gap 说明下一步的主要问题不是单纯“缺转弯轨迹”，而是“正确轨迹没有被排到 top1”。
+8. motion 上地图无稳定正收益，不等价于 planning 上地图无用；已新增 `base_e2e_lidar_plan_mapfuse.py`，把地图从 all-agent motion 约束拆成 planning-only 自车先验。
+9. planning GT 存在明确静止/低速偏置，尤其 val 的 `static + slow` 达到 40.4%；后续 planning 评估必须分 static/slow/moving/turning，否则平均指标会掩盖低速保守倾向。
+10. 训练侧去偏已作为独立配置保留：`base_e2e_lidar_plan_mapfuse_balanced.py`，降低 static/slow planning loss 权重，提高 turning 权重；它和 `base_e2e_lidar_plan_mapfuse.py` 同起点，适合直接消融。
 
 ## 10. 下一步建议
 
-优先训练：
+### 10.1 已完成实验的保留结论
+
+已经完成并建议保留的 checkpoint：
 
 ```text
 base_e2e_lidar_turnloss.py
-```
-
-如果 `wrong_mode` 明显减少、top1FDE 接近 minFDE，再训练组合版：
-
-```text
 base_e2e_lidar_turnaware_turnloss.py
 ```
 
-如果组合版仍然有效，再继续看地图：
+使用建议：
+
+| 目标 | 推荐 checkpoint |
+|---|---|
+| motion 单项最优 | `base_e2e_lidar_turnloss` |
+| 综合检测/跟踪/motion 最均衡 | `base_e2e_lidar_turnaware_turnloss` |
+| 原始 no-map baseline | `base_e2e_lidar` |
+| anchor-only 消融 | `base_e2e_lidar_turnaware` |
+
+### 10.2 下一轮优先方向：改 mode scoring / assignment
+
+当前最值得做的不是继续盲目加大 turn loss，而是让模型更容易把正确候选排到 top1。
+
+已新增配置：
+
+```text
+base_e2e_lidar_turnaware_modescore.py
+```
+
+核心思路：
+
+- 保持 `turnaware_turnloss` 的 anchor 和基础 loss 不变；
+- 只额外改 mode classification 的监督目标或权重；
+- 重点减少 `top1FDE - minFDE` 的 gap；
+- 不追求继续降低 oracle minFDE，而是提升实际 top1 轨迹。
+
+可以考虑三种实现，从保守到激进：
+
+| 方案 | 做法 | 风险 |
+|---|---|---|
+| A. 增大 best-mode 分类权重 | 对 `sharp_turn/mild_turn` 样本提高 mode classification loss 权重 | 最小，容易做消融 |
+| B. FDE-aware soft label | 不只监督单个 best mode，而是按 FDE/ade_fde 给 6 个 mode 分软标签 | 中等，需要确认 loss 接口 |
+| C. Top1 margin/ranking loss | 要求 oracle mode 分数高于错误 mode，尤其当 top1FDE 很差但 minFDE 好时 | 较大，可能影响稳定性 |
+
+推荐先做 A，再做 B。C 适合作为后续增强，不建议第一步就上。
+
+### 10.3 评估标准
+
+新实验不要只看 overall `minFDE`，必须同时看：
+
+| 指标 | 目标 |
+|---|---|
+| Overall top1FDE | 相比 `turnaware_turnloss` 下降 |
+| CoreVehicle sharp_turn top1FDE | 优先下降 |
+| `top1FDE - minFDE` gap | 明显缩小 |
+| Overall minFDE/MR | 不能明显劣化 |
+| straight / static_slow top1FDE | 不能明显回退 |
+
+尤其要盯住这些对比：
+
+```text
+base_e2e_lidar_turnloss
+base_e2e_lidar_turnaware_turnloss
+base_e2e_lidar_turnaware_modescore
+```
+
+### 10.4 地图和 stratified anchor 放到下一阶段
+
+motion 侧如果 mode scoring 改动有效，再继续看地图：
 
 ```text
 deferred/base_e2e_lidar_HDMap_turnloss.py
 deferred/base_e2e_lidar_HDMap_weak_turnloss.py
+```
+
+planning 侧已经新增更明确的地图实验：
+
+```text
+base_e2e_lidar_plan.py
+base_e2e_lidar_plan_mapfuse.py
 ```
 
 如果 `poor_oracle` 仍然很多，再训练：
@@ -502,7 +907,8 @@ deferred/base_e2e_lidar_stratified_k6_turnloss.py
 
 这样每一步都能回答一个明确问题：
 
-- loss 有没有用；
-- 地图有没有用；
-- weak map 是否比 hard map 更适合港口；
+- mode scoring 有没有解决 top1 选错；
+- 地图对 all-agent motion 有没有用；
+- weak map 是否比 hard map 更适合港口 motion；
+- planning-only 地图融合是否改善自车规划；
 - stratified anchor 是否比 weighted-kmeans anchor 更适合 sharp turn。

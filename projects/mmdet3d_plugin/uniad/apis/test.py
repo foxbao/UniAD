@@ -96,7 +96,71 @@ def _build_occ_eval_ranges(dataset, occ_tensor):
     }
 
 
+def _planning_tensor(value):
+    if isinstance(value, DataContainer):
+        value = value.data
+    if isinstance(value, (list, tuple)):
+        if len(value) == 1:
+            return _planning_tensor(value[0])
+        tensors = [_planning_tensor(v) for v in value]
+        if all(torch.is_tensor(v) for v in tensors):
+            return torch.stack(tensors, dim=0)
+        return tensors[0]
+    if torch.is_tensor(value):
+        return value
+    return torch.as_tensor(value)
+
+
+def _planning_traj_btc(value, steps=6, channels=2):
+    traj = _planning_tensor(value)
+    if traj.dim() == 4:
+        traj = traj[0] if traj.shape[0] == 1 else traj.flatten(0, 1)
+    elif traj.dim() == 2:
+        traj = traj.unsqueeze(0)
+    if traj.dim() != 3:
+        raise ValueError(f'Unexpected planning trajectory shape: {traj.shape}')
+    return traj[:, :steps, :channels].contiguous()
+
+
+def _planning_mask_btc(value, steps=6, channels=2):
+    mask = _planning_tensor(value)
+    if mask.dim() == 4:
+        mask = mask[0] if mask.shape[0] == 1 else mask.flatten(0, 1)
+    if mask.dim() == 2:
+        if mask.shape[-1] == channels and mask.shape[0] >= steps:
+            mask = mask.unsqueeze(0)
+        else:
+            mask = mask[:, :steps].unsqueeze(-1)
+    if mask.dim() != 3:
+        raise ValueError(f'Unexpected planning mask shape: {mask.shape}')
+    mask = mask[:, :steps]
+    if mask.shape[-1] >= channels:
+        mask = mask[..., :channels]
+    else:
+        mask = mask.expand(*mask.shape[:-1], channels)
+    return mask.contiguous()
+
+
+def _planning_seg_bthw(value, batch_size, steps=6):
+    seg = _planning_tensor(value)
+    if seg.dim() == 5:
+        seg = seg[0] if seg.shape[0] == 1 else seg.flatten(0, 1)
+    elif seg.dim() == 3:
+        seg = seg.unsqueeze(0)
+    if seg.dim() != 4:
+        raise ValueError(f'Unexpected planning segmentation shape: {seg.shape}')
+    if seg.shape[1] >= steps + 1:
+        seg = seg[:, 1:steps + 1]
+    else:
+        seg = seg[:, :steps]
+    if seg.shape[0] == 1 and batch_size > 1:
+        seg = seg.expand(batch_size, *seg.shape[1:])
+    return seg.contiguous()
+
+
 def _detach_to_cpu(obj):
+    if isinstance(obj, DataContainer):
+        return _detach_to_cpu(obj.data)
     if torch.is_tensor(obj):
         return obj.detach().cpu()
     if hasattr(obj, 'tensor') and hasattr(obj, 'to'):
@@ -110,10 +174,54 @@ def _detach_to_cpu(obj):
     return obj
 
 
-def _strip_eval_intermediates(item):
+def _planning_eval_tensor(value, dtype=None):
+    if value is None:
+        return None
+    tensor = _planning_tensor(value).detach().cpu()
+    if dtype is not None:
+        tensor = tensor.to(dtype=dtype)
+    return tensor
+
+
+def _compact_planning_for_eval(planning):
+    """Keep only the fields needed by KlDataset._evaluate_planning."""
+    if not isinstance(planning, dict):
+        return _detach_to_cpu(planning)
+
+    result_planning = planning.get('result_planning', {})
+    planning_gt = planning.get('planning_gt', {})
+    compact = dict(result_planning={}, planning_gt={})
+
+    if isinstance(result_planning, dict) and 'sdc_traj' in result_planning:
+        compact['result_planning']['sdc_traj'] = _planning_eval_tensor(
+            result_planning['sdc_traj'], dtype=torch.float32)
+
+    if isinstance(planning_gt, dict):
+        field_dtypes = {
+            'sdc_planning': torch.float32,
+            'sdc_planning_mask': torch.uint8,
+            'segmentation': torch.uint8,
+            'command': torch.long,
+        }
+        for key, dtype in field_dtypes.items():
+            if key in planning_gt:
+                compact['planning_gt'][key] = _planning_eval_tensor(
+                    planning_gt[key], dtype=dtype)
+
+    return compact
+
+
+def _dataset_wants_planning_payload(dataset):
+    return hasattr(_base_dataset(dataset), '_evaluate_planning')
+
+
+def _strip_eval_intermediates(item, keep_planning=False):
     """Remove per-frame GPU intermediates that are not used by metrics."""
     item.pop('occ', None)
-    item.pop('planning', None)
+    if keep_planning and 'planning' in item:
+        item['planning'] = _compact_planning_for_eval(item['planning'])
+    else:
+        item.pop('planning', None)
     item.pop('map', None)
     item.pop('args_tuple', None)
     pts_bbox = item.get('pts_bbox', None)
@@ -161,10 +269,16 @@ def custom_multi_gpu_test(model, data_loader, tmpdir=None, gpu_collect=False):
         iou_metrics = {}
         panoptic_metrics = {}
     
-    # Plan eval init
+    # Plan eval init. KL computes planning metrics from a compact per-sample
+    # payload in the dataset, because its ego footprint/grid differ from
+    # camera UniAD's PlanningMetric.
     eval_planning =  hasattr(model_to_eval, 'with_planning_head') \
                       and model_to_eval.with_planning_head
-    if eval_planning:
+    dataset = data_loader.dataset
+    keep_planning_payload = eval_planning and _dataset_wants_planning_payload(
+        dataset)
+    use_streaming_planning_metric = eval_planning and not keep_planning_payload
+    if use_streaming_planning_metric:
         planning_metrics = PlanningMetric(conf={
             'xbound': [-12.5, 12.5, 0.5],
             'ybound': [-12.5, 12.5, 0.5],
@@ -173,7 +287,6 @@ def custom_multi_gpu_test(model, data_loader, tmpdir=None, gpu_collect=False):
         
     bbox_results = []
     mask_results = []
-    dataset = data_loader.dataset
     rank, world_size = get_dist_info()
     if rank == 0:
         prog_bar = mmcv.ProgressBar(len(dataset))
@@ -196,8 +309,14 @@ def custom_multi_gpu_test(model, data_loader, tmpdir=None, gpu_collect=False):
                 result[0]['planning_traj'] = result[0]['planning']['result_planning']['sdc_traj']
                 result[0]['planning_traj_gt'] = result[0]['planning']['planning_gt']['sdc_planning']
                 result[0]['command'] = result[0]['planning']['planning_gt']['command']
-                planning_metrics(pred_sdc_traj[:, :6, :2], sdc_planning[0][0,:, :6, :2], 
-                                 sdc_planning_mask[0][0,:, :6, :2], segmentation[0][:, [1,2,3,4,5,6]])
+                if use_streaming_planning_metric:
+                    pred_metric = _planning_traj_btc(pred_sdc_traj)
+                    gt_metric = _planning_traj_btc(sdc_planning)
+                    mask_metric = _planning_mask_btc(sdc_planning_mask)
+                    seg_metric = _planning_seg_bthw(
+                        segmentation, batch_size=pred_metric.shape[0])
+                    planning_metrics(pred_metric, gt_metric, mask_metric,
+                                     seg_metric)
 
             # Eval Occ
             if eval_occ:
@@ -233,7 +352,8 @@ def custom_multi_gpu_test(model, data_loader, tmpdir=None, gpu_collect=False):
                 for item in result_items:
                     if not isinstance(item, dict):
                         continue
-                    _strip_eval_intermediates(item)
+                    _strip_eval_intermediates(
+                        item, keep_planning=keep_planning_payload)
             else:
                 for item in result_items:
                     if not isinstance(item, dict):
@@ -280,7 +400,7 @@ def custom_multi_gpu_test(model, data_loader, tmpdir=None, gpu_collect=False):
         else:
             mask_results = None
 
-    if eval_planning:
+    if use_streaming_planning_metric:
         planning_results = planning_metrics.compute()
         planning_metrics.reset()
 
@@ -306,7 +426,7 @@ def custom_multi_gpu_test(model, data_loader, tmpdir=None, gpu_collect=False):
         occ_results['num_occ'] = num_occ  # count on one gpu
         occ_results['ratio_occ'] = num_occ / len(dataset)  # count on one gpu, but reflect the relative ratio
         ret_results['occ_results_computed'] = occ_results
-    if eval_planning:
+    if use_streaming_planning_metric:
         ret_results['planning_results_computed'] = planning_results
 
     if mask_results is not None:

@@ -1,4 +1,5 @@
 import copy
+import math
 import time
 from os import path as osp
 
@@ -1393,6 +1394,92 @@ class KlDataset(Custom3DDataset):
                            col_n=np.zeros(T_max, dtype=np.int64))
                    for c in (0, 1, 2)}
 
+        bucket_names = ('static', 'slow', 'moving_straight', 'turning')
+        per_bucket = {
+            name: dict(l2_sum=np.zeros(T_max),
+                       l2_n=np.zeros(T_max, dtype=np.int64),
+                       col_sum=np.zeros(T_max, dtype=np.int64),
+                       col_n=np.zeros(T_max, dtype=np.int64))
+            for name in bucket_names
+        }
+
+        def wrap_pi(angle):
+            return (angle + math.pi) % (2.0 * math.pi) - math.pi
+
+        def heading_change_deg(points, min_segment_disp=0.05):
+            if len(points) < 2:
+                return 0.0
+            pts = np.concatenate([np.zeros((1, 2), dtype=np.float64),
+                                  points[:, :2]], axis=0)
+            deltas = np.diff(pts, axis=0)
+            norms = np.linalg.norm(deltas, axis=1)
+            valid = np.where(norms >= min_segment_disp)[0]
+            if len(valid) < 2:
+                return 0.0
+            v0 = deltas[valid[0]]
+            v1 = deltas[valid[-1]]
+            a0 = math.atan2(float(v0[1]), float(v0[0]))
+            a1 = math.atan2(float(v1[1]), float(v1[0]))
+            return abs(math.degrees(wrap_pi(a1 - a0)))
+
+        def yaw_change_deg(traj, valid):
+            if traj.shape[1] < 3:
+                return 0.0
+            idx = np.where(valid[:len(traj)])[0]
+            if len(idx) < 2:
+                return 0.0
+            yaw = traj[idx, 2]
+            if not np.isfinite(yaw).all():
+                return 0.0
+            return abs(math.degrees(wrap_pi(float(yaw[-1] - yaw[0]))))
+
+        def lateral_ratio(points):
+            if len(points) < 2:
+                return 0.0
+            end = points[-1, :2]
+            net = float(np.linalg.norm(end))
+            if net < 1e-6:
+                return 0.0
+            direction = end / net
+            normal = np.array([-direction[1], direction[0]],
+                              dtype=np.float64)
+            lateral = float(np.max(np.abs(points[:, :2] @ normal)))
+            return lateral / max(net, 1e-6)
+
+        def planning_bucket(gt_plan, valid):
+            idx = np.where(valid[:len(gt_plan)])[0]
+            if len(idx) == 0:
+                return None
+            last = int(idx[-1])
+            points = gt_plan[:last + 1][valid[:last + 1]]
+            if len(points) == 0:
+                return None
+            final_disp = float(np.linalg.norm(points[-1, :2]))
+            if final_disp < 0.5:
+                return 'static'
+            if final_disp < 2.0:
+                return 'slow'
+            turn_angle = max(
+                heading_change_deg(points),
+                yaw_change_deg(gt_plan[:last + 1], valid[:last + 1]))
+            if turn_angle >= 15.0 or lateral_ratio(points) >= 0.15:
+                return 'turning'
+            return 'moving_straight'
+
+        def add_l2(agg, err, valid, T):
+            for t in range(T):
+                if not valid[t]:
+                    continue
+                agg['l2_sum'][t] += float(err[t])
+                agg['l2_n'][t] += 1
+
+        def add_collision(agg, cols, valid, T):
+            for t in range(T):
+                if not valid[t]:
+                    continue
+                agg['col_sum'][t] += int(cols[t])
+                agg['col_n'][t] += 1
+
         for result in results:
             plan = result.get('planning')
             if plan is None:
@@ -1407,10 +1494,12 @@ class KlDataset(Custom3DDataset):
             if sdc_traj is None or sdc_planning is None:
                 continue
             pred_xy = self._planning_to_numpy(sdc_traj)[..., :2]
-            gt_xy = self._planning_to_numpy(sdc_planning)[..., :2]
+            gt_plan = self._planning_to_numpy(sdc_planning)
+            gt_xy = gt_plan[..., :2]
             mask = self._planning_to_numpy(sdc_planning_mask)
             # Shapes are [1, T, 2 or 3] -> drop the leading 1.
             pred_xy = pred_xy.reshape(-1, pred_xy.shape[-1])
+            gt_plan = gt_plan.reshape(-1, gt_plan.shape[-1])
             gt_xy = gt_xy.reshape(-1, gt_xy.shape[-1])
             if mask.ndim == 3:
                 mask = mask[0, :, 0]
@@ -1427,14 +1516,12 @@ class KlDataset(Custom3DDataset):
 
             T = min(T_max, pred_xy.shape[0], gt_xy.shape[0], len(mask))
             err = np.linalg.norm(pred_xy[:T, :2] - gt_xy[:T, :2], axis=-1)
-            for t in range(T):
-                if not mask[t]:
-                    continue
-                l2_sum[t] += float(err[t])
-                l2_n[t] += 1
-                if cmd_id in per_cmd:
-                    per_cmd[cmd_id]['l2_sum'][t] += float(err[t])
-                    per_cmd[cmd_id]['l2_n'][t] += 1
+            bucket_name = planning_bucket(gt_plan, mask)
+            add_l2(dict(l2_sum=l2_sum, l2_n=l2_n), err, mask, T)
+            if cmd_id in per_cmd:
+                add_l2(per_cmd[cmd_id], err, mask, T)
+            if bucket_name in per_bucket:
+                add_l2(per_bucket[bucket_name], err, mask, T)
 
             # Collision needs segmentation; skip frames missing it.
             if segmentation is None:
@@ -1448,14 +1535,11 @@ class KlDataset(Custom3DDataset):
             if seg.shape[-2:] != (bev_h, bev_w):
                 continue
             cols = collision_at(pred_xy[:T], seg)
-            for t in range(T):
-                if not mask[t]:
-                    continue
-                col_sum[t] += int(cols[t])
-                col_n[t] += 1
-                if cmd_id in per_cmd:
-                    per_cmd[cmd_id]['col_sum'][t] += int(cols[t])
-                    per_cmd[cmd_id]['col_n'][t] += 1
+            add_collision(dict(col_sum=col_sum, col_n=col_n), cols, mask, T)
+            if cmd_id in per_cmd:
+                add_collision(per_cmd[cmd_id], cols, mask, T)
+            if bucket_name in per_bucket:
+                add_collision(per_bucket[bucket_name], cols, mask, T)
 
         ret_dict = {}
 
@@ -1514,6 +1598,37 @@ class KlDataset(Custom3DDataset):
             ret_dict[f'planning/{cmd_name[cmd_id]}/avg.Collision'] = avg_col_c
         if len(per_cmd_lines) > 2:
             lines.extend(per_cmd_lines)
+
+        bucket_title = {
+            'static': 'Static',
+            'slow': 'Slow',
+            'moving_straight': 'MovingStraight',
+            'turning': 'Turning',
+        }
+        per_bucket_lines = ['', 'Planning per GT motion bucket:']
+        for bucket_name in bucket_names:
+            agg = per_bucket[bucket_name]
+            n_total = int(agg['l2_n'].max() if agg['l2_n'].size else 0)
+            if n_total == 0:
+                continue
+            l2_at_b, col_at_b = _format(eval_steps,
+                                        agg['l2_sum'], agg['l2_n'],
+                                        agg['col_sum'], agg['col_n'])
+            avg_l2_b = float(np.nanmean(l2_at_b))
+            avg_col_b = float(np.nanmean(col_at_b))
+            title = bucket_title[bucket_name]
+            per_bucket_lines.append(
+                f'  {title:14s} N={n_total:5d}  '
+                f'avg.L2 {avg_l2_b:.3f} m  '
+                f'avg.Collision {100.0 * avg_col_b:.2f}%')
+            ret_dict[f'planning/{title}/avg.L2'] = avg_l2_b
+            ret_dict[f'planning/{title}/avg.Collision'] = avg_col_b
+            ret_dict[f'planning/{title}/N'] = n_total
+            for lbl, l2, cl in zip(labels, l2_at_b, col_at_b):
+                ret_dict[f'planning/{title}/L2_{lbl}'] = l2
+                ret_dict[f'planning/{title}/Collision_{lbl}'] = cl
+        if len(per_bucket_lines) > 2:
+            lines.extend(per_bucket_lines)
 
         for line in lines:
             print_log(line, logger=logger)

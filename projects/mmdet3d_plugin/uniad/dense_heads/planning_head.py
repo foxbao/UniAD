@@ -6,6 +6,7 @@
 
 import torch
 import torch.nn as nn
+import math
 from mmdet.models.builder import HEADS, build_loss
 from einops import rearrange
 from projects.mmdet3d_plugin.models.utils.functional import bivariate_gaussian_activation
@@ -30,6 +31,11 @@ class PlanningHeadSingleMode(nn.Module):
                     alpha_collision=5.0,
                  ),
                  with_adapter=False,
+                 use_map_lane=False,
+                 map_local_k=None,
+                 map_attn_layers=1,
+                 map_gate_init=-2.0,
+                 planning_motion_loss_weights=None,
                 ):
         """
         Single Mode Planning Head for Autonomous Driving.
@@ -57,11 +63,30 @@ class PlanningHeadSingleMode(nn.Module):
         self.loss_planning = build_loss(loss_planning)
         self.planning_steps = planning_steps
         self.planning_eval = planning_eval
+        self.planning_motion_loss_weights = (
+            planning_motion_loss_weights or None)
         
         #### planning head
         fuser_dim = 3
         attn_module_layer = nn.TransformerDecoderLayer(embed_dims, 8, dim_feedforward=embed_dims*2, dropout=0.1, batch_first=False)
         self.attn_module = nn.TransformerDecoder(attn_module_layer, 3)
+
+        self.use_map_lane = use_map_lane
+        self.map_local_k = map_local_k
+        if use_map_lane:
+            map_attn_layer = nn.TransformerDecoderLayer(
+                embed_dims, 8, dim_feedforward=embed_dims*2,
+                dropout=0.1, batch_first=False)
+            self.map_attn_module = nn.TransformerDecoder(
+                map_attn_layer, map_attn_layers)
+            self.map_delta_proj = nn.Linear(embed_dims, embed_dims)
+            self.map_gate = nn.Sequential(
+                nn.Linear(embed_dims * 2, embed_dims),
+                nn.ReLU(inplace=True),
+                nn.Linear(embed_dims, embed_dims))
+            nn.init.zeros_(self.map_delta_proj.weight)
+            nn.init.zeros_(self.map_delta_proj.bias)
+            nn.init.constant_(self.map_gate[-1].bias, map_gate_init)
         
         self.mlp_fuser = nn.Sequential(
                 nn.Linear(embed_dims*fuser_dim, embed_dims),
@@ -99,6 +124,7 @@ class PlanningHeadSingleMode(nn.Module):
                       sdc_planning_mask=None,
                       command=None,
                       gt_future_boxes=None,
+                      outs_map=None,
                       ):
         """
         Perform forward planning training with the given inputs.
@@ -121,20 +147,97 @@ class PlanningHeadSingleMode(nn.Module):
 
         occ_mask = None
         
-        outs_planning = self(bev_embed, occ_mask, bev_pos, sdc_traj_query, sdc_track_query, command)
+        outs_planning = self(bev_embed, occ_mask, bev_pos, sdc_traj_query,
+                             sdc_track_query, command, outs_map=outs_map)
         loss_inputs = [sdc_planning, sdc_planning_mask, outs_planning, gt_future_boxes]
         losses = self.loss(*loss_inputs)
         ret_dict = dict(losses=losses, outs_motion=outs_planning)
         return ret_dict
 
-    def forward_test(self, bev_embed, outs_motion={}, outs_occflow={}, command=None):
+    def forward_test(self, bev_embed, outs_motion={}, outs_occflow={},
+                     command=None, outs_map=None):
         sdc_traj_query = outs_motion['sdc_traj_query']
         sdc_track_query = outs_motion['sdc_track_query']
         bev_pos = outs_motion['bev_pos']
         occ_mask = outs_occflow['seg_out']
         
-        outs_planning = self(bev_embed, occ_mask, bev_pos, sdc_traj_query, sdc_track_query, command)
+        outs_planning = self(bev_embed, occ_mask, bev_pos, sdc_traj_query,
+                             sdc_track_query, command, outs_map=outs_map)
         return outs_planning
+
+    def _lane_memory(self, outs_map, batch_size, device, dtype):
+        if not self.use_map_lane or outs_map is None:
+            return None, None
+
+        lane_query = outs_map.get('lane_query')
+        if lane_query is None or lane_query.size(1) == 0:
+            return None, None
+
+        lane_query = lane_query.to(device=device, dtype=dtype)
+        lane_query_pos = outs_map.get('lane_query_pos')
+        if lane_query_pos is not None:
+            lane_query_pos = lane_query_pos.to(device=device, dtype=dtype)
+            lane_mem = lane_query + lane_query_pos
+        else:
+            lane_mem = lane_query
+
+        if lane_mem.size(0) == 1 and batch_size != 1:
+            lane_mem = lane_mem.expand(batch_size, -1, -1)
+        if lane_mem.size(0) != batch_size:
+            raise ValueError(
+                'lane_query batch does not match plan_query batch: '
+                f'{lane_mem.size(0)} vs {batch_size}')
+
+        lane_valid = outs_map.get('lane_valid')
+        if lane_valid is None:
+            lane_mask = torch.zeros(
+                lane_mem.shape[:2], device=device, dtype=torch.bool)
+        else:
+            lane_valid = lane_valid.to(device=device).bool()
+            if lane_valid.size(0) == 1 and batch_size != 1:
+                lane_valid = lane_valid.expand(batch_size, -1)
+            lane_mask = ~lane_valid
+
+        if (self.map_local_k is not None and self.map_local_k > 0
+                and outs_map.get('lane_centroids') is not None):
+            lane_centroids = outs_map['lane_centroids'].to(
+                device=device, dtype=dtype)
+            if lane_centroids.size(0) == 1 and batch_size != 1:
+                lane_centroids = lane_centroids.expand(batch_size, -1, -1)
+            lane_dist = torch.linalg.norm(lane_centroids, dim=-1)
+            lane_dist = lane_dist.masked_fill(lane_mask, float('inf'))
+            k = min(self.map_local_k, lane_dist.size(1))
+            keep_idx = lane_dist.topk(k, dim=-1, largest=False).indices
+            keep = torch.zeros_like(lane_mask, dtype=torch.bool)
+            keep.scatter_(1, keep_idx, True)
+            keep = keep & torch.isfinite(lane_dist)
+            lane_mask = lane_mask | ~keep
+
+        if (~lane_mask).sum() == 0:
+            return None, None
+
+        all_masked = lane_mask.all(dim=1)
+        if all_masked.any():
+            lane_mask = lane_mask.clone()
+            lane_mem = lane_mem.clone()
+            lane_mask[all_masked] = False
+            lane_mem[all_masked] = 0
+
+        lane_mem = rearrange(lane_mem, 'b m c -> m b c')
+        return lane_mem, lane_mask
+
+    def _apply_map_lane_attention(self, plan_query, outs_map):
+        lane_mem, lane_mask = self._lane_memory(
+            outs_map, plan_query.size(1), plan_query.device,
+            plan_query.dtype)
+        if lane_mem is None:
+            return plan_query
+        map_context = self.map_attn_module(
+            plan_query, lane_mem, memory_key_padding_mask=lane_mask)
+        map_delta = self.map_delta_proj(map_context - plan_query)
+        map_gate = torch.sigmoid(
+            self.map_gate(torch.cat([plan_query, map_context], dim=-1)))
+        return plan_query + map_gate * map_delta
 
     def forward(self, 
                 bev_embed, 
@@ -142,7 +245,8 @@ class PlanningHeadSingleMode(nn.Module):
                 bev_pos, 
                 sdc_traj_query, 
                 sdc_track_query, 
-                command):
+                command,
+                outs_map=None):
         """
         Forward pass for PlanningHeadSingleMode.
 
@@ -182,6 +286,7 @@ class PlanningHeadSingleMode(nn.Module):
       
         pos_embed = self.pos_embed.weight
         plan_query = plan_query + pos_embed[None]  # [1, 1, 256]
+        plan_query = self._apply_map_lane_attention(plan_query, outs_map)
         
         # plan_query: [1, 1, 256]
         # bev_feat: [40000, 1, 256]
@@ -238,12 +343,130 @@ class PlanningHeadSingleMode(nn.Module):
         sdc_traj_optim = np.stack([sol.value(col_optimizer.position_x), sol.value(col_optimizer.position_y)], axis=-1)
         return torch.tensor(sdc_traj_optim[None], device=sdc_traj_all.device, dtype=sdc_traj_all.dtype)
     
+    @staticmethod
+    def _wrap_pi(angle):
+        return (angle + math.pi) % (2.0 * math.pi) - math.pi
+
+    @staticmethod
+    def _heading_change_deg(points, min_segment_disp=0.05):
+        if points.size(0) < 2:
+            return 0.0
+        origin = points.new_zeros((1, points.size(1)))
+        pts = torch.cat([origin, points], dim=0)
+        deltas = pts[1:, :2] - pts[:-1, :2]
+        norms = torch.linalg.norm(deltas, dim=-1)
+        valid = torch.nonzero(norms >= min_segment_disp, as_tuple=False)
+        if valid.numel() < 2:
+            return 0.0
+        first = int(valid[0, 0])
+        last = int(valid[-1, 0])
+        v0 = deltas[first]
+        v1 = deltas[last]
+        a0 = math.atan2(float(v0[1].detach().cpu()),
+                        float(v0[0].detach().cpu()))
+        a1 = math.atan2(float(v1[1].detach().cpu()),
+                        float(v1[0].detach().cpu()))
+        return abs(math.degrees(PlanningHeadSingleMode._wrap_pi(a1 - a0)))
+
+    @staticmethod
+    def _yaw_change_deg(traj, valid):
+        if traj.size(-1) < 3:
+            return 0.0
+        idx = torch.nonzero(valid[:traj.size(0)], as_tuple=False)
+        if idx.numel() < 2:
+            return 0.0
+        first = int(idx[0, 0])
+        last = int(idx[-1, 0])
+        yaw0 = float(traj[first, 2].detach().cpu())
+        yaw1 = float(traj[last, 2].detach().cpu())
+        if not np.isfinite(yaw0) or not np.isfinite(yaw1):
+            return 0.0
+        return abs(math.degrees(PlanningHeadSingleMode._wrap_pi(yaw1 - yaw0)))
+
+    @staticmethod
+    def _lateral_ratio(points):
+        if points.size(0) < 2:
+            return 0.0
+        end = points[-1, :2]
+        net = torch.linalg.norm(end)
+        if float(net.detach().cpu()) < 1e-6:
+            return 0.0
+        direction = end / net.clamp_min(1e-6)
+        normal = torch.stack([-direction[1], direction[0]])
+        lateral = torch.max(torch.abs(points[:, :2] @ normal))
+        return float((lateral / net.clamp_min(1e-6)).detach().cpu())
+
+    @staticmethod
+    def _planning_motion_bucket(sdc_planning, sdc_planning_mask):
+        if sdc_planning.dim() == 4:
+            traj = sdc_planning[0, 0]
+        elif sdc_planning.dim() == 3:
+            traj = sdc_planning[0] if sdc_planning.size(0) == 1 \
+                else sdc_planning
+        elif sdc_planning.dim() == 2:
+            traj = sdc_planning
+        else:
+            return None
+
+        if sdc_planning_mask.dim() == 4:
+            valid = sdc_planning_mask[0, 0, :, 0] > 0
+        elif sdc_planning_mask.dim() == 3:
+            mask = sdc_planning_mask[0] if sdc_planning_mask.size(0) == 1 \
+                else sdc_planning_mask
+            valid = mask[:, 0] > 0 if mask.size(-1) == 3 else mask > 0
+        elif sdc_planning_mask.dim() == 2:
+            valid = (sdc_planning_mask[:, 0] > 0
+                     if sdc_planning_mask.size(-1) == 3
+                     else sdc_planning_mask.reshape(-1) > 0)
+        else:
+            valid = sdc_planning_mask.reshape(-1) > 0
+        valid = valid[:traj.size(0)]
+        idx = torch.nonzero(valid, as_tuple=False)
+        if idx.numel() == 0:
+            return None
+        last = int(idx[-1, 0])
+        points = traj[:last + 1][valid[:last + 1]]
+        if points.numel() == 0:
+            return None
+        final_disp = torch.linalg.norm(points[-1, :2])
+        final_disp = float(final_disp.detach().cpu())
+        if final_disp < 0.5:
+            return 'static'
+        if final_disp < 2.0:
+            return 'slow'
+        turn_angle = max(
+            PlanningHeadSingleMode._heading_change_deg(points),
+            PlanningHeadSingleMode._yaw_change_deg(
+                traj[:last + 1], valid[:last + 1]))
+        if (turn_angle >= 15.0
+                or PlanningHeadSingleMode._lateral_ratio(points) >= 0.15):
+            return 'turning'
+        return 'moving_straight'
+
+    def _planning_motion_loss_weight(self, sdc_planning, sdc_planning_mask):
+        if not self.planning_motion_loss_weights:
+            return None, None
+        bucket = self._planning_motion_bucket(
+            sdc_planning, sdc_planning_mask)
+        if bucket is None:
+            return 'unknown', sdc_planning.new_tensor(1.0)
+        weight = float(self.planning_motion_loss_weights.get(bucket, 1.0))
+        return bucket, sdc_planning.new_tensor(weight)
+
     def loss(self, sdc_planning, sdc_planning_mask, outs_planning, future_gt_bbox=None):
         sdc_traj_all = outs_planning['sdc_traj_all'] # b, p, t, 5
         loss_dict = dict()
+        planning_bucket, planning_weight = self._planning_motion_loss_weight(
+            sdc_planning, sdc_planning_mask)
         for i in range(len(self.loss_collision)):
             loss_collision = self.loss_collision[i](sdc_traj_all, sdc_planning[0, :, :self.planning_steps, :3], torch.any(sdc_planning_mask[0, :, :self.planning_steps], dim=-1), future_gt_bbox[0][1:self.planning_steps+1])
+            if planning_weight is not None:
+                loss_collision = loss_collision * planning_weight
             loss_dict[f'loss_collision_{i}'] = loss_collision          
         loss_ade = self.loss_planning(sdc_traj_all, sdc_planning[0, :, :self.planning_steps, :2], torch.any(sdc_planning_mask[0, :, :self.planning_steps], dim=-1))
+        if planning_weight is not None:
+            loss_ade = loss_ade * planning_weight
         loss_dict.update(dict(loss_ade=loss_ade))
+        if planning_bucket is not None:
+            loss_dict['motion_bucket_weight'] = planning_weight.detach()
         return loss_dict
