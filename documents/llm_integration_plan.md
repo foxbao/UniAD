@@ -488,6 +488,59 @@ motion track_query（仅 fallback/历史分支）┘                            
     看真实直方图再定阈值；阈值写成 config 可调参数，不写死。
   - 宽松默认（待数据校准）：静止 >2s 且距最近 Crane <30m ⇒ "允许"标作业。
 
+#### 3.2.3 DriveVLM 阅读记录（2026-06-28）
+
+本节基于本地论文 `~/Downloads/DriveVLM.pdf`（CoRL 2024, `arXiv:2402.12289v5`）整理，重点看了
+Fig.1/2/3/4 和附录 Fig.8~18。
+
+**核心做法**：
+- DriveVLM 不是只做一句 caption，而是把驾驶理解拆成 CoT 流程：
+  `Scene Description -> Scene Analysis -> Hierarchical Planning`。输出包含环境/车道/时间/天气、
+  critical objects 及 2D box、每个关键目标的 characteristic / influence、场景总结、meta actions、
+  decision description 和未来 waypoints。
+- DriveVLM-Dual 是更贴近部署的双系统：VLM 分支低频理解/给参考轨迹，传统 3D perception /
+  motion prediction / trajectory planning 分支高频运行。关键点是它把 3D perception 结果投影到图像，
+  用 IoU 把 VLM 找到的 2D critical object 和 3D object 匹配，再把 BEV 位置、朝向、历史轨迹作为
+  language prompt 送回 VLM 做 scene analysis。这个设计和我们“LiDAR query/3D fact 辅助语言理解”
+  是同一类思想，只是他们在推理时仍依赖图像 VLM，我们当前 Stage-1 想验证的是 frozen LiDAR query
+  能否单独承载这些语义。
+
+**真值怎么产生**：
+- SUP-AD 真值不是纯硬规则生成。论文流程是：从大规模驾驶视频库中做 long-tail object mining
+  （CLIP/语言检索）和 challenging scenario mining（驾驶行为变化/策略变化），人工过滤后选关键帧，
+  再做 scene annotation，并由 3 名标注员验证。
+- 标注内容是高层语义 + 决策：scene summary、weather/time/road/lane condition、critical object
+  的 class / bbox / characteristic / influence、meta action 序列、decision description。
+  waypoints 可由车辆 IMU/记录轨迹自动得到。meta action 则和未来驾驶策略一致，速度类来自加减速/刹车，
+  转向/换道类结合方向盘、地图和感知信息。
+- 结论：我们当前 `gen_vlm_qa.py` 的硬规则 QA 适合作为 Stage-1 clean probe，优点是可控、低成本、
+  能检验 query 是否读到几何/轨迹/风险信息；但它不是 DriveVLM 级别的最终监督。特别是
+  `operation_state`、目标 `influence`、推荐动作解释这类标签，应该走 “几何预筛 + VLM teacher +
+  人工抽检/少量人工真值” 的闭环，而不是长期只靠硬阈值。
+
+**图片理解对我们的启发**：
+- Fig.1：3D perception 不是被 VLM 替代，而是作为 grounding prompt 给 VLM；最终再和传统规划融合。
+  对我们来说，可对应两条基线：`3D facts as text prompt`（不学 query）和 `LiDAR query object tokens`
+  （当前 head）做 A/B。
+- Fig.2/3：真值样例明确包含“目标特征”和“对自车决策的影响”，且数据构造先挖长尾/困难场景再标注。
+  港口场景也应优先挖稀有/高价值片段：近距离交互、IGV/Truck 横穿、吊机/叉车作业门控、异常停车、
+  狭窄通道、阻塞路径、高曲率绕行等。
+- Fig.15~18：可视化样例展示了逐步对话：先判断场景，再找 critical object，再注入 BEV 位置和历史轨迹，
+  最后给 meta action 和轨迹。样例里有洒水车、倒树、交通警察手势、环岛等长尾情况；其中“交通警察手势”
+  属于图像独有语义，我们的纯 LiDAR 推理不应强教。对应到港口，人的手势、灯牌文字、吊具细节也应继续列入
+  不教或只做 teacher/human 参考的范围。
+
+**后续可落地项**：
+- 训练完当前 Qwen3-4B QA probe 后，先做 `model / shuffle-query / no-query` 同帧评估，按
+  `count/spatial/motion/risk/advice/activity_gate` 分桶看差距；这一步对应 DriveVLM 的“3D prompt 有用吗”
+  消融，但我们检验的是 “query token 是否真的被用到”。
+- 增加 DriveVLM 风格的结构化 truth schema，用于小规模 teacher/human 标注：
+  `critical_objects[{track_id, class, bbox_or_bev, characteristic, influence, operation_state, recommended_action}]`
+  + `scene_summary/meta_actions/decision`。先只在 val v3 或更小的 hard-case 子集做。
+- 做一个 prompt-only 3D facts baseline：把 `geo_facts` 直接转文本喂 Qwen3-4B，不注入 object query。
+  如果 prompt-only 已经覆盖大部分 QA，而 query 模型没有明显超过 shuffle，则说明当前 head 主要在背模板；
+  如果 query 模型在同帧对照上更强，才值得继续扩大 teacher/human truth。
+
 
 ### 3.3 落点（代码）
 
@@ -508,6 +561,10 @@ motion track_query（仅 fallback/历史分支）┘                            
     旧说法"必须继承 occ 顶端才有料"已被修正：对 Stage-1 探针而言不成立。
 - caption 不走 pipeline 的 Collect key，而是数据集（`kl_dataset.py` `_union2one`）把 `gt_caption`
   注入当前帧的 **img_metas**，detector（`uniad_motion_lidar.py` `_current_caption`）从 img_metas 取出喂 llm_head。
+- QA 目标同样不走 Collect key：`gen_vlm_qa.py` 写 `info['vlm_qa']` / `info['geo_facts']['qa']`，
+  数据集注入 `img_metas['gt_qa']`，detector（`_current_qa`）传给
+  `LLMBridgeHead.forward_train(..., gt_qa=...)`。这样 caption probe 和 QA probe 共用同一套
+  LiDAR query/object-token 接线。
 - 数据：图像同步脚本（补相机路径）+ 几何模板生成 + VLM caption 生成，产出每帧 caption，存入 pkl/sidecar。
 - **query/center 对齐（2026-06-23 修）**：LLM 的 per-agent query 与 box center 必须 1:1 对应。
   曾用 `outs_motion['track_query']` 当 query、`outs_track['track_bbox_results']` 当 center——但
@@ -527,6 +584,11 @@ motion track_query（仅 fallback/历史分支）┘                            
 - loss：Stage-1 只优化 `llm.loss_llm`。full-task 历史分支仍可把 LM loss 经
   `loss_weighted_and_prefixed(prefix='llm')` 与现有 task loss 合并，但不作为当前结论依据。
 - 验证：先看 LLM caption 指标的 `model > shuffle/noquery` 是否成立，再考虑结构化特征、更多 token 或任务反哺。
+- **QA probe（2026-06-27 新增）**：`LLMBridgeHead.training_mode='qa'` 时，prompt 从
+  `qa_prompt_template.format(question=...)` 得到，target 是选中的 `qa['answer']`；默认 caption 模式不变。
+  `qa_index_strategy='hash'` 用 QA id 做确定性分散抽样，避免每帧永远只学第一题。
+  第一版 QA 全部是硬几何/轨迹真值：`summary/risk/advice/activity_gate/spatial/motion/count`。
+  其中 `activity_gate` 只是"需要视觉确认作业状态"的几何门控事实，不是 working/idle 视觉标签。
 
 ### 3.5 待定 / 风险
 
@@ -586,6 +648,27 @@ motion track_query（仅 fallback/历史分支）┘                            
     2×4 shard 完成 805 帧 annotated caption。相机兜底修复后 `missing_summary=0`，
     并根据人工抽检收紧 moving/waiting/不可见吊机规则；预览见
     `outputs/qwen32b_val_preview/overview.jpg` 和 `outputs/qwen32b_state_qa_preview/overview.jpg`。
+16. ✅ 硬真值 QA 生成与接线（2026-06-27）：新增 `tools/data_converter/gen_vlm_qa.py`，
+    只依赖 `geo_facts` / 3D box / future traj / rule，不读图、不调用 VLM。输出 schema：
+    `id/question/answer/answer_type/gt_source/target_ids`，并同时写到 `info['vlm_qa']` 与
+    `info['geo_facts']['qa']`。已生成：
+    - `data/kl_8/kl_infos_train_vlmqa.pkl`：43981 帧，686973 条 QA，709M。
+    - `data/kl_8/kl_infos_val_sub6cam_v3_vlmqa.pkl`：805 帧，14095 条 QA，18M。
+    接线已完成：`kl_dataset.py` 注入 `gt_qa`，`uniad_motion_lidar.py` 传给 head，
+    `LLMBridgeHead.training_mode='qa'` 可训练 answer-only。QA probe config：
+    `projects/configs/stage2_e2e_lidar/base_e2e_lidar_llm_qa_probe.py`。
+    复现命令：
+    ```bash
+    python3 tools/data_converter/gen_vlm_qa.py \
+      --pkl-path data/kl_8/kl_infos_train_vlmcap.pkl \
+      --out-path data/kl_8/kl_infos_train_vlmqa.pkl \
+      --max-qas 18 --clear-existing
+
+    python3 tools/data_converter/gen_vlm_qa.py \
+      --pkl-path data/kl_8/kl_infos_val_sub6cam_v3_vlmcap.pkl \
+      --out-path data/kl_8/kl_infos_val_sub6cam_v3_vlmqa.pkl \
+      --max-qas 18 --clear-existing
+    ```
 
 ### 4.2 经验教训（踩过的坑，复现必读）
 
@@ -632,6 +715,139 @@ motion track_query（仅 fallback/历史分支）┘                            
    历史 full-task 命令
    `uniad_dist_train.sh projects/configs/stage2_e2e_lidar/base_e2e_lidar_occ_llm_train.py <GPUS>`
    仅作对照复现，不再作为当前建议入口。
+
+**A-QA. Stage-1 硬真值 QA 探针（2026-06-27 新入口）**。这条线训练 question→answer，
+目标比自由 summary 更可控，建议先跑单卡 sanity，再跑完整 probe。
+   ```bash
+   # 单卡 sanity（需在带 mmcv/transformers/peft 的训练 env 中）
+   CUDA_VISIBLE_DEVICES=0 python tools/train.py \
+     projects/configs/stage2_e2e_lidar/base_e2e_lidar_llm_qa_probe.py \
+     --work-dir projects/work_dirs/stage2_e2e_lidar/base_e2e_lidar_llm_qa_probe \
+     --no-validate
+
+   # 多卡正式 probe
+   ./tools/uniad_dist_train.sh \
+     projects/configs/stage2_e2e_lidar/base_e2e_lidar_llm_qa_probe.py <GPUS>
+   ```
+   当前 QA probe 的 train pkl 是 full train（时序完整），val/test 是 805 帧 6cam 子集。
+   普通 `python3` 没有 `mmcv`，只适合做脚本语法和 pkl schema 检查；训练/build 需要原
+   `uniad_train` 或 Qwen3 隔离环境。
+   2026-06-27 单卡 sanity 记录：GPU 4 空闲，使用 `uniad_train` + `PYTHONPATH=$PWD`
+   跑 80 帧连续小 pkl（`/tmp/kl_infos_train_vlmqa_sanity80.pkl`）：
+   ```bash
+   PYTHONPATH=$PWD CUDA_VISIBLE_DEVICES=4 conda run -n uniad_train python tools/train.py \
+     projects/configs/stage2_e2e_lidar/base_e2e_lidar_llm_qa_probe.py \
+     --work-dir /tmp/uniad_llm_qa_probe_sanity --no-validate \
+     --cfg-options \
+       data.train.ann_file=/tmp/kl_infos_train_vlmqa_sanity80.pkl \
+       data.val.ann_file=/tmp/kl_infos_train_vlmqa_sanity80.pkl \
+       data.test.ann_file=/tmp/kl_infos_train_vlmqa_sanity80.pkl \
+       runner.max_epochs=1 total_epochs=1 checkpoint_config.interval=999 \
+       log_config.interval=1 data.workers_per_gpu=0
+   ```
+   结果：第一次尝试时由于执行权限/driver 可见性不足，训练环境里
+   `torch.cuda.is_available()==False`，`.cuda()` 时报 `RuntimeError: No CUDA GPUs are available`；
+   权限恢复后复跑通过。最终 run 走完 80/80 iter，`UniADMotionLidar + LLMBridgeHead + Qwen2.5 +
+   LoRA` 正常 forward/backward，`llm.loss_llm` 和 `grad_norm` 均为有限值。loss 前 10 iter 均值
+   约 `3.94`，后 10 iter 均值约 `1.25`；最后 5 个 `llm.loss_llm` 为
+   `[0.9299, 0.5880, 1.9247, 1.0275, 2.3703]`。日志：
+   `/tmp/uniad_llm_qa_probe_sanity/20260627_133627.log` 与
+   `/tmp/uniad_llm_qa_probe_sanity/20260627_133627.log.json`；临时 `epoch_1.pth` 已清理以节省磁盘。
+   该结果说明 QA pkl schema、dataset meta 传递、detector 到 `LLMBridgeHead(gt_qa=...)` 的接线、
+   以及 LoRA 训练链路都已打通。
+
+   2026-06-27 新增 `tools/uniad_dist_train_workdir.sh`：接口与 `tools/uniad_dist_train.sh`
+   基本一致，但允许通过环境变量 `WORK_DIR` 覆盖输出目录，避免根盘空间不足时默认写到
+   `projects/work_dirs`。full train QA probe 推荐命令：
+   ```bash
+   conda activate uniad_train
+   CUDA_VISIBLE_DEVICES=4,5,6,7 \
+   MASTER_PORT=28647 \
+   WORK_DIR=/mnt/disk1/uniad_work_dirs/stage2_e2e_lidar/base_e2e_lidar_llm_qa_probe \
+   TORCHRUN=/home/baojiali/anaconda3/envs/uniad_train/bin/torchrun \
+   ./tools/uniad_dist_train_workdir.sh \
+     projects/configs/stage2_e2e_lidar/base_e2e_lidar_llm_qa_probe.py 4
+   ```
+   若不设置 `WORK_DIR`，脚本会退回到原 `uniad_dist_train.sh` 的 config-derived work dir。
+
+   2026-06-27 14:00 手动启动过一次 full train QA probe：0-3 卡已有 `turnaware_modescore`
+   任务，故只使用 GPU 4-7；根盘只剩约 11G，work dir 显式放到 `/mnt/disk1`。
+   启动日志：
+   `/mnt/disk1/uniad_work_dirs/stage2_e2e_lidar/base_e2e_lidar_llm_qa_probe/logs/train_20260627_135913.launch.log`。
+   主训练日志：`/mnt/disk1/uniad_work_dirs/stage2_e2e_lidar/base_e2e_lidar_llm_qa_probe/20260627_135927.log`。
+   初始状态：checkpoint 正常加载，`missing keys` 为新增 `llm_head`，符合预期；epoch 1 到
+   `100/10996` 时，`llm.loss_llm` 从 iter 50 的 `2.4633` 降到 iter 100 的 `1.0918`，梯度有限。
+   后按手动接管要求停止在 epoch 1 `1300/10996`，最后 `llm.loss_llm=0.3291`，未产生完整
+   epoch checkpoint。后续可用 `tail -f` 跟踪新 run 的主训练日志。
+
+   2026-06-27 已下载 Qwen3-4B 指令版 student：
+   `/mnt/disk1/models/Qwen3-4B-Instruct-2507`，约 7.6G，`model_type=qwen3`，
+   `hidden_size=2560`。新增配置：
+   `projects/configs/stage2_e2e_lidar/base_e2e_lidar_llm_qa_probe_qwen3_4b.py`。
+   注意主 `uniad_train` 的 `transformers==4.46.3` 不认识 `qwen3`，不能直接跑这个配置；
+   需使用 Qwen3 隔离环境 `/mnt/disk1/conda_envs/uniad_train_qwen3_py39`（`transformers==4.51.3`）。
+   新增专用启动脚本 `tools/run_llm_qa_probe_qwen3_4b.sh`，已内置
+   `USE_TF=0 TRANSFORMERS_NO_TF=1 PYTHONNOUSERSITE=1`，避免用户目录 TensorFlow 干扰
+   transformers/peft 导入；也内置默认 GPU 4-7、`MASTER_PORT=28648`、`/mnt/disk1` work dir。
+   ```bash
+   ./tools/run_llm_qa_probe_qwen3_4b.sh \
+     projects/configs/stage2_e2e_lidar/base_e2e_lidar_llm_qa_probe_qwen3_4b.py 4
+   ```
+   不传 cfg/gpus 时会默认使用上面这个配置和 4 卡；单卡 sanity 示例：
+   `CUDA_VISIBLE_DEVICES=6 ./tools/run_llm_qa_probe_qwen3_4b.sh projects/configs/stage2_e2e_lidar/base_e2e_lidar_llm_qa_probe_qwen3_4b.py 1`。
+   如默认端口冲突，再临时加 `MASTER_PORT=28649` 覆盖。
+   4B 是 DDP 每卡一份完整模型，不是 4 卡模型并行；正式跑前建议先在单卡上做 80 帧 sanity，
+   看单卡 24G 显存是否足够，再扩大到 4 卡。
+
+   2026-06-28/29 `epoch_5.pth` 初步 QA 评估：新增
+   `tools/analysis_tools/eval_llm_qa.py`，支持 `model / shuffle / noquery` 三种模式。方法是先跑一次
+   test dataloader 捕获每帧 LiDAR query 和 box centres，再对同一批 QA 分别用同帧 query、错帧 query、
+   无 query 生成答案并按 normalized exact / contains / char-F1 统计。先用 GPU1 做了小样本 smoke：
+   ```bash
+   USE_TF=0 TRANSFORMERS_NO_TF=1 PYTHONNOUSERSITE=1 PYTHONPATH=$PWD CUDA_VISIBLE_DEVICES=1 \
+   /mnt/disk1/conda_envs/uniad_train_qwen3_py39/bin/python -u \
+     tools/analysis_tools/eval_llm_qa.py \
+     --pkl-path data/kl_8/kl_infos_val_sub6cam_v3_vlmqa.pkl \
+     --config projects/configs/stage2_e2e_lidar/base_e2e_lidar_llm_qa_probe_qwen3_4b.py \
+     --checkpoint /mnt/disk1/uniad_work_dirs/stage2_e2e_lidar/base_e2e_lidar_llm_qa_probe_qwen3_4b/epoch_5.pth \
+     --limit 30 --qa-strategy hash --max-qas-per-frame 1 --max-new-tokens 48 \
+     --out-json /mnt/disk1/uniad_work_dirs/stage2_e2e_lidar/base_e2e_lidar_llm_qa_probe_qwen3_4b/qa_eval_epoch5_limit30_hash.json
+   ```
+   结果（30 个 queue-able eval frames，每帧 1 个 hash QA）：`model contains=0.667, char_f1=0.424`；
+   `shuffle contains=0.567, char_f1=0.406`；`noquery contains=0.433, char_f1=0.384`。
+   初步看 `model > shuffle > noquery`，但差距偏小，且 motion/advice 题语言先验很强；spatial/count
+   更能体现 query 贡献。生成样例常先输出正确短答后继续重复/续写，故 exact 暂不可靠，先看
+   contains/char-F1。等 `epoch_6.pth` 完成后应复跑更大样本，最好按 answer_type 分桶报告。
+
+   2026-06-29 `epoch_6.pth` 已完成并复评。训练最终 checkpoint：
+   `/mnt/disk1/uniad_work_dirs/stage2_e2e_lidar/base_e2e_lidar_llm_qa_probe_qwen3_4b/epoch_6.pth`。
+   最后一轮原任务 val 指标与冻结 LiDAR backbone 基本一致（如 `mAP=0.8272, NDS=0.8343,
+   AMOTA=0.7570, motion_min_ade=0.3819, map_drivable_iou=0.8925`），符合 probe-only 预期；
+   这些不是 QA 指标，只说明评测链路和冻结主干正常。
+
+   QA 复评 1：`limit=50 --qa-strategy hash --max-qas-per-frame 1`：
+   `model contains=0.560, char_f1=0.454`；
+   `shuffle contains=0.540, char_f1=0.433`；
+   `noquery contains=0.420, char_f1=0.396`。整体仍是 `model > shuffle > noquery`，但
+   model-vs-shuffle 差距很小，因为 hash 题里 motion/advice/activity_gate 很多，问题文本本身已泄漏大部分答案。
+
+   QA 复评 2（更关键）：只评 `spatial/count`，`limit=40 --qa-strategy per_type --answer-types spatial count
+   --max-qas-per-frame 2`：
+   - overall：`model contains=0.287, char_f1=0.432`；
+     `shuffle contains=0.163, char_f1=0.414`；
+     `noquery contains=0.050, char_f1=0.304`。
+   - spatial：`model contains=0.442, char_f1=0.493`；
+     `shuffle contains=0.250, char_f1=0.468`；
+     `noquery contains=0.000, char_f1=0.303`。
+   - count：`model contains=0.000, char_f1=0.319`；
+     `shuffle contains=0.000, char_f1=0.314`；
+     `noquery contains=0.143, char_f1=0.305`。
+
+   读数：**空间题证明 query 有用**。同帧 query 能答出“右侧 6.0m 卡车静止”这类最近目标信息；
+   shuffle 会跟着错帧 query 输出另一个目标，noquery 常编“正前方 65m 小车”等语言先验。
+   但 **count 还没学会**，经常输出 2/3/10 个或连续列举，说明现有 object-token + LM 目标不擅长精确计数。
+   另一个明显问题是停止生成：模型常先输出正确短答，再继续重复或续写 `Human:`，所以后续要加
+   answer-only 后处理/停止词，或把 target 格式改成更强约束的短字段。
 
 **A0. Qwen3-VL-32B teacher QA / train 全量闸门**。32B annotated val 已跑完，现阶段不要直接
 重做 train 全量；先确认作业/空闲状态质量。当前 val 指标：`activity_addressed=0.895`，

@@ -55,6 +55,10 @@ class LLMBridgeHead(BaseModule):
                  lora_cfg=None,
                  max_text_len=128,
                  prompt='请用一句话描述本车周围的港口场景。',
+                 qa_prompt_template='请回答问题：{question}',
+                 training_mode='caption',
+                 qa_answer_types=None,
+                 qa_index_strategy='first',
                  loss_weight=1.0,
                  detach_inputs=False,
                  init_cfg=None):
@@ -72,6 +76,19 @@ class LLMBridgeHead(BaseModule):
             target_modules=['q_proj', 'v_proj'])
         self.max_text_len = max_text_len
         self.prompt = prompt
+        self.qa_prompt_template = qa_prompt_template
+        self.training_mode = training_mode
+        if self.training_mode not in ('caption', 'qa'):
+            raise ValueError(
+                f'Unsupported LLMBridgeHead training_mode={training_mode!r}; '
+                'use "caption" or "qa".')
+        self.qa_answer_types = (
+            None if qa_answer_types is None else set(qa_answer_types))
+        self.qa_index_strategy = qa_index_strategy
+        if self.qa_index_strategy not in ('first', 'hash'):
+            raise ValueError(
+                f'Unsupported qa_index_strategy={qa_index_strategy!r}; '
+                'use "first" or "hash".')
         self.loss_weight = loss_weight
         self.detach_inputs = detach_inputs
 
@@ -186,26 +203,82 @@ class LLMBridgeHead(BaseModule):
             max_length=self.max_text_len).input_ids.to(device)
         return ids, self._llm.get_input_embeddings()(ids)
 
-    def forward_train(self, outs_motion, outs_track=None, gt_caption=None):
-        """LM loss over [prompt | object tokens | caption].
+    @staticmethod
+    def _unwrap_single(value):
+        while (isinstance(value, (list, tuple)) and len(value) == 1 and
+               not (value and isinstance(value[0], dict))):
+            value = value[0]
+        return value
 
-        Supervises only the caption span. Returns dict(loss_llm=...). When
-        there is no caption or no agent query, returns a graph-connected zero
-        so DDP/backward stays happy.
+    def _select_qa(self, gt_qa):
+        """Pick one QA dict from current-frame QA metadata."""
+        gt_qa = self._unwrap_single(gt_qa)
+        if not gt_qa:
+            return None
+        if isinstance(gt_qa, dict):
+            qa_list = [gt_qa]
+        else:
+            qa_list = list(gt_qa)
+        if self.qa_answer_types is not None:
+            qa_list = [
+                qa for qa in qa_list
+                if isinstance(qa, dict)
+                and qa.get('answer_type') in self.qa_answer_types
+            ]
+        else:
+            qa_list = [qa for qa in qa_list if isinstance(qa, dict)]
+        if not qa_list:
+            return None
+        if self.qa_index_strategy == 'hash':
+            # Deterministic per-frame spread without importing random state.
+            key = str(qa_list[0].get('id', ''))
+            idx = sum(ord(ch) for ch in key) % len(qa_list)
+            return qa_list[idx]
+        return qa_list[0]
+
+    def _training_texts(self, gt_caption=None, gt_qa=None):
+        """Return (prompt, target) for the configured training mode."""
+        if self.training_mode == 'qa':
+            qa = self._select_qa(gt_qa)
+            if qa is None:
+                return None, None
+            question = qa.get('question')
+            answer = qa.get('answer')
+            if not question or not answer:
+                return None, None
+            prompt = self.qa_prompt_template.format(
+                question=question, answer_type=qa.get('answer_type', ''),
+                gt_source=qa.get('gt_source', ''))
+            return prompt, answer
+
+        target = self._unwrap_single(gt_caption)
+        if not target:
+            return None, None
+        return self.prompt, target
+
+    def forward_train(self, outs_motion, outs_track=None, gt_caption=None,
+                      gt_qa=None):
+        """LM loss over [prompt | object tokens | target text].
+
+        In caption mode target text is the VLM scene summary. In QA mode target
+        text is one deterministic hard-GT answer selected from gt_qa and the
+        prompt contains that question. Supervises only the target span. When
+        target text or agent query is absent, returns a graph-connected zero so
+        DDP/backward stays happy.
         """
         agent_query = self._agent_query(outs_motion, outs_track)
         device = (agent_query.device if agent_query is not None
                   else next(self.projector.parameters()).device)
 
-        target = gt_caption[0] if isinstance(gt_caption, (list, tuple)) \
-            else gt_caption
+        prompt, target = self._training_texts(
+            gt_caption=gt_caption, gt_qa=gt_qa)
         if not target or agent_query is None or agent_query.numel() == 0:
             zero = self.projector[0].weight.sum() * 0.0
             return dict(loss_llm=zero)
 
         centres = self._agent_centres(outs_track)
         obj_tok = self._object_tokens(agent_query, centres, device)  # [n,d]
-        prompt_ids, prompt_emb = self._embed_text(self.prompt, device)
+        prompt_ids, prompt_emb = self._embed_text(prompt, device)
         tgt_ids, tgt_emb = self._embed_text(target, device)
 
         obj_emb = obj_tok.unsqueeze(0)  # [1,n,d]

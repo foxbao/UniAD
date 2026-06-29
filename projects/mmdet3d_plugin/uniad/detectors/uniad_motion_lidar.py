@@ -92,12 +92,13 @@ class UniADMotionLidar(UniADTrackLidar):
     def with_llm_head(self):
         return hasattr(self, 'llm_head') and self.llm_head is not None
 
-    def _current_caption(self, img_metas):
-        """Extract the current-frame VLM caption from img_metas.
+    @staticmethod
+    def _current_meta_value(img_metas, key):
+        """Extract a current-frame metadata value from nested img_metas.
 
         img_metas for this stack is an integer-keyed metas_map
-        ({0:..., N-1:{... 'gt_caption':...}}); the caption sits on the last
-        frame. Mirrors _current_frame_ego2global's unwrapping of the nested
+        ({0:..., N-1:{... key:...}}); current-frame values sit on the last
+        frame. Mirrors _current_frame_ego2global's unwrapping of nested
         list/dict layouts. Returns None when absent.
         """
         if img_metas is None:
@@ -111,14 +112,22 @@ class UniADMotionLidar(UniADTrackLidar):
             meta = img_metas
         if not isinstance(meta, dict):
             return None
-        if 'gt_caption' in meta:
-            return meta['gt_caption']
-        # integer-keyed metas_map: caption lives on the last frame
+        if key in meta:
+            return meta[key]
+        # integer-keyed metas_map: current-frame value lives on the last frame
         if meta and all(isinstance(k, int) for k in meta.keys()):
             last = meta[max(meta.keys())]
             if isinstance(last, dict):
-                return last.get('gt_caption')
+                return last.get(key)
         return None
+
+    def _current_caption(self, img_metas):
+        """Extract the current-frame VLM caption from img_metas."""
+        return self._current_meta_value(img_metas, 'gt_caption')
+
+    def _current_qa(self, img_metas):
+        """Extract current-frame deterministic QA pairs from img_metas."""
+        return self._current_meta_value(img_metas, 'gt_qa')
 
     @staticmethod
     def _bev_for_motion_head(bev_embed):
@@ -270,7 +279,8 @@ class UniADMotionLidar(UniADTrackLidar):
                 raise RuntimeError('llm_probe_only=True requires llm_head.')
             losses_llm = self.llm_head.forward_train(
                 None, outs_track=outs_track,
-                gt_caption=self._current_caption(img_metas))
+                gt_caption=self._current_caption(img_metas),
+                gt_qa=self._current_qa(img_metas))
             losses.update(
                 self.loss_weighted_and_prefixed(losses_llm, prefix='llm'))
             return self._sanitize_losses(losses)
@@ -365,7 +375,8 @@ class UniADMotionLidar(UniADTrackLidar):
                 raise RuntimeError('LLMBridgeHead requires MotionHead outputs.')
             losses_llm = self.llm_head.forward_train(
                 outs_motion, outs_track=outs_track,
-                gt_caption=self._current_caption(img_metas))
+                gt_caption=self._current_caption(img_metas),
+                gt_qa=self._current_qa(img_metas))
             losses.update(
                 self.loss_weighted_and_prefixed(losses_llm, prefix='llm'))
 
