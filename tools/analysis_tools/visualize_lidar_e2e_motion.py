@@ -61,7 +61,9 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description='Visualize LiDAR E2E BEV boxes, track IDs, and motion.')
     parser.add_argument('--config', required=True)
-    parser.add_argument('--checkpoint', required=True)
+    parser.add_argument('--checkpoint', default=None)
+    parser.add_argument('--results', default=None,
+                        help='Optional eval results pkl. If set, render from saved results instead of running inference.')
     parser.add_argument('--out-dir', required=True)
     parser.add_argument('--split', default='val', choices=['val', 'test'])
     parser.add_argument('--device', default='cuda:0')
@@ -92,6 +94,8 @@ def parse_args() -> argparse.Namespace:
         raise ValueError('--point-stride must be positive.')
     if args.hdmap_max_lanes <= 0:
         raise ValueError('--hdmap-max-lanes must be positive.')
+    if args.results is None and args.checkpoint is None:
+        raise ValueError('Either --checkpoint or --results must be provided.')
     return args
 
 
@@ -443,6 +447,78 @@ def pred_from_result(result: dict, score_thr: float, topk: int):
         traj_scores=None if traj_scores is None else traj_scores[keep])
 
 
+def load_eval_results(path: str) -> List[dict]:
+    loaded = mmcv.load(resolve_repo_path(path))
+    if isinstance(loaded, dict):
+        if 'bbox_results' not in loaded:
+            raise KeyError('results dict must contain "bbox_results"')
+        loaded = loaded['bbox_results']
+    if not isinstance(loaded, list):
+        raise TypeError(f'Expected eval results list, got {type(loaded)}')
+    return loaded
+
+
+def planning_xy(value) -> Optional[np.ndarray]:
+    if value is None:
+        return None
+    arr = tensor_to_numpy(value).astype(np.float32)
+    if arr.size == 0:
+        return None
+    arr = np.reshape(arr, (-1, arr.shape[-1]))
+    return arr[:, :2]
+
+
+def planning_valid_mask(value, steps: int) -> np.ndarray:
+    if value is None:
+        return np.ones((steps,), dtype=bool)
+    mask = tensor_to_numpy(value)
+    if mask.size == 0:
+        return np.ones((steps,), dtype=bool)
+    mask = np.reshape(mask, (-1, mask.shape[-1]))
+    mask = mask[:steps]
+    if mask.ndim == 2:
+        mask = mask[:, 0] > 0
+    else:
+        mask = mask > 0
+    if len(mask) < steps:
+        pad = np.ones((steps - len(mask),), dtype=bool)
+        mask = np.concatenate([mask.astype(bool), pad], axis=0)
+    return mask.astype(bool)
+
+
+def command_to_text(command) -> str:
+    if command is None:
+        return 'unknown'
+    try:
+        cmd = int(np.reshape(tensor_to_numpy(command), (-1,))[0])
+    except Exception:
+        return 'unknown'
+    return {0: 'Right', 1: 'Left', 2: 'Straight'}.get(cmd, str(cmd))
+
+
+def planning_from_result(result: dict) -> Dict[str, Optional[np.ndarray]]:
+    raw = result[0] if isinstance(result, (list, tuple)) and result else result
+    if not isinstance(raw, dict):
+        return dict(pred=None, gt=None, gt_mask=None, command='unknown')
+    planning = raw.get('planning', {})
+    result_planning = planning.get('result_planning', {}) if isinstance(
+        planning, dict) else {}
+    planning_gt = planning.get('planning_gt', {}) if isinstance(
+        planning, dict) else {}
+
+    pred = planning_xy(result_planning.get('sdc_traj',
+                                          raw.get('planning_traj', None)))
+    gt = planning_xy(planning_gt.get('sdc_planning',
+                                    raw.get('planning_traj_gt', None)))
+    mask = planning_valid_mask(planning_gt.get('sdc_planning_mask', None),
+                               0 if gt is None else len(gt))
+    command = command_to_text(planning_gt.get('command',
+                                             raw.get('command', None)))
+    if gt is not None and mask is not None:
+        gt = gt[:len(mask)][mask]
+    return dict(pred=pred, gt=gt, gt_mask=mask, command=command)
+
+
 def best_traj(traj: Optional[np.ndarray],
               traj_scores: Optional[np.ndarray]) -> Optional[np.ndarray]:
     if traj is None or len(traj) == 0:
@@ -575,9 +651,44 @@ def draw_pred_traj(ax, pred_data: Dict[str, np.ndarray]) -> None:
                    marker='x', alpha=0.95)
 
 
+def draw_sdc_planning(ax, planning_data: Dict[str, Optional[np.ndarray]],
+                      draw_gt: bool, draw_pred: bool,
+                      compare_gt: bool = False) -> None:
+    origin = np.zeros((1, 2), dtype=np.float32)
+    gt = planning_data.get('gt')
+    pred = planning_data.get('pred')
+
+    if draw_gt and gt is not None and len(gt) > 0:
+        pts = np.concatenate([origin, gt[:, :2]], axis=0)
+        disp = lidar_xy_to_display(pts)
+        ax.plot(disp[:, 0], disp[:, 1], color='#6ee36e', linewidth=2.4,
+                alpha=0.98, zorder=7)
+        ax.scatter(disp[1:, 0], disp[1:, 1], color='#6ee36e', s=16,
+                   marker='o', alpha=0.95, zorder=8)
+        ax.text(disp[-1, 0], disp[-1, 1], 'SDC GT', color='#6ee36e',
+                fontsize=7, ha='left', va='bottom')
+
+    if compare_gt and gt is not None and len(gt) > 0:
+        pts = np.concatenate([origin, gt[:, :2]], axis=0)
+        disp = lidar_xy_to_display(pts)
+        ax.plot(disp[:, 0], disp[:, 1], color='white', linewidth=1.4,
+                alpha=0.75, linestyle='--', zorder=6)
+
+    if draw_pred and pred is not None and len(pred) > 0:
+        pts = np.concatenate([origin, pred[:, :2]], axis=0)
+        disp = lidar_xy_to_display(pts)
+        ax.plot(disp[:, 0], disp[:, 1], color='#ff9f1c', linewidth=2.6,
+                alpha=0.98, zorder=9)
+        ax.scatter(disp[1:, 0], disp[1:, 1], color='#ff9f1c', s=22,
+                   marker='x', alpha=0.98, zorder=10)
+        ax.text(disp[-1, 0], disp[-1, 1], 'SDC Pred', color='#ff9f1c',
+                fontsize=7, ha='left', va='bottom')
+
+
 def render_frame(points: np.ndarray,
                  gt_data: Dict[str, np.ndarray],
                  pred_data: Dict[str, np.ndarray],
+                 planning_data: Dict[str, Optional[np.ndarray]],
                  class_names: Sequence[str],
                  pc_range: Sequence[float],
                  title: str,
@@ -601,8 +712,11 @@ def render_frame(points: np.ndarray,
     draw_hdmap_lanes(left, hdmap_lanes)
     draw_boxes(left, gt_data, class_names, 'GT#', annotate_topk, alpha=0.75)
     draw_gt_future(left, gt_data)
+    draw_sdc_planning(left, planning_data, draw_gt=True, draw_pred=False)
     draw_boxes(right, pred_data, class_names, 'P#', annotate_topk, alpha=0.95)
     draw_pred_traj(right, pred_data)
+    draw_sdc_planning(right, planning_data, draw_gt=False, draw_pred=True,
+                      compare_gt=False)
     fig.suptitle(title, color='white', fontsize=11)
     fig.subplots_adjust(
         left=0.055, right=0.985, bottom=0.06, top=0.91, wspace=0.06)
@@ -748,9 +862,18 @@ def run_visualization(cfg: Config, args: argparse.Namespace) -> None:
     if not indices:
         raise RuntimeError('No frames selected for visualization.')
 
-    checkpoint = resolve_repo_path(args.checkpoint)
-    model = build_pytorch_model(cfg, checkpoint, args.device, dataset)
-    reset_model_sequence_state(model)
+    eval_results = None
+    model = None
+    if args.results is not None:
+        eval_results = load_eval_results(args.results)
+        if len(eval_results) != len(dataset):
+            raise ValueError(
+                f'Results length {len(eval_results)} != dataset length {len(dataset)}')
+        print(f'[INFO] Loaded eval results from {resolve_repo_path(args.results)}')
+    else:
+        checkpoint = resolve_repo_path(args.checkpoint)
+        model = build_pytorch_model(cfg, checkpoint, args.device, dataset)
+        reset_model_sequence_state(model)
 
     hdmap_lanes = None
     hdmap_path = None
@@ -777,10 +900,14 @@ def run_visualization(cfg: Config, args: argparse.Namespace) -> None:
             continue
 
         points = load_points(cfg, dataset_cfg, info)
-        result = model_forward_one(model, dataset, idx, args.device)
+        if eval_results is not None:
+            result = eval_results[idx]
+        else:
+            result = model_forward_one(model, dataset, idx, args.device)
         ann = dataset.get_ann_info(idx)
         gt_data = gt_from_ann(ann, class_names)
         pred_data = pred_from_result(result, args.score_thr, args.topk)
+        planning_data = planning_from_result(result)
         frame_hdmap_lanes = None
         if hdmap_lanes is not None:
             frame_hdmap_lanes = hdmap_lanes_for_frame(
@@ -789,12 +916,14 @@ def run_visualization(cfg: Config, args: argparse.Namespace) -> None:
                 args.hdmap_margin)
         scene = str(info.get('scene_token', ''))
         title = (
-            f'base_e2e_lidar | frame={frame_id} index={idx} '
+            f'{osp.splitext(osp.basename(args.config))[0]} | frame={frame_id} index={idx} '
             f'token={token[:8]} scene={scene[-8:]} | '
-            f'GT={len(gt_data["boxes"])} Pred={len(pred_data["boxes"])}')
+            f'GT={len(gt_data["boxes"])} Pred={len(pred_data["boxes"])} '
+            f'Command={planning_data.get("command", "unknown")}')
         render_frame(
-            points, gt_data, pred_data, class_names, cfg.point_cloud_range,
-            title, save_path, args.point_stride, args.annotate_topk,
+            points, gt_data, pred_data, planning_data, class_names,
+            cfg.point_cloud_range, title, save_path, args.point_stride,
+            args.annotate_topk,
             hdmap_lanes=frame_hdmap_lanes)
         frame_files.append(save_path)
         summary.append(dict(

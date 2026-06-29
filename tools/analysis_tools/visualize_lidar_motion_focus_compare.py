@@ -59,6 +59,7 @@ MODEL_COLORS = {
     'base': '#4c78a8',
     'turnaware': '#f58518',
     'turnloss': '#54a24b',
+    'turnaware_turnloss': '#e45756',
 }
 
 

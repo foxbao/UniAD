@@ -30,6 +30,7 @@ class TrajLoss(nn.Module):
                  best_mode_metric='minade',
                  fde_weight=0.5,
                  turn_loss_weights=None,
+                 turn_cls_loss_weights=None,
                  static_path_thr=2.0,
                  straight_deg=15.0,
                  mild_deg=45.0,
@@ -59,6 +60,7 @@ class TrajLoss(nn.Module):
         self.best_mode_metric = best_mode_metric
         self.fde_weight = float(fde_weight)
         self.turn_loss_weights = turn_loss_weights
+        self.turn_cls_loss_weights = turn_cls_loss_weights
         self.static_path_thr = float(static_path_thr)
         self.straight_deg = float(straight_deg)
         self.mild_deg = float(mild_deg)
@@ -127,9 +129,17 @@ class TrajLoss(nn.Module):
         # Compute classification loss
         l_class = -log_probs.gather(1, inds.unsqueeze(1)).squeeze(1)
 
-        sample_weights = self._sample_weights(traj_gt, masks)
+        sample_weights = self._sample_weights(
+            traj_gt, masks, self.turn_loss_weights)
+        cls_sample_weights = sample_weights
+        if self.turn_cls_loss_weights:
+            cls_sample_weights = cls_sample_weights * self._sample_weights(
+                traj_gt, masks, self.turn_cls_loss_weights)
+            if self.normalize_turn_weights and cls_sample_weights.numel() > 0:
+                cls_sample_weights = cls_sample_weights / \
+                    cls_sample_weights.mean().clamp(min=1e-6)
         l_reg = torch.sum(l_reg * sample_weights)/(batch_size + 1e-5)
-        l_class = torch.sum(l_class * sample_weights)/(batch_size + 1e-5)
+        l_class = torch.sum(l_class * cls_sample_weights)/(batch_size + 1e-5)
         l_minade = torch.sum(l_minade * sample_weights)/(batch_size + 1e-5)
         l_minfde = torch.sum(l_minfde * sample_weights)/(batch_size + 1e-5)
 
@@ -137,15 +147,16 @@ class TrajLoss(nn.Module):
         return loss, l_class, l_reg, l_minade, l_minfde, l_mr
 
     def _sample_weights(self, traj_gt: torch.Tensor,
-                        masks: torch.Tensor) -> torch.Tensor:
-        if not self.turn_loss_weights:
+                        masks: torch.Tensor,
+                        turn_loss_weights) -> torch.Tensor:
+        if not turn_loss_weights:
             return traj_gt.new_ones((traj_gt.shape[0], ))
         weights = traj_gt.new_ones((traj_gt.shape[0], ))
         valid = (1 - masks).bool()
         for idx in range(traj_gt.shape[0]):
             pts = traj_gt[idx, valid[idx], :2]
             bucket = self._classify_turn_bucket(pts)
-            weights[idx] = float(self.turn_loss_weights.get(bucket, 1.0))
+            weights[idx] = float(turn_loss_weights.get(bucket, 1.0))
         if self.normalize_turn_weights and weights.numel() > 0:
             weights = weights / weights.mean().clamp(min=1e-6)
         return weights
