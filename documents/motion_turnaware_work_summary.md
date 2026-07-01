@@ -496,6 +496,151 @@ projects/work_dirs/stage2_e2e_lidar/planning_gt_distribution/val/*.png
 - 如果模型在 moving/turning 上明显偏慢或停住，即使 overall L2 不差，也说明 planning 没学好；
 - 后续可考虑训练时对明显采集式 static scene 降权，或对 moving/turning 样本加权，但不要直接删除所有停车样本，因为港口等待停车也是真实场景。
 
+### 3.8 planning final-displacement 诊断与 front-obstacle 切分
+
+2026-07-01 进一步把 planning 诊断从 “L2 / collision” 扩展到 “终点位移是否偏短/偏长”。
+
+修改文件：
+
+```text
+projects/mmdet3d_plugin/datasets/kl_dataset.py
+tools/analysis_tools/diagnose_planning_disp.py
+```
+
+`KlTrackDataset._evaluate_planning()` 现在会额外输出：
+
+```text
+planning/pred_final_disp
+planning/gt_final_disp
+planning/final_disp_ratio
+planning/<Command>/pred_final_disp
+planning/<Command>/gt_final_disp
+planning/<Command>/final_disp_ratio
+planning/<Bucket>/pred_final_disp
+planning/<Bucket>/gt_final_disp
+planning/<Bucket>/final_disp_ratio
+planning/FrontClear/*
+planning/FrontObstacle/*
+```
+
+其中：
+
+```text
+final_disp_ratio = pred_final_disp / gt_final_disp
+```
+
+当 GT 终点位移小于 0.5 m 时不计算 ratio，避免静止样本分母过小导致比例失真。
+
+`FrontObstacle` 是一个粗粒度诊断切分：检查未来占用 `segmentation` 在自车前方走廊内是否有占用。
+默认走廊是：
+
+```text
+x: 0-30 m
+y: -6 m 到 +6 m
+```
+
+这个切分不是正式指标，而是为了验证一个假设：planning 偏短到底是来自 loss reweighting，
+还是来自 collision loss 在前方有障碍时把轨迹往回拉。它需要和 `GT>=3m / GT>=4m`
+一起看，避免把“GT 本来就该停车”的样本误判成预测偏短。
+
+新增离线诊断脚本：
+
+```text
+tools/analysis_tools/diagnose_planning_disp.py
+```
+
+它直接读取 `tools/uniad_dist_eval.sh --out` 保存的 pkl，不需要重新跑 GPU 推理。输出：
+
+```text
+planning_disp_diagnostics.csv
+planning_disp_diagnostics.md
+```
+
+脚本会按以下维度打印 `N / mean / median / IQR`：
+
+- Overall；
+- Left / Right / Straight command；
+- Static / Slow / MovingStraight / Turning；
+- FrontClear / FrontObstacle；
+- `GT>=2m / GT>=3m / GT>=4m`；
+- `MovingStraight/Turning x FrontClear/FrontObstacle x GT>=thr`。
+
+当前对 `base_e2e_lidar_plan_mapfuse_balanced` 的 epoch1-4 诊断结论：
+
+| checkpoint | overall ratio | MovingStraight ratio | Turning ratio | 现象 |
+|---|---:|---:|---:|---|
+| epoch1 | 1.005 | 0.849 | 0.658 | 转弯明显偏短 |
+| epoch2 | 1.061 | 0.614 | 0.872 | 直行明显偏短，overall 被 slow/static 掩盖 |
+| epoch3 | 1.034 | 1.032 | 1.111 | 长度最均衡，L2 也最好 |
+| epoch4 | 1.190 | 1.070 | 1.158 | 开始整体偏长 |
+
+因此当前 `balanced` 实验不能只看最后 epoch。epoch3 是更合理的候选，epoch4 已经出现过冲趋势。
+
+### 3.9 normalized balanced 配置
+
+`base_e2e_lidar_plan_mapfuse_balanced.py` 使用的原始 planning loss 权重是：
+
+```python
+planning_motion_loss_weights=dict(
+    static=0.3,
+    slow=0.7,
+    moving_straight=1.0,
+    turning=1.5,
+)
+```
+
+训练日志和数据统计显示，KL train split 下这个权重均值大约是 `0.869`，不是最初担心的
+`0.4-0.5`。因此它不会把 planning 有效学习率砍半，但仍然会改变样本侧重点。为了让消融更干净，
+新增 normalized 版本：
+
+```text
+projects/configs/stage2_e2e_lidar/base_e2e_lidar_plan_mapfuse_balanced_norm.py
+```
+
+归一化后的权重：
+
+```python
+planning_motion_loss_weights=dict(
+    static=0.345,
+    slow=0.806,
+    moving_straight=1.151,
+    turning=1.727,
+)
+```
+
+它保持相对偏好不变，但让训练集加权均值接近 1.0。这个配置用于区分：
+
+| 可能因素 | 诊断方式 |
+|---|---|
+| 绝对 loss 尺度变化 | balanced vs balanced_norm |
+| 相对样本偏好变化 | uniform mapfuse vs balanced_norm |
+| collision loss 偏短压力 | 后续 collision-off / collision-down ablation |
+| ADE 缺少末端约束 | 后续 FDE/后段加权 ablation |
+
+### 3.10 planning 可视化右侧 drivable 背景
+
+`visualize_lidar_e2e_motion.py` 新增参数：
+
+```bash
+--right-background drivable_gt
+```
+
+默认仍然是右侧画点云；开启后右侧不画点云，而是画验证 pipeline 生成的 `gt_lane_masks`
+drivable space。这个 mask 是 drivable head 训练和算 map IoU 用的标签。
+
+注意当前 `eval_epoch*_planning_results.pkl` 里没有保存逐帧预测 drivable mask，只保存了每帧
+`ret_iou` 和整体验证 IoU。因此这个背景是 GT/label drivable space，不是模型预测 drivable。
+
+实现时要注意坐标轴：
+
+```text
+gt_lane_masks: row = y, col = x
+BEV display:  display_x = -y, display_y = x
+```
+
+所以绘制前必须转置 mask，并使用 `origin='lower'`。最初直接 `imshow` 会看起来像差了 90 度，
+已经修正。
+
 ## 4. 新增配置矩阵
 
 ### 4.1 已有 baseline
@@ -533,12 +678,16 @@ projects/work_dirs/stage2_e2e_lidar/planning_gt_distribution/val/*.png
 | `base_e2e_lidar_plan.py` | 无 | 无 | `base_e2e_lidar/latest.pth` |
 | `base_e2e_lidar_plan_mapfuse.py` | planning-only HDMap lane attention | 关闭，`map_agent_scope='none'` | `base_e2e_lidar_plan/latest.pth` |
 | `base_e2e_lidar_plan_mapfuse_balanced.py` | planning-only HDMap lane attention + GT bucket reweight | 关闭，`map_agent_scope='none'` | `base_e2e_lidar_plan/latest.pth` |
+| `base_e2e_lidar_plan_mapfuse_balanced_norm.py` | planning-only HDMap lane attention + 均值归一化 GT bucket reweight | 关闭，`map_agent_scope='none'` | `base_e2e_lidar_plan/latest.pth` |
 
 这组实验不要和 motion HDMap 实验混在一起解读。它回答的是：导航 HDMap 作为自车规控先验，能否改善
 SDC planning 的 L2 和 collision；不是回答“地图能否约束所有 agent 的 motion prediction”。
 
 `base_e2e_lidar_plan_mapfuse_balanced.py` 是训练侧去偏实验：不删样本，只在 planning loss 上降低
 采集式静止/低速样本权重，提高转弯样本权重。
+
+`base_e2e_lidar_plan_mapfuse_balanced_norm.py` 是同一想法的更干净消融：保留相对权重，但让训练集
+平均权重约等于 1.0，避免把“loss 总尺度变化”和“样本侧重点变化”混在一起。
 
 ## 5. 推荐训练顺序
 
@@ -648,6 +797,7 @@ heading/yaw 变化或横向偏移明显。
 
 ```text
 projects/configs/stage2_e2e_lidar/base_e2e_lidar_plan_mapfuse_balanced.py
+projects/configs/stage2_e2e_lidar/base_e2e_lidar_plan_mapfuse_balanced_norm.py
 ```
 
 核心权重：
@@ -664,6 +814,14 @@ planning_motion_loss_weights=dict(
 它只影响 `planning.loss_ade` 和 `planning.loss_collision_*`，不影响 track、map、motion、occ，也不改变数据
 pipeline。该配置和 `base_e2e_lidar_plan_mapfuse.py` 一样从 `base_e2e_lidar_plan/latest.pth`
 开始，方便做同起点消融：一个是纯 map-fuse，一个是 map-fuse + planning GT bucket reweight。
+
+评估时必须同时看 `final_disp_ratio`，否则可能出现两种误判：
+
+- avg.L2 下降，但轨迹系统性偏短或偏长；
+- overall ratio 接近 1，但 MovingStraight / Turning 某一类明显偏短。
+
+当前 `balanced` 的 epoch3 是长度最均衡的 checkpoint；epoch4 虽然已经训练更多，但
+`final_disp_ratio` 显示整体偏长，不能简单认为“epoch 越靠后越好”。
 
 ### 5.4 第四组：验证 stratified K=6 anchor
 
@@ -735,6 +893,35 @@ failure 类型：
 - 如果 `poor_oracle` 很多，优先改 anchor 覆盖；
 - 如果 `missed_track` 很多，motion head 再怎么调也解决不了，需要看 tracking。
 
+### 6.3 planning final-displacement 诊断
+
+新增脚本：
+
+```text
+tools/analysis_tools/diagnose_planning_disp.py
+```
+
+典型用法：
+
+```bash
+conda activate uniad_train
+python tools/analysis_tools/diagnose_planning_disp.py \
+  --results \
+    plan_e1=projects/work_dirs/stage2_e2e_lidar/base_e2e_lidar_plan/eval_epoch1_planning_results.pkl \
+    balanced_e3=projects/work_dirs/stage2_e2e_lidar/base_e2e_lidar_plan_mapfuse_balanced/eval_epoch3_planning_results.pkl \
+  --out-dir projects/work_dirs/stage2_e2e_lidar/planning_disp_diagnostics/current
+```
+
+它用于回答三个问题：
+
+| 问题 | 看什么 |
+|---|---|
+| 模型是不是整体偏短/偏长 | `overall final_disp_ratio` |
+| 偏差是否集中在直行或转弯 | `MovingStraight / Turning` |
+| collision 是否把轨迹往回拉 | `FrontClear / FrontObstacle`，尤其 `GT>=3m/4m` |
+
+这个脚本只读取 eval pkl，不需要占 GPU。
+
 ## 7. 新增可视化和训练曲线工具
 
 新增工具：
@@ -751,8 +938,12 @@ tools/analysis_tools/visualize_track_drivable_eval.py
 - 画训练曲线；
 - 可视化 LiDAR E2E tracking + motion；
 - 在 GT 面板上叠加 HDMap；
+- 在预测面板上用 `--right-background drivable_gt` 替换点云背景，显示 drivable space；
 - 检查 motion GT、预测轨迹、track ID、不同车辆颜色；
 - 对 failure mining 输出的 sample index 做定点复查。
+
+`--right-background drivable_gt` 使用 `gt_lane_masks`。绘制时已经按
+`display_x=-y, display_y=x` 做了转置修正，避免 drivable mask 相对车辆/地图转 90 度。
 
 ## 8. 重要注意事项
 
@@ -815,6 +1006,8 @@ base_e2e_lidar.py vs base_e2e_lidar_HDMap.py
 8. motion 上地图无稳定正收益，不等价于 planning 上地图无用；已新增 `base_e2e_lidar_plan_mapfuse.py`，把地图从 all-agent motion 约束拆成 planning-only 自车先验。
 9. planning GT 存在明确静止/低速偏置，尤其 val 的 `static + slow` 达到 40.4%；后续 planning 评估必须分 static/slow/moving/turning，否则平均指标会掩盖低速保守倾向。
 10. 训练侧去偏已作为独立配置保留：`base_e2e_lidar_plan_mapfuse_balanced.py`，降低 static/slow planning loss 权重，提高 turning 权重；它和 `base_e2e_lidar_plan_mapfuse.py` 同起点，适合直接消融。
+11. planning 需要额外看 `final_disp_ratio`，否则 avg.L2 不能区分“轨迹方向错”和“轨迹长度偏短/偏长”。当前 `base_e2e_lidar_plan_mapfuse_balanced` 的 epoch3 长度最均衡，epoch4 已经有整体偏长趋势。
+12. `balanced_norm` 是更干净的下一步消融，用于确认收益来自样本侧重点而不是 planning loss 总尺度变化。
 
 ## 10. 下一步建议
 

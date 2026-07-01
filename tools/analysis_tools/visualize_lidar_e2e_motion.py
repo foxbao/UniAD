@@ -77,6 +77,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--annotate-topk', type=int, default=18)
     parser.add_argument('--webm-fps', type=float, default=6.0)
     parser.add_argument('--webm-crf', type=int, default=32)
+    parser.add_argument('--right-background', default='points',
+                        choices=['points', 'drivable_gt'],
+                        help='background for the right prediction panel')
     parser.add_argument('--gt-map-overlay', default='none',
                         choices=['none', 'hdmap'],
                         help='overlay map information on the left GT panel')
@@ -183,6 +186,8 @@ def tensor_to_numpy(value):
         return None
     if isinstance(value, torch.Tensor):
         return value.detach().cpu().numpy()
+    if value.__class__.__name__ == 'DataContainer':
+        return tensor_to_numpy(value.data)
     if hasattr(value, 'tensor'):
         return value.tensor.detach().cpu().numpy()
     return np.asarray(value)
@@ -557,6 +562,56 @@ def draw_points(ax, points: np.ndarray, stride: int) -> None:
                    linewidths=0)
 
 
+def drivable_mask_from_dataset_item(item: dict) -> Optional[np.ndarray]:
+    mask = tensor_to_numpy(item.get('gt_lane_masks'))
+    if mask is None:
+        return None
+    mask = np.asarray(mask)
+    while mask.ndim > 2 and mask.shape[0] == 1:
+        mask = mask[0]
+    if mask.ndim > 2:
+        mask = mask.reshape(-1, *mask.shape[-2:])[-1]
+    if mask.ndim != 2:
+        return None
+    return mask > 0
+
+
+def draw_bev_mask(ax,
+                  mask: Optional[np.ndarray],
+                  pc_range: Sequence[float],
+                  color: Sequence[float],
+                  alpha: float,
+                  label: Optional[str] = None) -> None:
+    if mask is None:
+        return
+    mask = np.asarray(mask).astype(bool)
+    if mask.ndim != 2 or not np.any(mask):
+        return
+    h, w = mask.shape
+    x_min, y_min, _, x_max, y_max, _ = [float(v) for v in pc_range]
+    # The drivable mask is indexed as rows=y and cols=x:
+    #   row 0 -> y_max, row H-1 -> y_min
+    #   col 0 -> x_min, col W-1 -> x_max
+    # BEV plotting uses lidar_xy_to_display(x, y) = (-y, x), so display
+    # columns must follow original y rows and display rows must follow
+    # original x cols. Transpose before imshow to avoid a 90-degree rotation.
+    display_mask = mask.T
+    rgba = np.zeros((w, h, 4), dtype=np.float32)
+    rgba[..., :3] = np.asarray(color, dtype=np.float32)
+    rgba[..., 3] = display_mask.astype(np.float32) * float(alpha)
+    # imshow extent is expressed after lidar_xy_to_display: display x=-y,
+    # display y=x.
+    ax.imshow(
+        rgba,
+        extent=(-y_max, -y_min, x_min, x_max),
+        origin='lower',
+        interpolation='nearest',
+        zorder=0)
+    if label:
+        ax.text(0.985, 0.02, label, transform=ax.transAxes, ha='right',
+                va='bottom', color=color, fontsize=7, alpha=0.95)
+
+
 def draw_hdmap_lanes(ax,
                      lanes: Optional[Sequence[Dict[str, Optional[np.ndarray]]]]
                      ) -> None:
@@ -695,6 +750,8 @@ def render_frame(points: np.ndarray,
                  out_path: str,
                  point_stride: int,
                  annotate_topk: int,
+                 right_background: str = 'points',
+                 drivable_gt: Optional[np.ndarray] = None,
                  hdmap_lanes: Optional[Sequence[
                      Dict[str, Optional[np.ndarray]]]] = None) -> None:
     fig, axes = plt.subplots(1, 2, figsize=(11.2, 8.6), dpi=160)
@@ -707,8 +764,12 @@ def render_frame(points: np.ndarray,
                gt_title)
     setup_axis(right, pc_range,
                f'Pred tracks + predicted future paths ({len(pred_data["boxes"])})')
-    for ax in axes:
-        draw_points(ax, points, point_stride)
+    draw_points(left, points, point_stride)
+    if right_background == 'points':
+        draw_points(right, points, point_stride)
+    elif right_background == 'drivable_gt':
+        draw_bev_mask(right, drivable_gt, pc_range, color=(0.22, 0.72, 0.52),
+                      alpha=0.42, label='GT drivable space')
     draw_hdmap_lanes(left, hdmap_lanes)
     draw_boxes(left, gt_data, class_names, 'GT#', annotate_topk, alpha=0.75)
     draw_gt_future(left, gt_data)
@@ -900,6 +961,11 @@ def run_visualization(cfg: Config, args: argparse.Namespace) -> None:
             continue
 
         points = load_points(cfg, dataset_cfg, info)
+        dataset_item = None
+        drivable_gt = None
+        if args.right_background == 'drivable_gt':
+            dataset_item = dataset[idx]
+            drivable_gt = drivable_mask_from_dataset_item(dataset_item)
         if eval_results is not None:
             result = eval_results[idx]
         else:
@@ -923,7 +989,8 @@ def run_visualization(cfg: Config, args: argparse.Namespace) -> None:
         render_frame(
             points, gt_data, pred_data, planning_data, class_names,
             cfg.point_cloud_range, title, save_path, args.point_stride,
-            args.annotate_topk,
+            args.annotate_topk, right_background=args.right_background,
+            drivable_gt=drivable_gt,
             hdmap_lanes=frame_hdmap_lanes)
         frame_files.append(save_path)
         summary.append(dict(

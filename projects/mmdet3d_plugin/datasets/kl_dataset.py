@@ -1380,6 +1380,22 @@ class KlDataset(Custom3DDataset):
                     collisions[t] = True
             return collisions
 
+        def front_obstacle_bucket(segmentation,
+                                  x_range=(0.0, 30.0),
+                                  y_abs=6.0):
+            """Coarse diagnostic split: future occupancy in front corridor."""
+            x_min, x_max = x_range
+            y_min, y_max = -float(y_abs), float(y_abs)
+            c0 = max(0, int(math.floor((x_min - x0) / cell)))
+            c1 = min(bev_w, int(math.ceil((x_max - x0) / cell)) + 1)
+            r0 = max(0, int(math.floor((y_min - y0) / cell)))
+            r1 = min(bev_h, int(math.ceil((y_max - y0) / cell)) + 1)
+            if c0 >= c1 or r0 >= r1:
+                return 'front_clear'
+            future_seg = segmentation[1:] if segmentation.shape[0] > 1 else segmentation
+            has_obstacle = bool(future_seg[:, r0:r1, c0:c1].any())
+            return 'front_obstacle' if has_obstacle else 'front_clear'
+
         T_max = max(eval_steps) + 1
         # Per-step accumulators
         l2_sum = np.zeros(T_max, dtype=np.float64)
@@ -1391,7 +1407,12 @@ class KlDataset(Custom3DDataset):
         per_cmd = {c: dict(l2_sum=np.zeros(T_max),
                            l2_n=np.zeros(T_max, dtype=np.int64),
                            col_sum=np.zeros(T_max, dtype=np.int64),
-                           col_n=np.zeros(T_max, dtype=np.int64))
+                           col_n=np.zeros(T_max, dtype=np.int64),
+                           pred_disp_sum=0.0,
+                           gt_disp_sum=0.0,
+                           ratio_sum=0.0,
+                           disp_n=0,
+                           ratio_n=0)
                    for c in (0, 1, 2)}
 
         bucket_names = ('static', 'slow', 'moving_straight', 'turning')
@@ -1399,8 +1420,31 @@ class KlDataset(Custom3DDataset):
             name: dict(l2_sum=np.zeros(T_max),
                        l2_n=np.zeros(T_max, dtype=np.int64),
                        col_sum=np.zeros(T_max, dtype=np.int64),
-                       col_n=np.zeros(T_max, dtype=np.int64))
+                       col_n=np.zeros(T_max, dtype=np.int64),
+                       pred_disp_sum=0.0,
+                       gt_disp_sum=0.0,
+                       ratio_sum=0.0,
+                       disp_n=0,
+                       ratio_n=0)
             for name in bucket_names
+        }
+        disp_stats = dict(pred_disp_sum=0.0,
+                          gt_disp_sum=0.0,
+                          ratio_sum=0.0,
+                          disp_n=0,
+                          ratio_n=0)
+        obstacle_names = ('front_clear', 'front_obstacle')
+        per_obstacle = {
+            name: dict(l2_sum=np.zeros(T_max),
+                       l2_n=np.zeros(T_max, dtype=np.int64),
+                       col_sum=np.zeros(T_max, dtype=np.int64),
+                       col_n=np.zeros(T_max, dtype=np.int64),
+                       pred_disp_sum=0.0,
+                       gt_disp_sum=0.0,
+                       ratio_sum=0.0,
+                       disp_n=0,
+                       ratio_n=0)
+            for name in obstacle_names
         }
 
         def wrap_pi(angle):
@@ -1480,6 +1524,24 @@ class KlDataset(Custom3DDataset):
                 agg['col_sum'][t] += int(cols[t])
                 agg['col_n'][t] += 1
 
+        def add_final_disp(agg, pred, gt, valid, T,
+                           ratio_min_gt_disp=0.5):
+            idx = np.where(valid[:T])[0]
+            if len(idx) == 0:
+                return
+            last = int(idx[-1])
+            pred_disp = float(np.linalg.norm(pred[last, :2]))
+            gt_disp = float(np.linalg.norm(gt[last, :2]))
+            agg['pred_disp_sum'] += pred_disp
+            agg['gt_disp_sum'] += gt_disp
+            agg['disp_n'] += 1
+            # Very small GT displacements make a length ratio unstable; keep
+            # pred/gt displacement means for static cases and ratio for moving
+            # cases.
+            if gt_disp >= ratio_min_gt_disp:
+                agg['ratio_sum'] += pred_disp / max(gt_disp, 1e-6)
+                agg['ratio_n'] += 1
+
         for result in results:
             plan = result.get('planning')
             if plan is None:
@@ -1518,10 +1580,14 @@ class KlDataset(Custom3DDataset):
             err = np.linalg.norm(pred_xy[:T, :2] - gt_xy[:T, :2], axis=-1)
             bucket_name = planning_bucket(gt_plan, mask)
             add_l2(dict(l2_sum=l2_sum, l2_n=l2_n), err, mask, T)
+            add_final_disp(disp_stats, pred_xy, gt_xy, mask, T)
             if cmd_id in per_cmd:
                 add_l2(per_cmd[cmd_id], err, mask, T)
+                add_final_disp(per_cmd[cmd_id], pred_xy, gt_xy, mask, T)
             if bucket_name in per_bucket:
                 add_l2(per_bucket[bucket_name], err, mask, T)
+                add_final_disp(per_bucket[bucket_name], pred_xy, gt_xy,
+                               mask, T)
 
             # Collision needs segmentation; skip frames missing it.
             if segmentation is None:
@@ -1534,12 +1600,19 @@ class KlDataset(Custom3DDataset):
                 continue
             if seg.shape[-2:] != (bev_h, bev_w):
                 continue
+            obstacle_name = front_obstacle_bucket(seg)
+            if obstacle_name in per_obstacle:
+                add_l2(per_obstacle[obstacle_name], err, mask, T)
+                add_final_disp(per_obstacle[obstacle_name], pred_xy, gt_xy,
+                               mask, T)
             cols = collision_at(pred_xy[:T], seg)
             add_collision(dict(col_sum=col_sum, col_n=col_n), cols, mask, T)
             if cmd_id in per_cmd:
                 add_collision(per_cmd[cmd_id], cols, mask, T)
             if bucket_name in per_bucket:
                 add_collision(per_bucket[bucket_name], cols, mask, T)
+            if obstacle_name in per_obstacle:
+                add_collision(per_obstacle[obstacle_name], cols, mask, T)
 
         ret_dict = {}
 
@@ -1566,6 +1639,19 @@ class KlDataset(Custom3DDataset):
         ret_dict['planning/avg.L2'] = avg_l2
         ret_dict['planning/avg.Collision'] = avg_col
 
+        def _disp_values(agg):
+            n = agg.get('disp_n', 0)
+            ratio_n = agg.get('ratio_n', 0)
+            pred_disp = (agg['pred_disp_sum'] / n) if n > 0 else float('nan')
+            gt_disp = (agg['gt_disp_sum'] / n) if n > 0 else float('nan')
+            ratio = (agg['ratio_sum'] / ratio_n) if ratio_n > 0 else float('nan')
+            return pred_disp, gt_disp, ratio
+
+        pred_disp, gt_disp, disp_ratio = _disp_values(disp_stats)
+        ret_dict['planning/pred_final_disp'] = pred_disp
+        ret_dict['planning/gt_final_disp'] = gt_disp
+        ret_dict['planning/final_disp_ratio'] = disp_ratio
+
         # Pretty-print summary
         lines = ['', 'Planning metrics (lower is better):']
         for s, lbl in zip(eval_steps, labels):
@@ -1576,6 +1662,9 @@ class KlDataset(Custom3DDataset):
                 f'(N={l2_n[s]})')
         lines.append(f'  avg.L2:        {avg_l2:.3f} m')
         lines.append(f'  avg.Collision: {100.0 * avg_col:.2f}%')
+        lines.append(
+            f'  final disp: pred {pred_disp:.3f} m / '
+            f'gt {gt_disp:.3f} m / ratio {disp_ratio:.3f}')
 
         # Per-command breakdown (only emit lines that have data).
         cmd_name = {0: 'Right', 1: 'Left', 2: 'Straight'}
@@ -1596,6 +1685,13 @@ class KlDataset(Custom3DDataset):
                 f'avg.Collision {100.0 * avg_col_c:.2f}%')
             ret_dict[f'planning/{cmd_name[cmd_id]}/avg.L2'] = avg_l2_c
             ret_dict[f'planning/{cmd_name[cmd_id]}/avg.Collision'] = avg_col_c
+            pred_disp_c, gt_disp_c, ratio_c = _disp_values(agg)
+            ret_dict[f'planning/{cmd_name[cmd_id]}/pred_final_disp'] = pred_disp_c
+            ret_dict[f'planning/{cmd_name[cmd_id]}/gt_final_disp'] = gt_disp_c
+            ret_dict[f'planning/{cmd_name[cmd_id]}/final_disp_ratio'] = ratio_c
+            per_cmd_lines.append(
+                f'           final disp pred {pred_disp_c:.3f} m / '
+                f'gt {gt_disp_c:.3f} m / ratio {ratio_c:.3f}')
         if len(per_cmd_lines) > 2:
             lines.extend(per_cmd_lines)
 
@@ -1624,11 +1720,54 @@ class KlDataset(Custom3DDataset):
             ret_dict[f'planning/{title}/avg.L2'] = avg_l2_b
             ret_dict[f'planning/{title}/avg.Collision'] = avg_col_b
             ret_dict[f'planning/{title}/N'] = n_total
+            pred_disp_b, gt_disp_b, ratio_b = _disp_values(agg)
+            ret_dict[f'planning/{title}/pred_final_disp'] = pred_disp_b
+            ret_dict[f'planning/{title}/gt_final_disp'] = gt_disp_b
+            ret_dict[f'planning/{title}/final_disp_ratio'] = ratio_b
+            per_bucket_lines.append(
+                f'                  final disp pred {pred_disp_b:.3f} m / '
+                f'gt {gt_disp_b:.3f} m / ratio {ratio_b:.3f}')
             for lbl, l2, cl in zip(labels, l2_at_b, col_at_b):
                 ret_dict[f'planning/{title}/L2_{lbl}'] = l2
                 ret_dict[f'planning/{title}/Collision_{lbl}'] = cl
         if len(per_bucket_lines) > 2:
             lines.extend(per_bucket_lines)
+
+        obstacle_title = {
+            'front_clear': 'FrontClear',
+            'front_obstacle': 'FrontObstacle',
+        }
+        per_obstacle_lines = ['', 'Planning per front occupancy:']
+        for obstacle_name in obstacle_names:
+            agg = per_obstacle[obstacle_name]
+            n_total = int(agg['l2_n'].max() if agg['l2_n'].size else 0)
+            if n_total == 0:
+                continue
+            l2_at_o, col_at_o = _format(eval_steps,
+                                        agg['l2_sum'], agg['l2_n'],
+                                        agg['col_sum'], agg['col_n'])
+            avg_l2_o = float(np.nanmean(l2_at_o))
+            avg_col_o = float(np.nanmean(col_at_o))
+            title = obstacle_title[obstacle_name]
+            per_obstacle_lines.append(
+                f'  {title:14s} N={n_total:5d}  '
+                f'avg.L2 {avg_l2_o:.3f} m  '
+                f'avg.Collision {100.0 * avg_col_o:.2f}%')
+            pred_disp_o, gt_disp_o, ratio_o = _disp_values(agg)
+            per_obstacle_lines.append(
+                f'                  final disp pred {pred_disp_o:.3f} m / '
+                f'gt {gt_disp_o:.3f} m / ratio {ratio_o:.3f}')
+            ret_dict[f'planning/{title}/avg.L2'] = avg_l2_o
+            ret_dict[f'planning/{title}/avg.Collision'] = avg_col_o
+            ret_dict[f'planning/{title}/N'] = n_total
+            ret_dict[f'planning/{title}/pred_final_disp'] = pred_disp_o
+            ret_dict[f'planning/{title}/gt_final_disp'] = gt_disp_o
+            ret_dict[f'planning/{title}/final_disp_ratio'] = ratio_o
+            for lbl, l2, cl in zip(labels, l2_at_o, col_at_o):
+                ret_dict[f'planning/{title}/L2_{lbl}'] = l2
+                ret_dict[f'planning/{title}/Collision_{lbl}'] = cl
+        if len(per_obstacle_lines) > 2:
+            lines.extend(per_obstacle_lines)
 
         for line in lines:
             print_log(line, logger=logger)
