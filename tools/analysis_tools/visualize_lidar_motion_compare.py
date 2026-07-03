@@ -25,9 +25,30 @@ import matplotlib
 
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
+from matplotlib import font_manager
 import mmcv
 import numpy as np
 from mmcv import Config, DictAction
+
+_CJK_FONT_NAME = None
+for _font_path in (
+        '/usr/share/fonts/truetype/wqy/wqy-microhei.ttc',
+        '/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc',
+        '/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf'):
+    if osp.exists(_font_path):
+        font_manager.fontManager.addfont(_font_path)
+        _CJK_FONT_NAME = font_manager.FontProperties(
+            fname=_font_path).get_name()
+        break
+if _CJK_FONT_NAME:
+    plt.rcParams['font.family'] = [_CJK_FONT_NAME]
+    plt.rcParams['font.sans-serif'] = [_CJK_FONT_NAME, 'DejaVu Sans']
+plt.rcParams['axes.unicode_minus'] = False
+
+_CJK_FONT_PROPERTIES = (
+    font_manager.FontProperties(fname=_font_path)
+    if _CJK_FONT_NAME and _font_path else None
+)
 
 from third_party.uniad_mmdet3d.datasets.builder import build_dataset
 from visualize_lidar_e2e_motion import (
@@ -52,6 +73,27 @@ from visualize_lidar_e2e_motion import (
     write_html,
     write_webm,
 )
+
+
+CLASS_NAME_ZH = {
+    'Pedestrian': '行人',
+    'Car': '小车',
+    'IGV-Full': '重载IGV',
+    'Truck': '卡车',
+    'Trailer-Empty': '空挂车',
+    'Trailer-Full': '重载挂车',
+    'IGV-Empty': '空载IGV',
+    'Crane': '起重机',
+    'OtherVehicle': '其他车',
+    'Cone': '锥桶',
+    'ContainerForklift': '集装箱叉车',
+    'Forklift': '叉车',
+    'WheelCrane': '轮式起重机',
+}
+
+
+def chinese_class_names(class_names: Sequence[str]) -> List[str]:
+    return [CLASS_NAME_ZH.get(name, name) for name in class_names]
 
 
 def parse_args() -> argparse.Namespace:
@@ -85,6 +127,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--hdmap-path', default=None)
     parser.add_argument('--hdmap-max-lanes', type=int, default=96)
     parser.add_argument('--hdmap-margin', type=float, default=8.0)
+    parser.add_argument('--chinese-labels', action='store_true',
+                        help='render panel titles, prefixes and class labels in Chinese')
+    parser.add_argument('--hide-frame-title', action='store_true',
+                        help='hide the top frame metadata title in rendered frames')
+    parser.add_argument('--show-axis-labels', action='store_true',
+                        help='show BEV coordinate meanings and units on axes')
+    parser.add_argument('--patent-layout', action='store_true',
+                        help='render a clearer two-row patent figure: GT/base and GT/compare')
+    parser.add_argument('--large-text', action='store_true',
+                        help='increase titles, axis labels, ticks and annotations for document figures')
     parser.add_argument('--cfg-options', nargs='+', action=DictAction)
     return parser.parse_args()
 
@@ -333,47 +385,124 @@ def render_compare_frame(points: np.ndarray,
                          out_path: str,
                          point_stride: int,
                          annotate_topk: int,
+                         chinese_labels: bool = False,
+                         show_axis_labels: bool = False,
+                         patent_layout: bool = False,
+                         large_text: bool = False,
                          hdmap_lanes: Optional[Sequence[dict]] = None) -> None:
-    num_panels = 4 if extra_pred is not None else 3
-    fig_width = 22.4 if extra_pred is not None else 16.8
-    fig, axes = plt.subplots(1, num_panels, figsize=(fig_width, 8.4), dpi=150)
+    if patent_layout:
+        if extra_pred is not None:
+            raise ValueError('--patent-layout does not support --extra-results')
+        fig, axes = plt.subplots(2, 2, figsize=(13.6, 16.0), dpi=150)
+        axes = axes.reshape(-1)
+    else:
+        num_panels = 4 if extra_pred is not None else 3
+        fig_width = 22.4 if extra_pred is not None else 16.8
+        fig, axes = plt.subplots(1, num_panels, figsize=(fig_width, 8.4), dpi=150)
     fig.patch.set_facecolor('black')
 
-    gt_title = f'GT boxes + GT future ({len(gt_data["boxes"])})'
+    gt_title = (
+        f'真值框+真值未来轨迹（{len(gt_data["boxes"])}）'
+        if chinese_labels
+        else f'GT boxes + GT future ({len(gt_data["boxes"])})'
+    )
     if hdmap_lanes:
-        gt_title += f' + HDMap ({len(hdmap_lanes)})'
-    panel_titles = [
-        gt_title,
-        f'{base_name} pred ({len(base_pred["boxes"])})',
-        f'{compare_name} pred ({len(compare_pred["boxes"])})',
-    ]
+        gt_title += (
+            f' + 高清地图（{len(hdmap_lanes)}）'
+            if chinese_labels
+            else f' + HDMap ({len(hdmap_lanes)})'
+        )
+    if patent_layout and chinese_labels:
+        panel_titles = [
+            gt_title,
+            f'{base_name}预测（{len(base_pred["boxes"])}）',
+            gt_title,
+            f'{compare_name}预测（{len(compare_pred["boxes"])}）',
+        ]
+    elif patent_layout:
+        panel_titles = [
+            gt_title,
+            f'{base_name} pred ({len(base_pred["boxes"])})',
+            gt_title,
+            f'{compare_name} pred ({len(compare_pred["boxes"])})',
+        ]
+    elif chinese_labels:
+        panel_titles = [
+            gt_title,
+            f'{base_name}预测（{len(base_pred["boxes"])}）',
+            f'{compare_name}预测（{len(compare_pred["boxes"])}）',
+        ]
+    else:
+        panel_titles = [
+            gt_title,
+            f'{base_name} pred ({len(base_pred["boxes"])})',
+            f'{compare_name} pred ({len(compare_pred["boxes"])})',
+        ]
     if extra_pred is not None:
-        panel_titles.append(f'{extra_name} pred ({len(extra_pred["boxes"])})')
+        panel_titles.append(
+            f'{extra_name}预测（{len(extra_pred["boxes"])}）'
+            if chinese_labels
+            else f'{extra_name} pred ({len(extra_pred["boxes"])})'
+        )
+    font_properties = _CJK_FONT_PROPERTIES if chinese_labels else None
+    text_scale = 1.5 if large_text else 1.0
+    line_scale = 1.18 if large_text else 1.0
+    axis_labels = None
+    if show_axis_labels:
+        axis_labels = (
+            '横向位置（米）' if chinese_labels else 'lateral position (m)',
+            '前向位置（米）' if chinese_labels else 'forward position (m)',
+        )
     for ax, panel_title in zip(axes, panel_titles):
-        setup_axis(ax, pc_range, panel_title)
+        setup_axis(ax, pc_range, panel_title,
+                   font_properties=font_properties,
+                   axis_labels=axis_labels,
+                   text_scale=text_scale)
         draw_points(ax, points, point_stride)
 
     draw_hdmap_lanes(axes[0], hdmap_lanes)
-    draw_boxes(axes[0], gt_data, class_names, 'GT#', annotate_topk,
-               alpha=0.75)
+    draw_boxes(axes[0], gt_data, class_names, '真值#' if chinese_labels else 'GT#', annotate_topk,
+               alpha=0.75, font_properties=font_properties,
+               text_scale=text_scale, line_scale=line_scale)
     draw_gt_future(axes[0], gt_data)
 
-    draw_boxes(axes[1], base_pred, class_names, 'B#', annotate_topk,
-               alpha=0.95)
+    draw_boxes(axes[1], base_pred, class_names, '普通#' if chinese_labels else 'B#', annotate_topk,
+               alpha=0.95, font_properties=font_properties,
+               text_scale=text_scale, line_scale=line_scale)
     draw_pred_traj(axes[1], base_pred)
 
-    draw_boxes(axes[2], compare_pred, class_names, 'T#', annotate_topk,
-               alpha=0.95)
-    draw_pred_traj(axes[2], compare_pred)
+    compare_axis = 3 if patent_layout else 2
+    if patent_layout:
+        draw_hdmap_lanes(axes[2], hdmap_lanes)
+        draw_boxes(axes[2], gt_data, class_names, '真值#' if chinese_labels else 'GT#', annotate_topk,
+                   alpha=0.75, font_properties=font_properties,
+                   text_scale=text_scale, line_scale=line_scale)
+        draw_gt_future(axes[2], gt_data)
 
-    if extra_pred is not None:
-        draw_boxes(axes[3], extra_pred, class_names, 'L#', annotate_topk,
-                   alpha=0.95)
+    draw_boxes(axes[compare_axis], compare_pred, class_names, '本方案#' if chinese_labels else 'T#', annotate_topk,
+               alpha=0.95, font_properties=font_properties,
+               text_scale=text_scale, line_scale=line_scale)
+    draw_pred_traj(axes[compare_axis], compare_pred)
+
+    if extra_pred is not None and not patent_layout:
+        draw_boxes(axes[3], extra_pred, class_names, '扩展#' if chinese_labels else 'L#', annotate_topk,
+                   alpha=0.95, font_properties=font_properties,
+                   text_scale=text_scale, line_scale=line_scale)
         draw_pred_traj(axes[3], extra_pred)
 
-    fig.suptitle(title, color='white', fontsize=11)
+    top = 0.91
+    if title:
+        fig.suptitle(title, color='white', fontsize=11,
+                     fontproperties=font_properties)
+    else:
+        top = 0.97 if patent_layout else 0.95
     fig.subplots_adjust(
-        left=0.04, right=0.99, bottom=0.06, top=0.91, wspace=0.05)
+        left=0.06 if patent_layout else 0.04,
+        right=0.99,
+        bottom=0.045 if patent_layout else 0.06,
+        top=top,
+        wspace=0.08 if patent_layout else 0.05,
+        hspace=0.18 if patent_layout else 0.0)
     fig.savefig(out_path, facecolor=fig.get_facecolor())
     plt.close(fig)
 
@@ -408,6 +537,8 @@ def main() -> None:
     dataset_cfg.test_mode = True
     dataset = build_dataset(dataset_cfg)
     class_names = get_class_names(cfg, dataset_cfg)
+    if args.chinese_labels:
+        class_names = chinese_class_names(class_names)
 
     base_results = mmcv.load(resolve_repo_path(args.base_results))
     compare_results = mmcv.load(resolve_repo_path(args.compare_results))
@@ -481,13 +612,24 @@ def main() -> None:
         scene = str(info.get('scene_token', ''))
         out_path = osp.join(
             frame_dir, f'{frame_id:03d}_{idx:06d}_{safe_token(token)}.png')
-        title = (
-            f'epoch={args.epoch} frame={frame_id} index={idx} '
-            f'token={token[:8]} scene={scene[-8:]}')
+        if args.hide_frame_title:
+            title = ''
+        else:
+            title = (
+                f'第{args.epoch}轮 | 帧序号={frame_id} 样本索引={idx} '
+                f'标识={token[:8]} 场景={scene[-8:]}'
+                if args.chinese_labels
+                else f'epoch={args.epoch} frame={frame_id} index={idx} '
+                     f'token={token[:8]} scene={scene[-8:]}'
+            )
         render_compare_frame(
             points, gt_data, base_pred, compare_pred, extra_pred, class_names,
             cfg.point_cloud_range, title, args.base_name, args.compare_name,
             args.extra_name, out_path, args.point_stride, args.annotate_topk,
+            chinese_labels=args.chinese_labels,
+            show_axis_labels=args.show_axis_labels,
+            patent_layout=args.patent_layout,
+            large_text=args.large_text,
             hdmap_lanes=frame_hdmap)
         frame_files.append(out_path)
         summary.append(dict(

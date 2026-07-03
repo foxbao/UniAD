@@ -1,0 +1,26 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>LiDAR E2E Motion</title>
+<style>
+body { margin:0; background:#101114; color:#f2f5fa; font-family:system-ui,sans-serif; }
+main { width:min(1500px, calc(100vw - 32px)); margin:0 auto; padding:18px 0 28px; }
+h1 { margin:0 0 12px; font-size:18px; }
+.stage { display:grid; place-items:center; min-height:360px; background:#050608; border:1px solid #343844; border-radius:6px; overflow:hidden; }
+img { max-width:100%; max-height:calc(100vh - 190px); }
+.controls { display:flex; gap:10px; align-items:center; margin-top:12px; padding:12px; background:#181a20; border:1px solid #343844; border-radius:6px; }
+button { height:34px; padding:0 12px; background:#222631; border:1px solid #343844; border-radius:5px; color:#f2f5fa; }
+input[type=range] { flex:1; accent-color:#64d2ff; }
+#frameText { color:#9aa4b2; font-size:13px; min-width:170px; }
+</style></head>
+<body><main><h1>LiDAR E2E Motion Visualization</h1>
+<section class="stage"><img id="frameImage"></section>
+<section class="controls"><button id="prev">Prev</button><button id="play">Play</button><button id="next">Next</button><input id="slider" type="range" min="0" max="2" value="0"><span id="frameText"></span></section>
+</main><script>
+const frames=["000_001522_1535527a-6460-4634-9a9a-5f909833df1f.png",
+      "001_000204_9a8da77a-295b-41c9-8e1e-3b218e2143c8.png",
+      "002_002409_15f680cc-82b9-4950-b77c-c14ea1686465.png"]; let idx=0; let timer=null;
+const img=document.getElementById('frameImage'), slider=document.getElementById('slider'), text=document.getElementById('frameText'), playBtn=document.getElementById('play');
+function setFrame(i){ idx=Math.max(0,Math.min(frames.length-1,i)); img.src=frames[idx]; slider.value=idx; text.textContent=`Frame ${idx+1} / ${frames.length}`; }
+function stop(){ if(timer) clearInterval(timer); timer=null; playBtn.textContent='Play'; }
+function play(){ stop(); playBtn.textContent='Pause'; timer=setInterval(()=>setFrame(idx>=frames.length-1?0:idx+1), 170); }
+playBtn.onclick=()=>timer?stop():play(); document.getElementById('prev').onclick=()=>{stop();setFrame(idx-1)}; document.getElementById('next').onclick=()=>{stop();setFrame(idx+1)}; slider.oninput=()=>{stop();setFrame(Number(slider.value))}; setFrame(0);
+</script></body></html>

@@ -23,9 +23,30 @@ import matplotlib
 
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
+from matplotlib import font_manager
 import mmcv
 import numpy as np
 from mmcv import Config, DictAction
+
+_CJK_FONT_PATH = None
+for _font_path in (
+        '/usr/share/fonts/truetype/wqy/wqy-microhei.ttc',
+        '/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc',
+        '/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf'):
+    if osp.exists(_font_path):
+        font_manager.fontManager.addfont(_font_path)
+        _CJK_FONT_PATH = _font_path
+        _CJK_FONT_NAME = font_manager.FontProperties(
+            fname=_font_path).get_name()
+        plt.rcParams['font.family'] = [_CJK_FONT_NAME]
+        plt.rcParams['font.sans-serif'] = [_CJK_FONT_NAME, 'DejaVu Sans']
+        break
+plt.rcParams['axes.unicode_minus'] = False
+
+_CJK_FONT_PROPERTIES = (
+    font_manager.FontProperties(fname=_CJK_FONT_PATH)
+    if _CJK_FONT_PATH else None
+)
 
 from third_party.uniad_mmdet3d.datasets.builder import build_dataset
 from compute_turn_bucket_metrics import (
@@ -62,6 +83,29 @@ MODEL_COLORS = {
     'turnaware_turnloss': '#e45756',
 }
 
+MODEL_NAME_ZH = {
+    'base': '普通锚点方案',
+    'turnaware': '转弯感知锚点方案',
+    'turnloss': '转弯损失方案',
+    'turnaware_turnloss': '本方案',
+}
+
+CLASS_NAME_ZH = {
+    'Pedestrian': '行人',
+    'Car': '小车',
+    'IGV-Full': '重载IGV',
+    'Truck': '卡车',
+    'Trailer-Empty': '空挂车',
+    'Trailer-Full': '重载挂车',
+    'IGV-Empty': '空载IGV',
+    'Crane': '起重机',
+    'OtherVehicle': '其他车',
+    'Cone': '锥桶',
+    'ContainerForklift': '集装箱叉车',
+    'Forklift': '叉车',
+    'WheelCrane': '轮式起重机',
+}
+
 
 class BucketArgs:
     static_path_thr = 2.0
@@ -88,6 +132,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--point-stride', type=int, default=5)
     parser.add_argument('--zoom-margin', type=float, default=0.0,
                         help='If positive, crop around the focused object and trajectories.')
+    parser.add_argument('--chinese-labels', action='store_true',
+                        help='render titles, labels and metric text in Chinese')
+    parser.add_argument('--patent-layout', action='store_true',
+                        help='render a clean side-by-side focused comparison for patent figures')
+    parser.add_argument('--show-axis-labels', action='store_true',
+                        help='show BEV coordinate meanings and units on axes')
+    parser.add_argument('--large-text', action='store_true',
+                        help='increase titles, axis labels, ticks and metric text')
+    parser.add_argument('--hide-frame-title', action='store_true',
+                        help='hide the top frame metadata title')
     parser.add_argument('--gt-map-overlay', default='none',
                         choices=['none', 'hdmap'])
     parser.add_argument('--hdmap-path', default=None)
@@ -95,6 +149,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--hdmap-margin', type=float, default=8.0)
     parser.add_argument('--cfg-options', nargs='+', action=DictAction)
     return parser.parse_args()
+
+
+def model_display_name(name: str, chinese_labels: bool) -> str:
+    if chinese_labels:
+        return MODEL_NAME_ZH.get(name, name)
+    return name
+
+
+def class_display_name(name: str, chinese_labels: bool) -> str:
+    if chinese_labels:
+        return CLASS_NAME_ZH.get(name, name)
+    return name
 
 
 def unwrap_result(result: dict) -> dict:
@@ -205,15 +271,18 @@ def match_prediction(result: dict,
 
 
 def draw_single_box(ax, box: np.ndarray, color: str, label: str,
-                    linestyle: str = '-') -> None:
+                    linestyle: str = '-', font_properties=None,
+                    text_scale: float = 1.0) -> None:
     corners = box_corners_bev(np.asarray([box], dtype=np.float32))[0]
     poly = lidar_xy_to_display(corners)
     closed = np.concatenate([poly, poly[:1]], axis=0)
     ax.plot(closed[:, 0], closed[:, 1], color=color, linewidth=1.7,
             linestyle=linestyle, alpha=0.95)
     center = lidar_xy_to_display(np.asarray([box[:2]], dtype=np.float32))[0]
-    ax.text(center[0], center[1], label, color=color, fontsize=8,
-            ha='left', va='bottom')
+    if label:
+        ax.text(center[0], center[1], label, color=color,
+                fontsize=8 * text_scale, ha='left', va='bottom',
+                fontproperties=font_properties)
 
 
 def absolute_traj(box_xy: np.ndarray, rel_traj: np.ndarray,
@@ -231,6 +300,21 @@ def plot_path(ax, points_xy: np.ndarray, color: str, label: str,
             linestyle=linestyle, alpha=0.95, label=label)
     ax.scatter(disp[-1:, 0], disp[-1:, 1], color=color, s=24,
                marker=marker, alpha=0.95)
+
+
+def plot_path_with_scale(ax,
+                         points_xy: np.ndarray,
+                         color: str,
+                         label: str,
+                         linestyle: str,
+                         marker: str,
+                         linewidth: float,
+                         text_scale: float = 1.0) -> None:
+    disp = lidar_xy_to_display(points_xy)
+    ax.plot(disp[:, 0], disp[:, 1], color=color, linewidth=linewidth,
+            linestyle=linestyle, alpha=0.96, label=label)
+    ax.scatter(disp[-1:, 0], disp[-1:, 1], color=color,
+               s=36 * text_scale, marker=marker, alpha=0.96)
 
 
 def apply_zoom(ax, xy_chunks: Sequence[np.ndarray],
@@ -252,6 +336,129 @@ def apply_zoom(ax, xy_chunks: Sequence[np.ndarray],
     crop_y_max = min(y_max, float(np.max(xy[:, 1])) + margin)
     ax.set_xlim(-crop_y_max, -crop_y_min)
     ax.set_ylim(crop_x_min, crop_x_max)
+
+
+def render_patent_case(points: np.ndarray,
+                       hdmap_lanes,
+                       class_name: str,
+                       track_id: int,
+                       bucket: str,
+                       bucket_meta: Dict[str, float],
+                       gt_box: np.ndarray,
+                       gt_traj: np.ndarray,
+                       gt_mask: np.ndarray,
+                       matches: Dict[str, Optional[dict]],
+                       pc_range: Sequence[float],
+                       title: str,
+                       out_path: str,
+                       point_stride: int,
+                       zoom_margin: float,
+                       chinese_labels: bool,
+                       show_axis_labels: bool,
+                       large_text: bool) -> dict:
+    model_items = [(name, match) for name, match in matches.items()]
+    if len(model_items) != 2:
+        raise ValueError('--patent-layout expects exactly two --result entries')
+
+    fig, axes = plt.subplots(1, 2, figsize=(14.8, 7.2), dpi=190)
+    fig.patch.set_facecolor('black')
+    font_properties = _CJK_FONT_PROPERTIES if chinese_labels else None
+    text_scale = 1.45 if large_text else 1.0
+    axis_labels = None
+    if show_axis_labels:
+        axis_labels = (
+            '横向位置（米）' if chinese_labels else 'lateral position (m)',
+            '前向位置（米）' if chinese_labels else 'forward position (m)',
+        )
+
+    valid = motion_valid_mask(gt_mask)
+    steps = min(len(gt_traj), len(valid))
+    valid = valid[:steps]
+    gt_abs = absolute_traj(gt_box[:2], gt_traj[:steps][valid])
+    zoom_chunks = [gt_box[None, :2], gt_abs]
+    for _, match in model_items:
+        if match is None:
+            continue
+        zoom_chunks.append(match['box'][None, :2])
+        zoom_chunks.append(absolute_traj(match['box'][:2],
+                                         match['traj'][match['top1']]))
+
+    summary = []
+    for ax, (name, match) in zip(axes, model_items):
+        display_name = model_display_name(name, chinese_labels)
+        title_text = (
+            f'{display_name}预测'
+            if chinese_labels else f'{display_name} prediction')
+        setup_axis(
+            ax, pc_range, title_text, font_properties=font_properties,
+            axis_labels=axis_labels, text_scale=text_scale)
+        draw_points(ax, points, point_stride)
+        draw_hdmap_lanes(ax, hdmap_lanes)
+        draw_single_box(
+            ax, gt_box, '#ffffff',
+            f'真值#{track_id}:{class_display_name(class_name, chinese_labels)}'
+            if chinese_labels else f'GT#{track_id}:{class_name}',
+            '-', font_properties=font_properties, text_scale=text_scale)
+        plot_path_with_scale(
+            ax, gt_abs, '#ffffff',
+            '真实未来轨迹' if chinese_labels else 'GT future',
+            '-', 'o', 2.4, text_scale)
+
+        if match is None:
+            metric_text = '未匹配到目标' if chinese_labels else 'missed target'
+            summary.append(dict(model=name, matched=False))
+        else:
+            color = MODEL_COLORS.get(name, '#e45756')
+            draw_single_box(
+                ax, match['box'], color, display_name, ':',
+                font_properties=font_properties, text_scale=text_scale)
+            top1_path = absolute_traj(match['box'][:2],
+                                      match['traj'][match['top1']])
+            plot_path_with_scale(
+                ax, top1_path, color,
+                f'{display_name}最高置信度轨迹'
+                if chinese_labels else f'{display_name} top1',
+                '-', 'x', 2.2, text_scale)
+            metric_text = (
+                f'最高置信度FDE：{match["top1FDE"]:.2f}米\n'
+                f'最优候选FDE：{match["minFDE"]:.2f}米'
+                if chinese_labels else
+                f'top1 FDE: {match["top1FDE"]:.2f} m\n'
+                f'oracle FDE: {match["minFDE"]:.2f} m'
+            )
+            summary.append(dict(
+                model=name,
+                matched=True,
+                pred_idx=match['pred_idx'],
+                score=match['score'],
+                center_dist=match['dist'],
+                top1_mode=match['top1'],
+                oracle_mode=match['oracle'],
+                top1FDE=match['top1FDE'],
+                minFDE=match['minFDE'],
+            ))
+        ax.text(
+            0.03, 0.04, metric_text, transform=ax.transAxes,
+            color='white', fontsize=8.8 * text_scale,
+            fontproperties=font_properties, ha='left', va='bottom',
+            bbox=dict(facecolor='#050608', edgecolor='#777777',
+                      alpha=0.82, boxstyle='round,pad=0.32'))
+        ax.legend(loc='upper right', fontsize=6.8 * text_scale,
+                  facecolor='#050608', edgecolor='#555555',
+                  labelcolor='white', prop=font_properties)
+        apply_zoom(ax, zoom_chunks, pc_range, zoom_margin)
+
+    if title and not title.isspace():
+        fig.suptitle(title, color='white', fontsize=12.5 * text_scale,
+                     fontproperties=font_properties)
+        top = 0.91
+    else:
+        top = 0.96
+    fig.subplots_adjust(left=0.06, right=0.99, bottom=0.09,
+                        top=top, wspace=0.10)
+    fig.savefig(out_path, facecolor=fig.get_facecolor())
+    plt.close(fig)
+    return dict(bucket=bucket, bucket_meta=bucket_meta, matches=summary)
 
 
 def render_case(points: np.ndarray,
@@ -410,11 +617,22 @@ def main() -> None:
         title = (
             f'epoch6 focus | index={sample_idx} token={token[:8]} '
             f'scene={scene[-8:]} | GT#{track_id}:{class_name}')
-        case_summary = render_case(
-            points, frame_hdmap_lanes, class_name, track_id, bucket,
-            bucket_meta, gt_boxes[gt_idx], gt_trajs[gt_idx], gt_masks[gt_idx],
-            matches, cfg.point_cloud_range, title, out_path,
-            args.point_stride, note, args.zoom_margin)
+        if args.hide_frame_title:
+            title = ''
+        if args.patent_layout:
+            case_summary = render_patent_case(
+                points, frame_hdmap_lanes, class_name, track_id, bucket,
+                bucket_meta, gt_boxes[gt_idx], gt_trajs[gt_idx],
+                gt_masks[gt_idx], matches, cfg.point_cloud_range, title,
+                out_path, args.point_stride, args.zoom_margin,
+                args.chinese_labels, args.show_axis_labels,
+                args.large_text)
+        else:
+            case_summary = render_case(
+                points, frame_hdmap_lanes, class_name, track_id, bucket,
+                bucket_meta, gt_boxes[gt_idx], gt_trajs[gt_idx],
+                gt_masks[gt_idx], matches, cfg.point_cloud_range, title,
+                out_path, args.point_stride, note, args.zoom_margin)
         frame_files.append(out_path)
         summary_rows.append(dict(
             frame=frame_id,

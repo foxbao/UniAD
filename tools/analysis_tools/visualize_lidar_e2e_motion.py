@@ -538,14 +538,28 @@ def best_traj(traj: Optional[np.ndarray],
     return traj[np.arange(traj.shape[0]), mode_idx, :, :2]
 
 
-def setup_axis(ax, pc_range: Sequence[float], title: str) -> None:
+def setup_axis(ax,
+               pc_range: Sequence[float],
+               title: str,
+               font_properties=None,
+               axis_labels: Optional[Sequence[str]] = None,
+               text_scale: float = 1.0) -> None:
     x_min, y_min, _, x_max, y_max, _ = [float(v) for v in pc_range]
     ax.set_facecolor('#050608')
     ax.set_xlim(-y_max, -y_min)
     ax.set_ylim(x_min, x_max)
     ax.set_aspect('equal', adjustable='box')
-    ax.set_title(title, color='white', fontsize=10)
-    ax.tick_params(colors='white', labelsize=7)
+    ax.set_title(title, color='white', fontsize=10 * text_scale,
+                 fontproperties=font_properties)
+    if axis_labels is not None:
+        xlabel, ylabel = axis_labels
+        if xlabel:
+            ax.set_xlabel(xlabel, color='white', fontsize=8 * text_scale,
+                          fontproperties=font_properties)
+        if ylabel:
+            ax.set_ylabel(ylabel, color='white', fontsize=8 * text_scale,
+                          fontproperties=font_properties)
+    ax.tick_params(colors='white', labelsize=7 * text_scale)
     ax.grid(color='#444444', linestyle='--', linewidth=0.5, alpha=0.35)
     for spine in ax.spines.values():
         spine.set_color('#888888')
@@ -636,7 +650,10 @@ def draw_boxes(ax,
                class_names: Sequence[str],
                prefix: str,
                annotate_topk: int,
-               alpha: float = 0.95) -> None:
+               alpha: float = 0.95,
+               font_properties=None,
+               text_scale: float = 1.0,
+               line_scale: float = 1.0) -> None:
     boxes = data['boxes']
     if boxes.size == 0:
         return
@@ -646,7 +663,7 @@ def draw_boxes(ax,
         color = color_for_id(track_id)
         poly = lidar_xy_to_display(corners[box_idx])
         closed = np.concatenate([poly, poly[:1]], axis=0)
-        ax.plot(closed[:, 0], closed[:, 1], color=color, linewidth=1.4,
+        ax.plot(closed[:, 0], closed[:, 1], color=color, linewidth=1.4 * line_scale,
                 alpha=alpha)
         center = lidar_xy_to_display(boxes[box_idx:box_idx + 1, :2])[0]
         yaw = float(boxes[box_idx, 6])
@@ -654,7 +671,7 @@ def draw_boxes(ax,
             np.array([[math.cos(yaw), math.sin(yaw)]], dtype=np.float32))[0]
         ax.plot([center[0], center[0] + heading[0] * 1.2],
                 [center[1], center[1] + heading[1] * 1.2],
-                color=color, linewidth=0.9, linestyle='--', alpha=0.75)
+                color=color, linewidth=0.9 * line_scale, linestyle='--', alpha=0.75)
         if rank >= annotate_topk:
             continue
         label = int(data['labels'][box_idx])
@@ -663,7 +680,8 @@ def draw_boxes(ax,
         if 'scores' in data and data['scores'] is not None:
             score = f' {float(data["scores"][box_idx]):.2f}'
         ax.text(center[0], center[1], f'{prefix}{track_id}:{label_name[:5]}{score}',
-                color=color, fontsize=6, ha='left', va='bottom')
+                color=color, fontsize=6 * text_scale, ha='left', va='bottom',
+                fontproperties=font_properties, clip_on=True)
 
 
 def draw_gt_future(ax, gt_data: Dict[str, np.ndarray]) -> None:

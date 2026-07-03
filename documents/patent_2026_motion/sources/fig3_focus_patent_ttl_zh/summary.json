@@ -1,0 +1,134 @@
+[
+  {
+    "frame": 0,
+    "sample_idx": 1522,
+    "token": "1535527a-6460-4634-9a9a-5f909833df1f",
+    "scene_token": "20251108_007/202511081344_record",
+    "gt_idx": 7,
+    "class_name": "Truck",
+    "track_id": 10,
+    "note": "base_top1_8.06_vs_scheme_0.26",
+    "out_file": "documents/patent_2026_motion/sources/fig3_focus_patent_ttl_zh/000_001522_1535527a-6460-4634-9a9a-5f909833df1f.png",
+    "hdmap_path": null,
+    "num_hdmap_lanes": 0,
+    "bucket": "mild_turn",
+    "bucket_meta": {
+      "path": 16.852201797233107,
+      "net": 18.279006169319008,
+      "heading_change": 16.289355874438115,
+      "lateral_ratio": 0.06079557440628696
+    },
+    "matches": [
+      {
+        "model": "base",
+        "matched": true,
+        "pred_idx": 3,
+        "score": 0.9507530331611633,
+        "center_dist": 0.047801923006772995,
+        "top1_mode": 0,
+        "oracle_mode": 2,
+        "top1FDE": 8.06037284105313,
+        "minFDE": 1.319498265452233
+      },
+      {
+        "model": "turnaware_turnloss",
+        "matched": true,
+        "pred_idx": 10,
+        "score": 0.88583904504776,
+        "center_dist": 0.015818903222680092,
+        "top1_mode": 0,
+        "oracle_mode": 0,
+        "top1FDE": 0.25578457694848855,
+        "minFDE": 0.25578457694848855
+      }
+    ]
+  },
+  {
+    "frame": 1,
+    "sample_idx": 204,
+    "token": "9a8da77a-295b-41c9-8e1e-3b218e2143c8",
+    "scene_token": "20251105_007/202511051003_record",
+    "gt_idx": 4,
+    "class_name": "Crane",
+    "track_id": 5,
+    "note": "base_top1_6.53_vs_scheme_0.81",
+    "out_file": "documents/patent_2026_motion/sources/fig3_focus_patent_ttl_zh/001_000204_9a8da77a-295b-41c9-8e1e-3b218e2143c8.png",
+    "hdmap_path": null,
+    "num_hdmap_lanes": 0,
+    "bucket": "sharp_turn",
+    "bucket_meta": {
+      "path": 5.648550715577257,
+      "net": 4.695233471267802,
+      "heading_change": 52.34289048404165,
+      "lateral_ratio": 0.09197782211551023
+    },
+    "matches": [
+      {
+        "model": "base",
+        "matched": true,
+        "pred_idx": 0,
+        "score": 0.9212021827697754,
+        "center_dist": 0.20331932604312897,
+        "top1_mode": 2,
+        "oracle_mode": 0,
+        "top1FDE": 6.53332851627706,
+        "minFDE": 1.4681327220950355
+      },
+      {
+        "model": "turnaware_turnloss",
+        "matched": true,
+        "pred_idx": 0,
+        "score": 0.9238107204437256,
+        "center_dist": 0.1056886613368988,
+        "top1_mode": 1,
+        "oracle_mode": 1,
+        "top1FDE": 0.8117070162164034,
+        "minFDE": 0.8117070162164034
+      }
+    ]
+  },
+  {
+    "frame": 2,
+    "sample_idx": 2409,
+    "token": "15f680cc-82b9-4950-b77c-c14ea1686465",
+    "scene_token": "20251119_007/202511191517_record",
+    "gt_idx": 3,
+    "class_name": "Crane",
+    "track_id": 4,
+    "note": "base_top1_7.71_vs_scheme_1.18",
+    "out_file": "documents/patent_2026_motion/sources/fig3_focus_patent_ttl_zh/002_002409_15f680cc-82b9-4950-b77c-c14ea1686465.png",
+    "hdmap_path": null,
+    "num_hdmap_lanes": 0,
+    "bucket": "sharp_turn",
+    "bucket_meta": {
+      "path": 4.0889135023002,
+      "net": 4.479135204122689,
+      "heading_change": 111.39534440225987,
+      "lateral_ratio": 0.06305957542426029
+    },
+    "matches": [
+      {
+        "model": "base",
+        "matched": true,
+        "pred_idx": 0,
+        "score": 0.965201735496521,
+        "center_dist": 0.18445859849452972,
+        "top1_mode": 2,
+        "oracle_mode": 0,
+        "top1FDE": 7.711799322895253,
+        "minFDE": 1.8908438517632629
+      },
+      {
+        "model": "turnaware_turnloss",
+        "matched": true,
+        "pred_idx": 0,
+        "score": 0.9721468091011047,
+        "center_dist": 0.25477948784828186,
+        "top1_mode": 5,
+        "oracle_mode": 5,
+        "top1FDE": 1.1779660956852998,
+        "minFDE": 1.1779660956852998
+      }
+    ]
+  }
+]
