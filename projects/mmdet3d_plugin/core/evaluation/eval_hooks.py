@@ -28,12 +28,32 @@ def _calc_dynamic_intervals(start_interval, dynamic_interval_list):
 
 class CustomDistEvalHook(BaseDistEvalHook):
 
-    def __init__(self, *args, dynamic_intervals=None,  **kwargs):
+    def __init__(self,
+                 *args,
+                 dynamic_intervals=None,
+                 save_results=False,
+                 results_path_template=None,
+                 **kwargs):
         super(CustomDistEvalHook, self).__init__(*args, **kwargs)
         self.use_dynamic_intervals = dynamic_intervals is not None
+        self.save_results = save_results
+        self.results_path_template = results_path_template
         if self.use_dynamic_intervals:
             self.dynamic_milestones, self.dynamic_intervals = \
                 _calc_dynamic_intervals(self.interval, dynamic_intervals)
+
+    def _get_results_path(self, runner):
+        if self.results_path_template:
+            filename = self.results_path_template.format(
+                epoch=runner.epoch + 1,
+                iter=runner.iter + 1,
+                work_dir=runner.work_dir)
+            if osp.isabs(filename):
+                return filename
+            return osp.join(runner.work_dir, filename)
+        suffix = 'epoch' if self.by_epoch else 'iter'
+        progress = runner.epoch + 1 if self.by_epoch else runner.iter + 1
+        return osp.join(runner.work_dir, f'eval_{suffix}{progress}_results.pkl')
 
     def _decide_interval(self, runner):
         if self.use_dynamic_intervals:
@@ -81,6 +101,12 @@ class CustomDistEvalHook(BaseDistEvalHook):
             tmpdir=tmpdir,
             gpu_collect=self.gpu_collect)
         if runner.rank == 0:
+            if self.save_results:
+                results_path = self._get_results_path(runner)
+                mmcv.mkdir_or_exist(osp.dirname(results_path))
+                mmcv.dump(results, results_path)
+                runner.logger.info(f'Saved eval results to {results_path}')
+
             print('\n')
             runner.log_buffer.output['eval_iter_num'] = len(self.dataloader)
 

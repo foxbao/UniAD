@@ -1,9 +1,11 @@
 # KL LiDAR Motion Turn-Aware 工作总结
 
-更新时间：2026-06-29
+更新时间：2026-07-02
 主要相关提交：`dd632f7 feat(motion): add turn-aware training and analysis tooling`，
 `d904ca8 feat(motion): add turnloss ablation configs and comparison tooling`，
-`b63c4af feat(motion): add focused turn-aware comparison visualizers`
+`b63c4af feat(motion): add focused turn-aware comparison visualizers`，
+`1969f3d feat(planning): add HDMap fuse and balanced loss experiments`，
+`5f4c7fc feat(planning): add displacement diagnostics and drivable visualization`
 
 ## 1. 背景
 
@@ -195,6 +197,127 @@ projects/work_dirs/stage2_e2e_lidar/visual_compare_epoch6_turnaware_turnloss/ful
 - mild turn / straight 上存在回退样本，说明转弯加权不能继续无约束加大，否则会牺牲常规移动样本。
 
 这支持一个更细的判断：`turnaware_turnloss` 是值得保留的综合候选，但当前主要瓶颈已经从“有没有转弯候选”转向“能不能把正确候选排到 top1”。
+
+### 2.7 planning map-fuse balanced 训练与退化诊断
+
+2026-07-02 复查了 `base_e2e_lidar_plan_mapfuse_balanced.py` 的完整训练结果。该配置已经训练到 6 epoch：
+
+```text
+projects/work_dirs/stage2_e2e_lidar/base_e2e_lidar_plan_mapfuse_balanced/epoch_6.pth
+projects/work_dirs/stage2_e2e_lidar/base_e2e_lidar_plan_mapfuse_balanced/latest.pth
+```
+
+训练日志没有发现 `Traceback`、`OOM`、`NaN` 或 `Killed`。真实完整训练日志是：
+
+```text
+projects/work_dirs/stage2_e2e_lidar/base_e2e_lidar_plan_mapfuse_balanced/20260629_161020.log
+```
+
+这次训练从 `base_e2e_lidar_plan/latest.pth` 初始化，`resume_from=None`，不是中途 resume。
+
+epoch validation 的 planning 指标如下：
+
+| Epoch | avg.L2 | avg.Collision | Static L2 | Slow L2 | MovingStraight L2 | Turning L2 | motion minADE | motion minFDE | motion MR |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 1.4291 | 0.0530 | 1.6250 | 0.8801 | 1.5444 | 1.8817 | 0.3846 | 0.6800 | 0.0980 |
+| 2 | 2.5215 | 0.0536 | 1.8277 | 1.4992 | 3.3167 | 1.0395 | 0.3715 | 0.6517 | 0.0940 |
+| 3 | **0.9041** | 0.0539 | **1.3308** | **0.5906** | **0.8556** | **0.8590** | 0.3556 | 0.6190 | 0.0874 |
+| 4 | 1.2920 | **0.0529** | 1.8760 | 0.8564 | 1.2486 | 0.8696 | 0.3359 | 0.5909 | 0.0827 |
+| 5 | 1.4955 | 0.0550 | 2.2573 | 1.2781 | 1.2942 | 0.9563 | 0.3281 | 0.5773 | 0.0794 |
+| 6 | 2.1723 | 0.0565 | 2.5663 | 2.3246 | 1.9264 | 2.4724 | **0.3240** | **0.5677** | **0.0775** |
+
+结论：
+
+- `balanced` 训练本身是健康的，但 final epoch 不是 planning 最优点。
+- 如果按 planning 指标选 checkpoint，应优先使用 `epoch_3.pth`，`epoch_4.pth` 作为备选；不应直接用 `latest.pth/epoch_6.pth` 汇报 planning。
+- motion 指标从 epoch1 到 epoch6 持续改善，但 planning 在 epoch3 后明显退化，说明总 loss 下降掩盖了 planning head 后期偏离最优的问题。
+
+训练日志里的 planning loss 也支持该判断：
+
+| Epoch | planning.loss_ade tail20 | planning.loss_collision_0 tail20 | planning.loss_collision_1 tail20 | planning.loss_collision_2 tail20 |
+|---:|---:|---:|---:|---:|
+| 1 | 0.5780 | 0.3159 | 0.2058 | 0.0859 |
+| 2 | 2.2341 | 0.5118 | 0.3095 | 0.1171 |
+| 3 | 0.7724 | 0.3270 | 0.1931 | 0.0771 |
+| 4 | 0.8789 | 0.4437 | 0.2631 | 0.0992 |
+| 5 | 1.3222 | 0.4721 | 0.2884 | 0.1139 |
+| 6 | 1.5069 | 0.6462 | 0.3822 | 0.1449 |
+
+因此退化不是单纯验证集偶然波动，而是后期 planning 训练信号本身在变差。
+
+`base_e2e_lidar_plan_mapfuse_balanced.py` 使用的权重为：
+
+```python
+planning_motion_loss_weights=dict(
+    static=0.3,
+    slow=0.7,
+    moving_straight=1.0,
+    turning=1.5,
+)
+```
+
+训练日志显示该权重的 batch mean 约为 `0.87`，因此它不只是改变了样本权重结构，也整体降低了 planning loss 相对强度。这可能导致 motion/map 等其他任务继续收敛时，总 loss 仍下降，但 planning head 后期被相对削弱并发生漂移。
+
+### 2.8 balanced_norm 配置与自动保存 eval 结果
+
+为验证 `balanced` 的退化是否与 planning loss 总尺度偏低有关，新增了归一化版本：
+
+```text
+projects/configs/stage2_e2e_lidar/base_e2e_lidar_plan_mapfuse_balanced_norm.py
+```
+
+该配置继承自 `base_e2e_lidar_plan_mapfuse.py`，只修改 planning motion bucket 权重：
+
+| 配置 | static | slow | moving_straight | turning | 目的 |
+|---|---:|---:|---:|---:|---|
+| `balanced` | 0.300 | 0.700 | 1.000 | 1.500 | 去掉 static/slow 支配，但平均 loss 尺度约 0.87 |
+| `balanced_norm` | 0.345 | 0.806 | 1.151 | 1.727 | 保持相对偏好，同时把平均 planning loss 尺度拉回接近 1.0 |
+
+`balanced_norm` 的关键含义是：
+
+- 保留 `static < slow < moving_straight < turning` 的训练偏好；
+- 只修正整体 loss scale，不额外改变 map-fuse 结构；
+- 相比重新设计一套温和权重，它是更干净的 ablation，用于回答“balanced 后期退化是否因为 planning loss 被整体削弱”。
+
+当前建议：
+
+- 先不要改 `balanced_norm.py` 的四个权重，按原样训练；
+- 不要默认用 `latest.pth`，而是按 `planning/avg.L2` 选择 best checkpoint；
+- 重点观察 `planning/avg.L2`、`planning/Turning/avg.L2`、`planning/Static/avg.L2`、`planning/avg.Collision`；
+- 如果 `balanced_norm` 仍然后期退化，再新建一个 mild ablation，而不是直接覆盖 `balanced_norm.py`。
+
+候选 mild 版本可以使用更温和的权重：
+
+```python
+planning_motion_loss_weights=dict(
+    static=0.5,
+    slow=0.8,
+    moving_straight=1.0,
+    turning=1.2,
+)
+```
+
+但该 mild 版本应作为独立配置保留，避免和 `balanced_norm` 的实验含义混在一起。
+
+同时，已经修改 `CustomDistEvalHook`，支持在训练 validation 后自动保存 eval outputs：
+
+```python
+evaluation = dict(
+    interval=1,
+    save_results=True,
+    results_path_template='eval_epoch{epoch}_planning_results.pkl',
+)
+```
+
+`base_e2e_lidar_plan_mapfuse_balanced_norm.py` 已开启该配置。后续训练时只要不加 `--no-validate`，每个 epoch validation 后会自动保存：
+
+```text
+projects/work_dirs/stage2_e2e_lidar/base_e2e_lidar_plan_mapfuse_balanced_norm/eval_epoch1_planning_results.pkl
+projects/work_dirs/stage2_e2e_lidar/base_e2e_lidar_plan_mapfuse_balanced_norm/eval_epoch2_planning_results.pkl
+...
+```
+
+这样后续可以直接对每个 epoch 做 displacement diagnostics、可视化和 best-checkpoint 选择。
 
 ## 3. 本轮代码改动
 

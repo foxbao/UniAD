@@ -15,3 +15,9 @@ model = dict(
 
 load_from = './projects/work_dirs/stage2_e2e_lidar/base_e2e_lidar_plan/latest.pth'
 work_dir = './projects/work_dirs/stage2_e2e_lidar/base_e2e_lidar_plan_mapfuse_balanced_norm'
+
+evaluation = dict(
+    interval=1,
+    save_results=True,
+    results_path_template='eval_epoch{epoch}_planning_results.pkl',
+)
