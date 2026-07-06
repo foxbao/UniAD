@@ -778,10 +778,13 @@ def render_frame(points: np.ndarray,
     gt_title = f'GT boxes + GT future paths ({len(gt_data["boxes"])})'
     if hdmap_lanes:
         gt_title += f' + HDMap lanes ({len(hdmap_lanes)})'
+    pred_title = f'Pred tracks + predicted future paths ({len(pred_data["boxes"])})'
+    if hdmap_lanes:
+        pred_title += f' + HDMap lanes ({len(hdmap_lanes)})'
     setup_axis(left, pc_range,
                gt_title)
     setup_axis(right, pc_range,
-               f'Pred tracks + predicted future paths ({len(pred_data["boxes"])})')
+               pred_title)
     draw_points(left, points, point_stride)
     if right_background == 'points':
         draw_points(right, points, point_stride)
@@ -789,6 +792,7 @@ def render_frame(points: np.ndarray,
         draw_bev_mask(right, drivable_gt, pc_range, color=(0.22, 0.72, 0.52),
                       alpha=0.42, label='GT drivable space')
     draw_hdmap_lanes(left, hdmap_lanes)
+    draw_hdmap_lanes(right, hdmap_lanes)
     draw_boxes(left, gt_data, class_names, 'GT#', annotate_topk, alpha=0.75)
     draw_gt_future(left, gt_data)
     draw_sdc_planning(left, planning_data, draw_gt=True, draw_pred=False)
