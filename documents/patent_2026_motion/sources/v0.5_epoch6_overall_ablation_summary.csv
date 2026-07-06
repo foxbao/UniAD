@@ -1,5 +1,0 @@
-config,anchor,loss,minADE,minFDE,MR,Recall,mAP,AMOTA,NDS
-base_e2e_lidar,old 2grp,original,0.33683,0.59741,0.08124,0.92837,0.84523,0.80039,0.84994
-base_e2e_lidar_turnaware,turn-aware 3grp,original,0.33708,0.59263,0.08227,0.92705,0.84096,0.80758,0.84783
-base_e2e_lidar_turnloss,old 2grp,ADE+FDE + turn weighting,0.32767,0.57616,0.07821,0.92605,0.84045,0.81009,0.84745
-base_e2e_lidar_turnaware_turnloss,turn-aware 3grp,ADE+FDE + turn weighting,0.32822,0.58010,0.08124,0.92837,0.85473,0.81174,0.85593
