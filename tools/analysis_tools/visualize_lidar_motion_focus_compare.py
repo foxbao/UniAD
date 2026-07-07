@@ -142,6 +142,8 @@ def parse_args() -> argparse.Namespace:
                         help='increase titles, axis labels, ticks and metric text')
     parser.add_argument('--hide-frame-title', action='store_true',
                         help='hide the top frame metadata title')
+    parser.add_argument('--patent-bw-lines', action='store_true',
+                        help='render GT and prediction overlays with black-and-white patent-friendly line styles')
     parser.add_argument('--gt-map-overlay', default='none',
                         choices=['none', 'hdmap'])
     parser.add_argument('--hdmap-path', default=None)
@@ -355,7 +357,8 @@ def render_patent_case(points: np.ndarray,
                        zoom_margin: float,
                        chinese_labels: bool,
                        show_axis_labels: bool,
-                       large_text: bool) -> dict:
+                       large_text: bool,
+                       patent_bw_lines: bool) -> dict:
     model_items = [(name, match) for name, match in matches.items()]
     if len(model_items) != 2:
         raise ValueError('--patent-layout expects exactly two --result entries')
@@ -394,23 +397,42 @@ def render_patent_case(points: np.ndarray,
             axis_labels=axis_labels, text_scale=text_scale)
         draw_points(ax, points, point_stride)
         draw_hdmap_lanes(ax, hdmap_lanes)
+        gt_line_style = '--' if patent_bw_lines else '-'
+        gt_marker = 'o'
+        gt_line_width = 2.4
+        gt_box_label = ''
+        if not patent_bw_lines:
+            gt_box_label = (
+                f'真值#{track_id}:{class_display_name(class_name, chinese_labels)}'
+                if chinese_labels else f'GT#{track_id}:{class_name}'
+            )
         draw_single_box(
-            ax, gt_box, '#ffffff',
-            f'真值#{track_id}:{class_display_name(class_name, chinese_labels)}'
-            if chinese_labels else f'GT#{track_id}:{class_name}',
-            '-', font_properties=font_properties, text_scale=text_scale)
+            ax, gt_box, '#ffffff', gt_box_label, '-',
+            font_properties=font_properties, text_scale=text_scale)
         plot_path_with_scale(
             ax, gt_abs, '#ffffff',
             '真实未来轨迹' if chinese_labels else 'GT future',
-            '-', 'o', 2.4, text_scale)
+            gt_line_style, gt_marker, gt_line_width, text_scale)
 
         if match is None:
             metric_text = '未匹配到目标' if chinese_labels else 'missed target'
             summary.append(dict(model=name, matched=False))
         else:
-            color = MODEL_COLORS.get(name, '#e45756')
+            if patent_bw_lines:
+                color = '#d9d9d9' if name == 'base' else '#ffffff'
+                pred_linestyle = '-' if name != 'base' else '-'
+                pred_marker = 'x'
+                pred_linewidth = 2.0 if name == 'base' else 2.8
+                box_linestyle = ':'
+            else:
+                color = MODEL_COLORS.get(name, '#e45756')
+                pred_linestyle = '-'
+                pred_marker = 'x'
+                pred_linewidth = 2.2
+                box_linestyle = ':'
+            pred_box_label = '' if patent_bw_lines else display_name
             draw_single_box(
-                ax, match['box'], color, display_name, ':',
+                ax, match['box'], color, pred_box_label, box_linestyle,
                 font_properties=font_properties, text_scale=text_scale)
             top1_path = absolute_traj(match['box'][:2],
                                       match['traj'][match['top1']])
@@ -418,7 +440,7 @@ def render_patent_case(points: np.ndarray,
                 ax, top1_path, color,
                 f'{display_name}最高置信度轨迹'
                 if chinese_labels else f'{display_name} top1',
-                '-', 'x', 2.2, text_scale)
+                pred_linestyle, pred_marker, pred_linewidth, text_scale)
             metric_text = (
                 f'最高置信度FDE：{match["top1FDE"]:.2f}米\n'
                 f'最优候选FDE：{match["minFDE"]:.2f}米'
@@ -443,9 +465,11 @@ def render_patent_case(points: np.ndarray,
             fontproperties=font_properties, ha='left', va='bottom',
             bbox=dict(facecolor='#050608', edgecolor='#777777',
                       alpha=0.82, boxstyle='round,pad=0.32'))
-        ax.legend(loc='upper right', fontsize=6.8 * text_scale,
+        legend_font = font_properties.copy()
+        legend_font.set_size((8.8 if patent_bw_lines else 7.2) * text_scale)
+        ax.legend(loc='upper right',
                   facecolor='#050608', edgecolor='#555555',
-                  labelcolor='white', prop=font_properties)
+                  labelcolor='white', prop=legend_font)
         apply_zoom(ax, zoom_chunks, pc_range, zoom_margin)
 
     if title and not title.isspace():
@@ -626,7 +650,7 @@ def main() -> None:
                 gt_masks[gt_idx], matches, cfg.point_cloud_range, title,
                 out_path, args.point_stride, args.zoom_margin,
                 args.chinese_labels, args.show_axis_labels,
-                args.large_text)
+                args.large_text, args.patent_bw_lines)
         else:
             case_summary = render_case(
                 points, frame_hdmap_lanes, class_name, track_id, bucket,
