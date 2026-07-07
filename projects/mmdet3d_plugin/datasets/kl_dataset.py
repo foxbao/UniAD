@@ -1563,10 +1563,23 @@ class KlDataset(Custom3DDataset):
             pred_xy = pred_xy.reshape(-1, pred_xy.shape[-1])
             gt_plan = gt_plan.reshape(-1, gt_plan.shape[-1])
             gt_xy = gt_xy.reshape(-1, gt_xy.shape[-1])
-            if mask.ndim == 3:
-                mask = mask[0, :, 0]
-            elif mask.ndim == 2:
-                mask = mask[:, 0]
+            # sdc_planning_mask marks which future planning steps have valid GT
+            # (sequence tails may have fewer than planning_steps frames). Its
+            # last dim is the per-coordinate validity (2 for the nuScenes
+            # reference's [x,y]; 3 here for [x,y,yaw]) and the second-to-last
+            # dim is the timestep axis. The canonical reduction is .any() over
+            # the coordinate dim, matching trajectory_api's
+            # `planning_mask_all[0].any(axis=1)`. Reduce to a per-timestep
+            # (T,) bool. NB: an earlier version fell through to reshape(-1) for
+            # the 4D (1,1,T,C) layout this dataset emits, which flattened
+            # coords into the time axis and mis-aligned every downstream slice.
+            mask = np.asarray(mask)
+            if mask.ndim >= 2:
+                # Layout is (..., T, C): collapse only the coordinate dim, then
+                # drop any leading batch dims. Avoid np.squeeze on the whole
+                # array — it would also strip a singleton timestep axis (T=1)
+                # and mis-count valid steps.
+                mask = mask.any(axis=-1).reshape(-1)
             else:
                 mask = mask.reshape(-1)
             mask = mask.astype(bool)

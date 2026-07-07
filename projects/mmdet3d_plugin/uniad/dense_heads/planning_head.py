@@ -35,6 +35,7 @@ class PlanningHeadSingleMode(nn.Module):
                  map_local_k=None,
                  map_attn_layers=1,
                  map_gate_init=-2.0,
+                 map_delta_init='zeros',
                  planning_motion_loss_weights=None,
                 ):
         """
@@ -84,7 +85,21 @@ class PlanningHeadSingleMode(nn.Module):
                 nn.Linear(embed_dims * 2, embed_dims),
                 nn.ReLU(inplace=True),
                 nn.Linear(embed_dims, embed_dims))
-            nn.init.zeros_(self.map_delta_proj.weight)
+            # map_delta_init controls how the map->plan residual projection
+            # starts. 'zeros' (default, preserves the historical behaviour of
+            # base_e2e_lidar_plan_mapfuse) makes the map delta identically 0 at
+            # step 0; combined with a strongly negative map_gate_init this
+            # starves the map branch of gradient and it converges to a no-op.
+            # 'small' seeds a tiny random projection so the branch receives a
+            # non-degenerate gradient from the first step, giving the map a fair
+            # chance to be learned. The gate bias is a separate lever
+            # (map_gate_init): relax it toward 0 to open the fusion channel.
+            assert map_delta_init in ('zeros', 'small'), (
+                f'map_delta_init must be zeros/small, got {map_delta_init}')
+            if map_delta_init == 'zeros':
+                nn.init.zeros_(self.map_delta_proj.weight)
+            else:
+                nn.init.xavier_uniform_(self.map_delta_proj.weight, gain=0.1)
             nn.init.zeros_(self.map_delta_proj.bias)
             nn.init.constant_(self.map_gate[-1].bias, map_gate_init)
         
