@@ -1087,7 +1087,16 @@ class UniADTrackTRT(UniADTrack):
         )
 
         reference_points = reference_points + velo_pad * time_delta
-        ref_pts = reference_points @ l2g_r1 + l2g_t1 - l2g_t2
+        # FP16 numerical hygiene (same class as MapLaneEncoderTRT): the naive
+        # form `reference_points @ l2g_r1 + l2g_t1 - l2g_t2` first adds the ego
+        # global translation l2g_t1 (~thousands of metres) and only then
+        # subtracts l2g_t2 (same magnitude) -> catastrophic cancellation in FP16
+        # (ULP ~2 m at 3000). Compute the inter-frame translation delta
+        # (l2g_t1 - l2g_t2, a small metric offset) in fp32 first, so no
+        # ~3000 m intermediate ever enters the graph. Math-identical:
+        #   (a @ R + t1) - t2 == a @ R + (t1 - t2)
+        trans_delta = (l2g_t1.float() - l2g_t2.float()).to(dtype=ref_pts.dtype)
+        ref_pts = reference_points @ l2g_r1 + trans_delta
 
         g2l_r = self.inverse(l2g_r2[None,...])[0].float()
 
