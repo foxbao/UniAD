@@ -36,7 +36,9 @@ class PlanningHeadSingleMode(nn.Module):
                  map_attn_layers=1,
                  map_gate_init=-2.0,
                  map_delta_init='zeros',
+                 ablate_ego_status='none',
                  planning_motion_loss_weights=None,
+                 use_goal=False,
                 ):
         """
         Single Mode Planning Head for Autonomous Driving.
@@ -68,7 +70,39 @@ class PlanningHeadSingleMode(nn.Module):
             planning_motion_loss_weights or None)
         
         #### planning head
-        fuser_dim = 3
+        # Goal-conditioned planning (feat/plan-goal). When use_goal is False the
+        # head is byte-identical to upstream: fuser_dim stays 3, no goal_encoder
+        # is created, and forward concatenates only the original three queries.
+        # This keeps base_e2e_lidar_plan / _mapfuse / _mapfuse_v2 unchanged.
+        # ablate_ego_status: EVAL-only diagnostic to disambiguate "map fusion is
+        # too weak" from "ego-status dominates the plan" (CVPR2024 "Is Ego Status
+        # All You Need?"). The sdc_track_query carries the ego's detected
+        # position+velocity (the strongest ego-status pathway in this planner;
+        # confirmed by the runaway-frame analysis). Zeroing/perturbing it at
+        # inference severs that pathway; comparing the map-on/off delta with vs
+        # without ego-status tells us whether the kinematic prior was capping the
+        # map's contribution. 'none' = unchanged (default). 'zero' = zero the
+        # sdc_track_query. 'noise' = replace with unit-scaled Gaussian noise
+        # (keeps "an ego exists" but destroys the state). No effect on training.
+        # Modes act on the ego-status pathways feeding plan_query:
+        #   none  : unchanged (default)
+        #   zero  : zero sdc_track_query (detected ego box: position+velocity)
+        #   noise : replace sdc_track_query with Gaussian noise
+        #   traj  : zero sdc_traj_query (motion-predicted ego future trajectory —
+        #           the kinematic-trend pathway; suspected true ego-status route,
+        #           since runaway static frames copied the ego's motion trend)
+        #   both  : zero BOTH sdc_track_query and sdc_traj_query
+        assert ablate_ego_status in ('none', 'zero', 'noise', 'traj', 'both'), (
+            'ablate_ego_status must be none/zero/noise/traj/both, got '
+            f'{ablate_ego_status}')
+        self.ablate_ego_status = ablate_ego_status
+        self.use_goal = use_goal
+        if use_goal:
+            self.goal_encoder = nn.Sequential(
+                nn.Linear(2, embed_dims),
+                nn.ReLU(inplace=True),
+                nn.Linear(embed_dims, embed_dims))
+        fuser_dim = 4 if use_goal else 3
         attn_module_layer = nn.TransformerDecoderLayer(embed_dims, 8, dim_feedforward=embed_dims*2, dropout=0.1, batch_first=False)
         self.attn_module = nn.TransformerDecoder(attn_module_layer, 3)
 
@@ -140,6 +174,7 @@ class PlanningHeadSingleMode(nn.Module):
                       command=None,
                       gt_future_boxes=None,
                       outs_map=None,
+                      sdc_goal=None,
                       ):
         """
         Perform forward planning training with the given inputs.
@@ -163,21 +198,23 @@ class PlanningHeadSingleMode(nn.Module):
         occ_mask = None
         
         outs_planning = self(bev_embed, occ_mask, bev_pos, sdc_traj_query,
-                             sdc_track_query, command, outs_map=outs_map)
+                             sdc_track_query, command, outs_map=outs_map,
+                             sdc_goal=sdc_goal)
         loss_inputs = [sdc_planning, sdc_planning_mask, outs_planning, gt_future_boxes]
         losses = self.loss(*loss_inputs)
         ret_dict = dict(losses=losses, outs_motion=outs_planning)
         return ret_dict
 
     def forward_test(self, bev_embed, outs_motion={}, outs_occflow={},
-                     command=None, outs_map=None):
+                     command=None, outs_map=None, sdc_goal=None):
         sdc_traj_query = outs_motion['sdc_traj_query']
         sdc_track_query = outs_motion['sdc_track_query']
         bev_pos = outs_motion['bev_pos']
         occ_mask = outs_occflow['seg_out']
-        
+
         outs_planning = self(bev_embed, occ_mask, bev_pos, sdc_traj_query,
-                             sdc_track_query, command, outs_map=outs_map)
+                             sdc_track_query, command, outs_map=outs_map,
+                             sdc_goal=sdc_goal)
         return outs_planning
 
     def _lane_memory(self, outs_map, batch_size, device, dtype):
@@ -258,10 +295,11 @@ class PlanningHeadSingleMode(nn.Module):
                 bev_embed, 
                 occ_mask, 
                 bev_pos, 
-                sdc_traj_query, 
-                sdc_track_query, 
+                sdc_traj_query,
+                sdc_track_query,
                 command,
-                outs_map=None):
+                outs_map=None,
+                sdc_goal=None):
         """
         Forward pass for PlanningHeadSingleMode.
 
@@ -277,14 +315,34 @@ class PlanningHeadSingleMode(nn.Module):
             dict: A dictionary containing SDC trajectory and all SDC trajectories.
         """
         sdc_track_query = sdc_track_query.detach()
+        # EVAL-only ego-status ablation (no-op when 'none', i.e. all training
+        # configs). Two ego pathways feed plan_query: sdc_track_query (detected
+        # ego box: position+velocity) and sdc_traj_query (motion-predicted ego
+        # future trajectory: the kinematic trend). Sever them per mode to test
+        # whether ego-status dominance caps the map contribution.
+        if self.ablate_ego_status in ('zero', 'both'):
+            sdc_track_query = torch.zeros_like(sdc_track_query)
+        elif self.ablate_ego_status == 'noise':
+            sdc_track_query = torch.randn_like(sdc_track_query)
         sdc_traj_query = sdc_traj_query[-1]
+        if self.ablate_ego_status in ('traj', 'both'):
+            sdc_traj_query = torch.zeros_like(sdc_traj_query)
         P = sdc_traj_query.shape[1]
         sdc_track_query = sdc_track_query[:, None].expand(-1,P,-1)
         
         
         navi_embed = self.navi_embed.weight[command]
         navi_embed = navi_embed[None].expand(-1,P,-1)
-        plan_query = torch.cat([sdc_traj_query, sdc_track_query, navi_embed], dim=-1)
+        if self.use_goal:
+            # sdc_goal arrives as (B,1,2) after collation; take (x,y) and encode
+            # into a per-mode conditioning token. The goal is only a directional
+            # prior (no endpoint loss) — see get_sdc_goal / loss().
+            goal_xy = sdc_goal.reshape(1, -1)[:, :2].to(sdc_traj_query)
+            goal_embed = self.goal_encoder(goal_xy)[:, None, :].expand(-1, P, -1)
+            plan_query = torch.cat(
+                [sdc_traj_query, sdc_track_query, navi_embed, goal_embed], dim=-1)
+        else:
+            plan_query = torch.cat([sdc_traj_query, sdc_track_query, navi_embed], dim=-1)
 
         plan_query = self.mlp_fuser(plan_query).max(1, keepdim=True)[0]   # expand, then fuse  # [1, 6, 768] -> [1, 1, 256]
         plan_query = rearrange(plan_query, 'b p c -> p b c')
