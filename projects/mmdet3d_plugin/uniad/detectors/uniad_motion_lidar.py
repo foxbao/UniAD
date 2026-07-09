@@ -253,6 +253,8 @@ class UniADMotionLidar(UniADTrackLidar):
                       sdc_planning=None,
                       sdc_planning_mask=None,
                       command=None,
+                      sdc_goal=None,
+                      sdc_goal_mask=None,
                       gt_future_boxes=None,
                       l2g_t=None,
                       l2g_r_mat=None,
@@ -365,7 +367,8 @@ class UniADMotionLidar(UniADTrackLidar):
                 sdc_planning_mask=sdc_planning_mask,
                 command=command,
                 gt_future_boxes=gt_future_boxes,
-                outs_map=outs_map)
+                outs_map=outs_map,
+                sdc_goal=sdc_goal)
             losses.update(
                 self.loss_weighted_and_prefixed(
                     outs_planning['losses'], prefix='planning'))
@@ -449,7 +452,7 @@ class UniADMotionLidar(UniADTrackLidar):
                 'seg_out': bev_embed.new_zeros((1, 1, 1, 1, 1)).long()}
             result_planning = self.planning_head.forward_test(
                 bev_embed, outs_motion, occ_for_plan, command,
-                outs_map=outs_map)
+                outs_map=outs_map, sdc_goal=kwargs.get('sdc_goal'))
             results[0]['planning'] = dict(
                 planning_gt=dict(
                     segmentation=kwargs.get('gt_segmentation'),

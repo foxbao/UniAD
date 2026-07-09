@@ -1,3 +1,4 @@
+import hashlib
 import numpy as np
 from nuscenes.prediction import (PredictHelper,
                                  convert_local_coords_to_global,
@@ -19,7 +20,9 @@ class NuScenesTraj(object):
                  with_velocity,
                  CLASSES,
                  box_mode_3d,
-                 use_nonlinear_optimizer=False):
+                 use_nonlinear_optimizer=False,
+                 with_sdc_goal=False,
+                 goal_max_steps=None):
         super().__init__()
         self.nusc = nusc
         self.prepare_sdc_vel_info()
@@ -32,6 +35,12 @@ class NuScenesTraj(object):
         self.box_mode_3d = box_mode_3d
         self.predict_helper = PredictHelper(self.nusc)
         self.use_nonlinear_optimizer = use_nonlinear_optimizer
+        # Goal-conditioned planning (feat/plan-goal). Both default off so that
+        # every existing config (base_e2e_lidar_plan / _mapfuse / _mapfuse_v2
+        # ...) never enters get_sdc_goal -> sdc_planning/command and the global
+        # RNG stream are provably untouched.
+        self.with_sdc_goal = with_sdc_goal
+        self.goal_max_steps = goal_max_steps or (planning_steps * 5)
 
     def get_traj_label(self, sample_token, ann_tokens):
         sd_rec = self.nusc.get('sample', sample_token)
@@ -274,10 +283,76 @@ class NuScenesTraj(object):
         if mask.sum() == 0:
             command = 2 #'FORWARD'
         elif planning_all[0, mask][-1][0] >= 2:
-            command = 0 #'RIGHT' 
+            command = 0 #'RIGHT'
         elif planning_all[0, mask][-1][0] <= -2:
             command = 1 #'LEFT'
         else:
             command = 2 #'FORWARD'
-        
+
         return planning_all, planning_mask_all, command
+
+    def get_sdc_goal(self, sample_token):
+        """Sample a goal point for goal-conditioned planning (feat/plan-goal).
+
+        Walks the ego's own future further than ``planning_steps`` (up to
+        ``goal_max_steps``) using the *same* frame transforms as
+        ``get_sdc_planning_label``, expresses every future ego position in the
+        initial ego frame, then picks one point at a random arc length that is
+        farther than the supervised horizon. Because the goal is drawn from the
+        ego's real future, the near ``planning_steps`` GT stays a consistent
+        "opening move" toward it -- the model learns goal *direction*, not a
+        hard endpoint (no extra loss is added; see planning_head.loss).
+
+        The point is returned in the initial ego frame, matching the frame of
+        ``sdc_planning``. Only invoked when ``with_sdc_goal`` is set, so it can
+        never perturb the plan/mapfuse configs.
+
+        Returns:
+            sdc_goal:      (1, 2) float32, (x, y) in initial ego frame.
+            sdc_goal_mask: (1, 1) float32, 1.0 if a valid goal was found.
+        """
+        sd_rec = self.nusc.get('sample', sample_token)
+        l2e_r_mat_init, l2e_t_init, e2g_r_mat_init, e2g_t_init = \
+            self.get_l2g_transform(sd_rec)
+
+        path = []
+        for _ in range(self.goal_max_steps):
+            next_token = sd_rec['next']
+            if next_token == '':
+                break
+            sd_rec = self.nusc.get('sample', next_token)
+            l2e_r_mat_curr, l2e_t_curr, e2g_r_mat_curr, e2g_t_curr = \
+                self.get_l2g_transform(sd_rec)
+
+            bbox3d = self.generate_sdc_info(
+                self.sdc_vel_info[next_token], as_lidar_instance3d_box=True)
+            # curr lidar -> curr ego -> world -> initial ego -> initial lidar,
+            # identical chain to get_sdc_planning_label.
+            bbox3d.rotate(l2e_r_mat_curr.T)
+            bbox3d.translate(l2e_t_curr)
+            bbox3d.rotate(e2g_r_mat_curr.T)
+            bbox3d.translate(e2g_t_curr)
+            bbox3d.translate(- e2g_t_init)
+            bbox3d.rotate(np.linalg.inv(e2g_r_mat_init).T)
+            bbox3d.translate(- l2e_t_init)
+            bbox3d.rotate(np.linalg.inv(l2e_r_mat_init).T)
+
+            xy = bbox3d.tensor.squeeze(0).numpy()[[0, 1]]
+            path.append(xy)
+
+        sdc_goal = np.zeros((1, 2), dtype=np.float32)
+        sdc_goal_mask = np.zeros((1, 1), dtype=np.float32)
+        if len(path) > 0:
+            path = np.stack(path, axis=0)  # (T, 2)
+            # Per-sample deterministic RNG via a stable hash: reproducible and,
+            # more importantly, isolated from the global numpy RNG stream so it
+            # cannot shift any augmentation sequence. NB: this fixes one goal
+            # per sample (diversity is across samples, not across epochs); if
+            # the goal branch collapses to a no-op, switch to a per-epoch seed.
+            seed = int(hashlib.md5(sample_token.encode()).hexdigest(), 16)
+            rng = np.random.RandomState(seed % (2 ** 32))
+            lo = min(self.planning_steps, len(path) - 1)
+            k = rng.randint(lo, len(path))
+            sdc_goal[0] = path[k]
+            sdc_goal_mask[0] = 1.0
+        return sdc_goal, sdc_goal_mask

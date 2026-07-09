@@ -371,6 +371,9 @@ class ObjectRangeFilterTrack(object):
             input_dict['sdc_planning'] = input_dict['ann_info']['sdc_planning']
             input_dict['sdc_planning_mask'] = input_dict['ann_info']['sdc_planning_mask']
             input_dict['command'] = input_dict['ann_info']['command']
+        if 'sdc_goal' in input_dict['ann_info'].keys():
+            input_dict['sdc_goal'] = input_dict['ann_info']['sdc_goal']
+            input_dict['sdc_goal_mask'] = input_dict['ann_info']['sdc_goal_mask']
 
         gt_bboxes_3d = input_dict['gt_bboxes_3d']
         gt_labels_3d = input_dict['gt_labels_3d']
