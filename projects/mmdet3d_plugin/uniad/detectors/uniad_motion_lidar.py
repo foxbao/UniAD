@@ -19,6 +19,7 @@ class UniADMotionLidar(UniADTrackLidar):
                  map_lane_encoder=None,
                  llm_probe_only=False,
                  freeze_non_llm=False,
+                 freeze_except_prefixes=None,
                  **kwargs):
         super().__init__(**kwargs)
         self.motion_head = build_head(motion_head) if motion_head else None
@@ -30,6 +31,7 @@ class UniADMotionLidar(UniADTrackLidar):
             track=1.0, motion=1.0, occ=1.0, planning=1.0)
         self.llm_probe_only = llm_probe_only
         self.freeze_non_llm = freeze_non_llm or llm_probe_only
+        self.freeze_except_prefixes = tuple(freeze_except_prefixes or [])
 
         # HD-map lane prior. It is a detector-level module (an external survey
         # input, not a perception output), encoding surveyed lanes into
@@ -45,6 +47,8 @@ class UniADMotionLidar(UniADTrackLidar):
                 **map_lane_encoder)
         if self.freeze_non_llm:
             self._freeze_non_llm_modules()
+        if self.freeze_except_prefixes:
+            self._freeze_except_prefixes()
 
     def _freeze_non_llm_modules(self):
         """Freeze every detector child except the LLM probe head."""
@@ -53,10 +57,19 @@ class UniADMotionLidar(UniADTrackLidar):
                 continue
             self._freeze_modules([module])
 
+    def _freeze_except_prefixes(self):
+        """Freeze all parameters except explicitly named trainable prefixes."""
+        for name, param in self.named_parameters():
+            param.requires_grad = any(
+                name.startswith(prefix)
+                for prefix in self.freeze_except_prefixes)
+
     def train(self, mode=True):
         super().train(mode)
         if self.freeze_non_llm:
             self._freeze_non_llm_modules()
+        if self.freeze_except_prefixes:
+            self._freeze_except_prefixes()
         return self
 
     def _build_outs_map(self, bev_embed, ego2global):
@@ -68,12 +81,19 @@ class UniADMotionLidar(UniADTrackLidar):
         """
         if self.map_lane_encoder is None or ego2global is None:
             return dict(lane_query=None, lane_query_pos=None, lane_valid=None,
-                        lane_centroids=None)
-        lane_query, lane_query_pos, lane_valid, lane_centroids = \
+                        lane_centroids=None, lane_points=None)
+        lane_outputs = \
             self.map_lane_encoder(
                 ego2global, device=bev_embed.device, dtype=bev_embed.dtype)
+        if len(lane_outputs) == 4:
+            lane_query, lane_query_pos, lane_valid, lane_centroids = lane_outputs
+            lane_points = None
+        else:
+            lane_query, lane_query_pos, lane_valid, lane_centroids, lane_points = \
+                lane_outputs
         return dict(lane_query=lane_query, lane_query_pos=lane_query_pos,
-                    lane_valid=lane_valid, lane_centroids=lane_centroids)
+                    lane_valid=lane_valid, lane_centroids=lane_centroids,
+                    lane_points=lane_points)
 
     @property
     def with_motion_head(self):

@@ -36,6 +36,19 @@ class PlanningHeadSingleMode(nn.Module):
                  map_attn_layers=1,
                  map_gate_init=-2.0,
                  map_delta_init='zeros',
+                 map_fusion_mode='gated_residual',
+                 map_force_scale=1.0,
+                 lane_anchor_mode='none',
+                 lane_anchor_scale=1.0,
+                 lane_anchor_offset_scale=0.0,
+                 lane_anchor_sample_mode='whole_lane',
+                 lane_anchor_reference='absolute',
+                 lane_anchor_select_mode='first_point',
+                 lane_anchor_candidate_k=8,
+                 lane_anchor_direction_mode='forward',
+                 lane_anchor_init_alpha=0.3,
+                 lane_anchor_static_gate_loss_weight=0.0,
+                 lane_anchor_static_disp_thresh=0.5,
                  ablate_ego_status='none',
                  planning_motion_loss_weights=None,
                  use_goal=False,
@@ -108,6 +121,48 @@ class PlanningHeadSingleMode(nn.Module):
 
         self.use_map_lane = use_map_lane
         self.map_local_k = map_local_k
+        assert map_fusion_mode in ('gated_residual', 'force_residual'), (
+            'map_fusion_mode must be gated_residual/force_residual, got '
+            f'{map_fusion_mode}')
+        self.map_fusion_mode = map_fusion_mode
+        self.map_force_scale = float(map_force_scale)
+        assert lane_anchor_mode in (
+                'none', 'replace', 'residual', 'blend', 'learned_blend'), (
+            'lane_anchor_mode must be none/replace/residual/blend/'
+            'learned_blend, got '
+            f'{lane_anchor_mode}')
+        self.lane_anchor_mode = lane_anchor_mode
+        self.lane_anchor_scale = float(lane_anchor_scale)
+        self.lane_anchor_offset_scale = float(lane_anchor_offset_scale)
+        self.lane_anchor_init_alpha = float(lane_anchor_init_alpha)
+        assert 0.0 < self.lane_anchor_init_alpha < 1.0, (
+            'lane_anchor_init_alpha must be in (0, 1), got '
+            f'{lane_anchor_init_alpha}')
+        self.lane_anchor_static_gate_loss_weight = float(
+            lane_anchor_static_gate_loss_weight)
+        self.lane_anchor_static_disp_thresh = float(
+            lane_anchor_static_disp_thresh)
+        assert lane_anchor_sample_mode in ('whole_lane', 'local_forward'), (
+            'lane_anchor_sample_mode must be whole_lane/local_forward, got '
+            f'{lane_anchor_sample_mode}')
+        self.lane_anchor_sample_mode = lane_anchor_sample_mode
+        assert lane_anchor_reference in ('absolute', 'relative_start'), (
+            'lane_anchor_reference must be absolute/relative_start, got '
+            f'{lane_anchor_reference}')
+        self.lane_anchor_reference = lane_anchor_reference
+        assert lane_anchor_select_mode in (
+                'first_point', 'closest_point', 'best_endpoint'), (
+            'lane_anchor_select_mode must be first_point/closest_point/'
+            f'best_endpoint, got {lane_anchor_select_mode}')
+        self.lane_anchor_select_mode = lane_anchor_select_mode
+        self.lane_anchor_candidate_k = int(lane_anchor_candidate_k)
+        assert self.lane_anchor_candidate_k > 0, (
+            'lane_anchor_candidate_k must be > 0, got '
+            f'{lane_anchor_candidate_k}')
+        assert lane_anchor_direction_mode in ('forward', 'bidirectional'), (
+            'lane_anchor_direction_mode must be forward/bidirectional, got '
+            f'{lane_anchor_direction_mode}')
+        self.lane_anchor_direction_mode = lane_anchor_direction_mode
         if use_map_lane:
             map_attn_layer = nn.TransformerDecoderLayer(
                 embed_dims, 8, dim_feedforward=embed_dims*2,
@@ -165,6 +220,24 @@ class PlanningHeadSingleMode(nn.Module):
             N_Blocks = 3
             bev_adapter = [copy.deepcopy(bev_adapter_block) for _ in range(N_Blocks)]
             self.bev_adapter = nn.Sequential(*bev_adapter)
+
+        if lane_anchor_mode == 'learned_blend':
+            anchor_ctl_dim = embed_dims + planning_steps * 2 * 3
+            self.lane_anchor_gate_head = nn.Sequential(
+                nn.Linear(anchor_ctl_dim, embed_dims // 2),
+                nn.ReLU(inplace=True),
+                nn.Linear(embed_dims // 2, 1))
+            self.lane_anchor_residual_head = nn.Sequential(
+                nn.Linear(anchor_ctl_dim, embed_dims),
+                nn.ReLU(inplace=True),
+                nn.Linear(embed_dims, planning_steps * 2))
+            init_logit = math.log(
+                self.lane_anchor_init_alpha
+                / (1.0 - self.lane_anchor_init_alpha))
+            nn.init.zeros_(self.lane_anchor_gate_head[-1].weight)
+            nn.init.constant_(self.lane_anchor_gate_head[-1].bias, init_logit)
+            nn.init.zeros_(self.lane_anchor_residual_head[-1].weight)
+            nn.init.zeros_(self.lane_anchor_residual_head[-1].bias)
            
     def forward_train(self,
                       bev_embed, 
@@ -286,10 +359,186 @@ class PlanningHeadSingleMode(nn.Module):
             return plan_query
         map_context = self.map_attn_module(
             plan_query, lane_mem, memory_key_padding_mask=lane_mask)
+        if self.map_fusion_mode == 'force_residual':
+            return plan_query + self.map_force_scale * (
+                map_context - plan_query)
         map_delta = self.map_delta_proj(map_context - plan_query)
         map_gate = torch.sigmoid(
             self.map_gate(torch.cat([plan_query, map_context], dim=-1)))
         return plan_query + map_gate * map_delta
+
+    def _lane_anchor_trajectory(self, outs_map, device, dtype, ref_traj=None):
+        if (self.lane_anchor_mode == 'none' or outs_map is None
+                or outs_map.get('lane_points') is None):
+            return None
+
+        lane_points = outs_map['lane_points'].to(device=device, dtype=dtype)
+        lane_valid = outs_map.get('lane_valid')
+        if lane_valid is None:
+            lane_valid = torch.ones(
+                lane_points.shape[:2], device=device, dtype=torch.bool)
+        else:
+            lane_valid = lane_valid.to(device=device).bool()
+
+        if (self.lane_anchor_sample_mode == 'local_forward'
+                and self.lane_anchor_select_mode == 'best_endpoint'
+                and ref_traj is not None):
+            return self._best_endpoint_lane_anchor(
+                lane_points, lane_valid, dtype, ref_traj)
+
+        if self.lane_anchor_select_mode == 'closest_point':
+            lane_dist = torch.linalg.norm(
+                lane_points[..., :2], dim=-1).min(dim=-1).values
+        else:
+            lane_dist = torch.linalg.norm(lane_points[..., 0, :2], dim=-1)
+        lane_dist = lane_dist.masked_fill(~lane_valid, float('inf'))
+        best = lane_dist.argmin(dim=1)
+        has_lane = torch.isfinite(lane_dist.gather(1, best[:, None])).squeeze(1)
+        if not has_lane.any():
+            return None
+
+        batch_idx = torch.arange(lane_points.size(0), device=device)
+        anchor_points = lane_points[batch_idx, best]
+        if self.lane_anchor_sample_mode == 'local_forward':
+            return self._local_forward_lane_anchor(
+                anchor_points, has_lane, dtype, ref_traj)
+
+        if anchor_points.size(1) == self.planning_steps:
+            anchor = anchor_points
+        else:
+            src_idx = torch.linspace(
+                0, anchor_points.size(1) - 1, self.planning_steps,
+                device=device)
+            left = src_idx.floor().long()
+            right = src_idx.ceil().long()
+            alpha = (src_idx - left.to(dtype))[:, None]
+            anchor = (anchor_points[:, left] * (1 - alpha)
+                      + anchor_points[:, right] * alpha)
+        anchor = anchor * has_lane[:, None, None].to(dtype)
+        return anchor * self.lane_anchor_scale
+
+    def _anchor_ref_score(self, anchor, has_lane, ref_traj):
+        ref_xy = ref_traj[..., :2].to(anchor)
+        endpoint = torch.linalg.norm(anchor[:, -1] - ref_xy[:, -1], dim=-1)
+        traj = torch.linalg.norm(anchor - ref_xy, dim=-1).mean(dim=1)
+        score = endpoint + 0.25 * traj
+        return score.masked_fill(~has_lane, float('inf'))
+
+    def _best_endpoint_lane_anchor(self, lane_points, lane_valid, dtype,
+                                   ref_traj):
+        """Choose the local lane anchor most compatible with base planner."""
+        lane_dist = torch.linalg.norm(
+            lane_points[..., :2], dim=-1).min(dim=-1).values
+        lane_dist = lane_dist.masked_fill(~lane_valid, float('inf'))
+        if not torch.isfinite(lane_dist).any():
+            return None
+
+        batch_size, num_lanes = lane_dist.shape
+        k = min(self.lane_anchor_candidate_k, num_lanes)
+        cand_idx = lane_dist.topk(k, dim=1, largest=False).indices
+        batch_idx = torch.arange(batch_size, device=lane_points.device)
+
+        cand_anchors = []
+        cand_scores = []
+        for rank in range(k):
+            idx = cand_idx[:, rank]
+            has_lane = torch.isfinite(lane_dist[batch_idx, idx])
+            points = lane_points[batch_idx, idx]
+            anchor = self._local_forward_lane_anchor(
+                points, has_lane, dtype, ref_traj)
+            score = self._anchor_ref_score(anchor, has_lane, ref_traj)
+
+            if self.lane_anchor_direction_mode == 'bidirectional':
+                rev_points = torch.flip(points, dims=[1])
+                rev_anchor = self._local_forward_lane_anchor(
+                    rev_points, has_lane, dtype, ref_traj)
+                rev_score = self._anchor_ref_score(
+                    rev_anchor, has_lane, ref_traj)
+                use_rev = rev_score < score
+                anchor = torch.where(use_rev[:, None, None], rev_anchor, anchor)
+                score = torch.minimum(score, rev_score)
+
+            cand_anchors.append(anchor)
+            cand_scores.append(score)
+
+        anchors = torch.stack(cand_anchors, dim=1)
+        scores = torch.stack(cand_scores, dim=1)
+        best = scores.argmin(dim=1)
+        has_best = torch.isfinite(scores.gather(1, best[:, None])).squeeze(1)
+        if not has_best.any():
+            return None
+        best_anchor = anchors[batch_idx, best]
+        return best_anchor * has_best[:, None, None].to(dtype)
+
+    def _local_forward_lane_anchor(self, anchor_points, has_lane, dtype,
+                                   ref_traj=None):
+        """Sample a short-horizon lane anchor from the point nearest ego."""
+        origin = anchor_points.new_zeros(anchor_points.size(0), 1, 2)
+        point_dist = torch.linalg.norm(anchor_points[..., :2], dim=-1)
+        start_idx = point_dist.argmin(dim=1)
+
+        deltas = anchor_points[:, 1:] - anchor_points[:, :-1]
+        seg_len = torch.linalg.norm(deltas, dim=-1).clamp_min(1e-6)
+        cum_s = torch.cat([
+            torch.zeros(anchor_points.size(0), 1, device=anchor_points.device,
+                        dtype=dtype),
+            torch.cumsum(seg_len, dim=1)
+        ], dim=1)
+
+        if ref_traj is None:
+            target_s = torch.arange(
+                1, self.planning_steps + 1, device=anchor_points.device,
+                dtype=dtype)[None] * 1.0
+        else:
+            ref_pts = torch.cat([origin, ref_traj[..., :2]], dim=1)
+            ref_step = torch.linalg.norm(
+                ref_pts[:, 1:] - ref_pts[:, :-1], dim=-1)
+            target_s = torch.cumsum(ref_step, dim=1)
+
+        start_s = cum_s.gather(1, start_idx[:, None])
+        sample_s = start_s + target_s
+        sample_s = torch.minimum(sample_s, cum_s[:, -1:])
+
+        right = torch.searchsorted(cum_s.contiguous(), sample_s.contiguous())
+        right = right.clamp(min=1, max=anchor_points.size(1) - 1)
+        left = right - 1
+        left_s = cum_s.gather(1, left)
+        right_s = cum_s.gather(1, right)
+        denom = (right_s - left_s).clamp_min(1e-6)
+        alpha = ((sample_s - left_s) / denom).unsqueeze(-1)
+
+        left_pts = anchor_points.gather(
+            1, left[..., None].expand(-1, -1, 2))
+        right_pts = anchor_points.gather(
+            1, right[..., None].expand(-1, -1, 2))
+        anchor = left_pts * (1 - alpha) + right_pts * alpha
+        if self.lane_anchor_reference == 'relative_start':
+            start_pts = anchor_points.gather(
+                1, start_idx[:, None, None].expand(-1, 1, 2))
+            anchor = anchor - start_pts
+        anchor = anchor * has_lane[:, None, None].to(dtype)
+        return anchor * self.lane_anchor_scale
+
+    def _lane_anchor_control_feature(self, plan_query, base_traj, lane_anchor):
+        query_feat = rearrange(plan_query, 'p b c -> b (p c)')
+        base_xy = base_traj[..., :2]
+        anchor_xy = lane_anchor[..., :2]
+        geom_feat = torch.cat([
+            base_xy.reshape(base_xy.size(0), -1),
+            anchor_xy.reshape(anchor_xy.size(0), -1),
+            (anchor_xy - base_xy).reshape(base_xy.size(0), -1),
+        ], dim=-1)
+        return torch.cat([query_feat, geom_feat.to(query_feat)], dim=-1)
+
+    def _apply_learned_lane_anchor(self, plan_query, base_traj, lane_anchor):
+        control_feat = self._lane_anchor_control_feature(
+            plan_query, base_traj, lane_anchor)
+        gate = torch.sigmoid(self.lane_anchor_gate_head(control_feat))
+        residual = self.lane_anchor_residual_head(control_feat).view(
+            -1, self.planning_steps, 2)
+        anchor_target = lane_anchor + residual
+        final_traj = base_traj + gate[:, None] * (anchor_target - base_traj)
+        return final_traj, gate.squeeze(-1), residual
 
     def forward(self, 
                 bev_embed, 
@@ -368,15 +617,43 @@ class PlanningHeadSingleMode(nn.Module):
         sdc_traj_all = self.reg_branch(plan_query).view((-1, self.planning_steps, 2))
         sdc_traj_all[...,:2] = torch.cumsum(sdc_traj_all[...,:2], dim=1)
         sdc_traj_all[0] = bivariate_gaussian_activation(sdc_traj_all[0])
+        sdc_traj_base = sdc_traj_all
+        lane_anchor_gate = None
+        lane_anchor_residual = None
+        lane_anchor = self._lane_anchor_trajectory(
+            outs_map, sdc_traj_all.device, sdc_traj_all.dtype,
+            ref_traj=sdc_traj_all.detach())
+        if lane_anchor is not None:
+            if self.lane_anchor_mode == 'replace':
+                sdc_traj_all = lane_anchor + (
+                    self.lane_anchor_offset_scale * sdc_traj_all)
+            elif self.lane_anchor_mode == 'residual':
+                sdc_traj_all = sdc_traj_all + lane_anchor
+            elif self.lane_anchor_mode == 'blend':
+                alpha = self.lane_anchor_offset_scale
+                sdc_traj_all = sdc_traj_all + alpha * (
+                    lane_anchor - sdc_traj_all)
+            elif self.lane_anchor_mode == 'learned_blend':
+                sdc_traj_all, lane_anchor_gate, lane_anchor_residual = \
+                    self._apply_learned_lane_anchor(
+                        plan_query, sdc_traj_all, lane_anchor)
         if self.use_col_optim and not self.training:
             # post process, only used when testing
             assert occ_mask is not None
             sdc_traj_all = self.collision_optimization(sdc_traj_all, occ_mask)
-        
-        return dict(
+
+        ret = dict(
             sdc_traj=sdc_traj_all,
             sdc_traj_all=sdc_traj_all,
+            sdc_traj_base=sdc_traj_base,
         )
+        if lane_anchor is not None:
+            ret['lane_anchor'] = lane_anchor
+        if lane_anchor_gate is not None:
+            ret['lane_anchor_gate'] = lane_anchor_gate
+        if lane_anchor_residual is not None:
+            ret['lane_anchor_residual'] = lane_anchor_residual
+        return ret
 
     def collision_optimization(self, sdc_traj_all, occ_mask):
         """
@@ -540,6 +817,17 @@ class PlanningHeadSingleMode(nn.Module):
         if planning_weight is not None:
             loss_ade = loss_ade * planning_weight
         loss_dict.update(dict(loss_ade=loss_ade))
+        if (self.lane_anchor_static_gate_loss_weight > 0
+                and 'lane_anchor_gate' in outs_planning):
+            gt_final = sdc_planning[0, :, self.planning_steps - 1, :2]
+            gt_disp = torch.linalg.norm(gt_final, dim=-1)
+            static_mask = gt_disp < self.lane_anchor_static_disp_thresh
+            gate = outs_planning['lane_anchor_gate'].reshape(-1)
+            static_weight = static_mask.to(gate).mean()
+            loss_static_gate = gate.pow(2).mean() * static_weight
+            loss_static_gate = loss_static_gate * \
+                self.lane_anchor_static_gate_loss_weight
+            loss_dict['loss_lane_anchor_static_gate'] = loss_static_gate
         if planning_bucket is not None:
             loss_dict['motion_bucket_weight'] = planning_weight.detach()
         return loss_dict
