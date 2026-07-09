@@ -54,8 +54,6 @@ class NuScenesE2EDataset(NuScenesDataset):
                  past_steps=4,
                  fut_steps=4,
                  use_nonlinear_optimizer=False,
-                 with_sdc_goal=False,
-                 goal_max_steps=None,
                  lane_ann_file=None,
                  eval_mod=None,
 
@@ -93,10 +91,6 @@ class NuScenesE2EDataset(NuScenesDataset):
         self.eval_mod = eval_mod
 
         self.use_nonlinear_optimizer = use_nonlinear_optimizer
-        # Goal-conditioned planning (feat/plan-goal); default off so existing
-        # configs are byte-identical (traj_api.get_sdc_goal is never called).
-        self.with_sdc_goal = with_sdc_goal
-        self.goal_max_steps = goal_max_steps
 
         self.nusc = NuScenes(version=self.version,
                              dataroot=self.data_root, verbose=True)
@@ -131,9 +125,7 @@ class NuScenesE2EDataset(NuScenesDataset):
                                      self.with_velocity,
                                      self.CLASSES,
                                      self.box_mode_3d,
-                                     self.use_nonlinear_optimizer,
-                                     with_sdc_goal=self.with_sdc_goal,
-                                     goal_max_steps=self.goal_max_steps)
+                                     self.use_nonlinear_optimizer)
 
         # Occ
         self.enbale_temporal_aug = enbale_temporal_aug
@@ -417,12 +409,6 @@ class NuScenesE2EDataset(NuScenesDataset):
             sdc_planning_mask=sdc_planning_mask,
             command=command,
         )
-        # Goal-conditioned planning (feat/plan-goal): only computed when the
-        # dataset opts in, so the plan/mapfuse configs never hit this branch.
-        if self.with_sdc_goal:
-            sdc_goal, sdc_goal_mask = self.traj_api.get_sdc_goal(info['token'])
-            anns_results['sdc_goal'] = sdc_goal
-            anns_results['sdc_goal_mask'] = sdc_goal_mask
         assert gt_fut_traj.shape[0] == gt_labels_3d.shape[0]
         assert gt_past_traj.shape[0] == gt_labels_3d.shape[0]
         return anns_results
@@ -567,9 +553,6 @@ class NuScenesE2EDataset(NuScenesDataset):
             input_dict['sdc_planning'] = input_dict['ann_info']['sdc_planning']
             input_dict['sdc_planning_mask'] = input_dict['ann_info']['sdc_planning_mask']
             input_dict['command'] = input_dict['ann_info']['command']
-        if 'sdc_goal' in input_dict['ann_info'].keys():
-            input_dict['sdc_goal'] = input_dict['ann_info']['sdc_goal']
-            input_dict['sdc_goal_mask'] = input_dict['ann_info']['sdc_goal_mask']
 
         rotation = Quaternion(input_dict['ego2global_rotation'])
         translation = input_dict['ego2global_translation']

@@ -1,4 +1,5 @@
 import copy
+import hashlib
 import math
 import time
 from os import path as osp
@@ -58,9 +59,16 @@ class KlDataset(Custom3DDataset):
                  filter_eval_by_range=True,
                  pi_symmetric_classes=('IGV-Full', 'IGV-Empty',
                                        'WheelCrane'),
+                 with_sdc_goal=False,
+                 goal_max_steps=None,
                  **kwargs):
         if classes is None and metainfo is not None:
             classes = metainfo.get('classes', None)
+        # Goal-conditioned planning (feat/plan-goal); default off so every
+        # existing KL config is byte-identical (get_ann_info never samples a
+        # goal, no sdc_goal key is emitted).
+        self.with_sdc_goal = with_sdc_goal
+        self.goal_max_steps = goal_max_steps
         self.data_prefix = data_prefix or {}
         self.with_velocity = with_velocity
         self.use_valid_flag = use_valid_flag
@@ -265,7 +273,61 @@ class KlDataset(Custom3DDataset):
                 info['sdc_planning_mask'], dtype=np.float32)
             ann_info['command'] = np.asarray(
                 info['command'], dtype=np.int64)
+        # Goal-conditioned planning (feat/plan-goal): only when opted in, so
+        # the plan/mapfuse configs never emit sdc_goal and stay byte-identical.
+        if self.with_sdc_goal:
+            goal, goal_mask = self._sample_sdc_goal(info)
+            ann_info['sdc_goal'] = goal
+            ann_info['sdc_goal_mask'] = goal_mask
         return ann_info
+
+    def _sample_sdc_goal(self, info):
+        """Sample a goal point (x, y) in the ego frame for goal-conditioned
+        planning, from the precomputed gt_sdc_fut_traj (a longer SDC future
+        than the 6-step sdc_planning; verified same frame -- their first steps
+        coincide). Picks a valid index BEYOND the planning horizon so the near
+        6-step GT stays a consistent "opening move" toward the goal (the goal
+        is only a directional prior; no endpoint loss is added).
+
+        Per-sample md5-seeded RandomState -> reproducible and isolated from the
+        global RNG stream (matters under --deterministic). One goal per sample;
+        if the branch collapses to a no-op, switch to a per-epoch seed.
+
+        Returns:
+            sdc_goal:      (1, 2) float32, (x, y) in the ego frame.
+            sdc_goal_mask: (1, 1) float32, 1.0 if a valid goal was found.
+        """
+        goal = np.zeros((1, 2), dtype=np.float32)
+        goal_mask = np.zeros((1, 1), dtype=np.float32)
+        fut = info.get('gt_sdc_fut_traj')
+        if fut is None:
+            return goal, goal_mask
+        fut = np.asarray(fut, dtype=np.float32).reshape(-1, 2)  # (T, 2)
+        futm = info.get('gt_sdc_fut_traj_mask')
+        if futm is not None:
+            futm = np.asarray(futm, dtype=np.float32).reshape(fut.shape[0], -1)
+            valid = futm.any(axis=-1)
+        else:
+            valid = np.ones(fut.shape[0], dtype=bool)
+
+        plan_len = 0
+        if 'sdc_planning' in info:
+            plan_len = int(np.asarray(info['sdc_planning']).shape[-2])
+        hi = fut.shape[0]
+        if self.goal_max_steps is not None:
+            hi = min(hi, plan_len + int(self.goal_max_steps))
+
+        valid_idx = np.nonzero(valid[:hi])[0]
+        far = valid_idx[valid_idx >= plan_len]
+        pool = far if far.size > 0 else valid_idx[-1:] if valid_idx.size else []
+        if len(pool) > 0:
+            seed = int(hashlib.md5(
+                str(info.get('token', '')).encode()).hexdigest(), 16)
+            rng = np.random.RandomState(seed % (2 ** 32))
+            k = int(pool[rng.randint(len(pool))])
+            goal[0] = fut[k]
+            goal_mask[0] = 1.0
+        return goal, goal_mask
 
     @staticmethod
     def _stack_track_trajs(trajs, masks, num_steps=None):
@@ -2389,6 +2451,18 @@ class KlTrackDataset(KlBEVFormerDataset):
             sample['sdc_planning_mask'] = DC(
                 sdc_planning_mask, stack=True, pad_dims=None)
             sample['command'] = DC(command, stack=True, pad_dims=None)
+        # Goal-conditioned planning (feat/plan-goal): present only when the
+        # dataset opted in and Collect3D forwarded it. Wrapped like sdc_planning
+        # so it reaches PlanningHead as a (B, 1, 2) tensor.
+        if 'sdc_goal' in queue[-1]:
+            sdc_goal = self._as_tensor(
+                queue[-1]['sdc_goal'], dtype=torch.float32)
+            sample['sdc_goal'] = DC(sdc_goal, stack=True, pad_dims=None)
+            if 'sdc_goal_mask' in queue[-1]:
+                sdc_goal_mask = self._as_tensor(
+                    queue[-1]['sdc_goal_mask'], dtype=torch.float32)
+                sample['sdc_goal_mask'] = DC(
+                    sdc_goal_mask, stack=True, pad_dims=None)
         if has_future_boxes:
             sample['gt_future_boxes'] = DC(gt_future_boxes_list, cpu_only=True)
             sample['gt_future_labels'] = DC(gt_future_labels_list)
