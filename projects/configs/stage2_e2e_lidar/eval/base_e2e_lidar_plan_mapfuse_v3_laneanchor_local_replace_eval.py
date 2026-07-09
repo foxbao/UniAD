@@ -1,4 +1,4 @@
-_base_ = ['./base_e2e_lidar_plan_mapfuse_v2.py']
+_base_ = ['../base_e2e_lidar_plan_mapfuse_v2.py']
 
 # v3 local lane-anchor sanity eval: choose the HD-map centerline closest to ego,
 # then sample only the short forward segment matching the base planner's

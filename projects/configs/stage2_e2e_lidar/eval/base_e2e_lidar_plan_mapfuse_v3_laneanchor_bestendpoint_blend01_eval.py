@@ -1,4 +1,4 @@
-_base_ = ['./base_e2e_lidar_plan_mapfuse_v2.py']
+_base_ = ['../base_e2e_lidar_plan_mapfuse_v2.py']
 
 # v3 best-endpoint lane-anchor blend sanity eval, alpha=0.1. This brackets the
 # weaker side of the successful alpha=0.2 run.

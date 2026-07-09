@@ -1,4 +1,4 @@
-_base_ = ['./base_e2e_lidar_plan_mapfuse_v2.py']
+_base_ = ['../base_e2e_lidar_plan_mapfuse_v2.py']
 
 # v3 lane-anchor residual sanity eval: add the nearest HD-map centerline anchor
 # to the learned planner output. This checks whether direct trajectory-space map

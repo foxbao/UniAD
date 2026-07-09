@@ -1,4 +1,4 @@
-_base_ = ['./base_e2e_lidar_plan_mapfuse_v2.py']
+_base_ = ['../base_e2e_lidar_plan_mapfuse_v2.py']
 
 # v3 local lane-anchor residual eval: add a local forward lane segment to the
 # learned plan using the base planner's own displacement profile.

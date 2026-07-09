@@ -1,4 +1,4 @@
-_base_ = ['./base_e2e_lidar_plan_mapfuse.py']
+_base_ = ['../base_e2e_lidar_plan_mapfuse.py']
 
 # Ablation-eval config: reuse the map-trained checkpoint but turn OFF the
 # planning-head map-lane attention at inference. This isolates how much the

@@ -1,4 +1,4 @@
-_base_ = ['./base_e2e_lidar_plan_mapfuse_v2.py']
+_base_ = ['../base_e2e_lidar_plan_mapfuse_v2.py']
 
 # v3 lane-anchor sanity eval: bypass query-space map residuals and use the
 # nearest HD-map centerline as the ego trajectory anchor at the planning output.

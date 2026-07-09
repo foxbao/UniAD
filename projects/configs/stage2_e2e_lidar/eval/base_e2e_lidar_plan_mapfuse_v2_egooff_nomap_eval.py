@@ -1,4 +1,4 @@
-_base_ = ['./base_e2e_lidar_plan_mapfuse_v2.py']
+_base_ = ['../base_e2e_lidar_plan_mapfuse_v2.py']
 
 # Diagnostic-eval config (ego-status ablation, map OFF). Fourth cell of the 2x2
 # ego x map ablation matrix on the v2 checkpoint: sdc_track_query zeroed AND the

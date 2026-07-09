@@ -1,4 +1,4 @@
-_base_ = ['./base_e2e_lidar_plan_mapfuse_v2.py']
+_base_ = ['../base_e2e_lidar_plan_mapfuse_v2.py']
 
 # v3 local-relative lane-anchor residual eval: add a short ego-relative lane
 # segment to the learned plan. This is a diagnostic companion to the replace

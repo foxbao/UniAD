@@ -1,4 +1,4 @@
-_base_ = ['./base_e2e_lidar_plan_mapfuse_v2.py']
+_base_ = ['../base_e2e_lidar_plan_mapfuse_v2.py']
 
 # Ablation-eval companion for base_e2e_lidar_plan_mapfuse_v2. Reuse the v2
 # map-trained checkpoint but turn OFF the planning-head map-lane attention at

@@ -1,4 +1,4 @@
-_base_ = ['./base_e2e_lidar_plan_mapfuse_v2.py']
+_base_ = ['../base_e2e_lidar_plan_mapfuse_v2.py']
 
 # v3 best-endpoint lane-anchor blend sanity eval: use the same multi-candidate
 # bidirectional local-relative map anchor as the hard-replace test, but only

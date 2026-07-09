@@ -446,7 +446,7 @@ multi-candidate lane selection and local-relative sampling. The gain is modest b
 on epoch_4: about **1.3% avg.L2** without worsening collision or detection/NDS.
 
 **Current best eval config:**
-`projects/configs/stage2_e2e_lidar/base_e2e_lidar_plan_mapfuse_v3_laneanchor_bestendpoint_blend03_eval.py`
+`projects/configs/stage2_e2e_lidar/eval/`
 
 **Logs:**
 
@@ -566,7 +566,7 @@ MASTER_PORT=28693 ./tools/uniad_dist_eval.sh \
   projects/configs/stage2_e2e_lidar/base_e2e_lidar_plan_mapfuse_v2.py $CKPT 4
 # map-OFF (ablation)
 MASTER_PORT=28694 ./tools/uniad_dist_eval.sh \
-  projects/configs/stage2_e2e_lidar/base_e2e_lidar_plan_mapfuse_v2_nomap_eval.py $CKPT 4
+  projects/configs/stage2_e2e_lidar/eval/ $CKPT 4
 ```
 
 Planning metrics print near the end of each eval log

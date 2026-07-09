@@ -1,4 +1,4 @@
-_base_ = ['./base_e2e_lidar_plan_mapfuse_v2.py']
+_base_ = ['../base_e2e_lidar_plan_mapfuse_v2.py']
 
 # Diagnostic-eval config (ego-status ablation, map ON). Reuse the v2 checkpoint
 # but zero the sdc_track_query at inference, severing the ego position/velocity

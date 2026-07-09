@@ -1,4 +1,4 @@
-_base_ = ['./base_e2e_lidar_plan_mapfuse_v2.py']
+_base_ = ['../base_e2e_lidar_plan_mapfuse_v2.py']
 
 # v3 sanity eval: force the planning-head map-attention context to perturb the
 # plan query directly, bypassing the learned gate/delta projection that proved

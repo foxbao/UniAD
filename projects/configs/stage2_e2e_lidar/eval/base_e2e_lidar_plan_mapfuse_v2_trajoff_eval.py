@@ -1,4 +1,4 @@
-_base_ = ['./base_e2e_lidar_plan_mapfuse_v2.py']
+_base_ = ['../base_e2e_lidar_plan_mapfuse_v2.py']
 
 # Diagnostic-eval: ego-status ablation mode='traj', map ON.
 # Part of the ego x map ablation matrix on the v2 checkpoint. mode='traj' zeros

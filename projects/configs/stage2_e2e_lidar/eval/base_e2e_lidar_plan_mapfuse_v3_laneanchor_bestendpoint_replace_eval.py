@@ -1,4 +1,4 @@
-_base_ = ['./base_e2e_lidar_plan_mapfuse_v2.py']
+_base_ = ['../base_e2e_lidar_plan_mapfuse_v2.py']
 
 # v3 best-endpoint lane-anchor sanity eval: consider multiple nearby HD-map
 # centerlines, sample each as a local ego-relative short-horizon trajectory,
