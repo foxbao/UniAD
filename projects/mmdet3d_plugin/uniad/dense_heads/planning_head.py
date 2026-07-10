@@ -356,16 +356,30 @@ class PlanningHeadSingleMode(nn.Module):
             outs_map, plan_query.size(1), plan_query.device,
             plan_query.dtype)
         if lane_mem is None:
-            return plan_query
+            return plan_query, None
         map_context = self.map_attn_module(
             plan_query, lane_mem, memory_key_padding_mask=lane_mask)
         if self.map_fusion_mode == 'force_residual':
-            return plan_query + self.map_force_scale * (
-                map_context - plan_query)
-        map_delta = self.map_delta_proj(map_context - plan_query)
-        map_gate = torch.sigmoid(
-            self.map_gate(torch.cat([plan_query, map_context], dim=-1)))
-        return plan_query + map_gate * map_delta
+            map_delta = map_context - plan_query
+            applied_delta = self.map_force_scale * map_delta
+            gate_mean = plan_query.new_tensor(self.map_force_scale)
+        else:
+            map_delta = self.map_delta_proj(map_context - plan_query)
+            map_gate = torch.sigmoid(
+                self.map_gate(torch.cat([plan_query, map_context], dim=-1)))
+            applied_delta = map_gate * map_delta
+            gate_mean = map_gate.mean()
+
+        delta_norm = map_delta.norm(dim=-1).mean()
+        applied_norm = applied_delta.norm(dim=-1).mean()
+        query_norm = plan_query.norm(dim=-1).mean().clamp_min(1e-6)
+        stats = dict(
+            map_fusion_gate_mean=gate_mean,
+            map_fusion_delta_norm=delta_norm,
+            map_fusion_applied_norm=applied_norm,
+            map_fusion_relative_norm=applied_norm / query_norm,
+        )
+        return plan_query + applied_delta, stats
 
     def _lane_anchor_trajectory(self, outs_map, device, dtype, ref_traj=None):
         if (self.lane_anchor_mode == 'none' or outs_map is None
@@ -608,7 +622,8 @@ class PlanningHeadSingleMode(nn.Module):
       
         pos_embed = self.pos_embed.weight
         plan_query = plan_query + pos_embed[None]  # [1, 1, 256]
-        plan_query = self._apply_map_lane_attention(plan_query, outs_map)
+        plan_query, map_fusion_stats = self._apply_map_lane_attention(
+            plan_query, outs_map)
         
         # plan_query: [1, 1, 256]
         # bev_feat: [40000, 1, 256]
@@ -653,6 +668,8 @@ class PlanningHeadSingleMode(nn.Module):
             ret['lane_anchor_gate'] = lane_anchor_gate
         if lane_anchor_residual is not None:
             ret['lane_anchor_residual'] = lane_anchor_residual
+        if map_fusion_stats is not None:
+            ret.update(map_fusion_stats)
         return ret
 
     def collision_optimization(self, sdc_traj_all, occ_mask):
@@ -830,4 +847,11 @@ class PlanningHeadSingleMode(nn.Module):
             loss_dict['loss_lane_anchor_static_gate'] = loss_static_gate
         if planning_bucket is not None:
             loss_dict['motion_bucket_weight'] = planning_weight.detach()
+        for key in (
+                'map_fusion_gate_mean',
+                'map_fusion_delta_norm',
+                'map_fusion_applied_norm',
+                'map_fusion_relative_norm'):
+            if key in outs_planning:
+                loss_dict[key] = outs_planning[key].detach()
         return loss_dict
