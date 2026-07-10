@@ -37,6 +37,7 @@ class PlanningHeadSingleMode(nn.Module):
                  map_gate_init=-2.0,
                  map_delta_init='zeros',
                  map_fusion_mode='gated_residual',
+                 map_fusion_position='pre_bev',
                  map_force_scale=1.0,
                  lane_anchor_mode='none',
                  lane_anchor_scale=1.0,
@@ -125,6 +126,10 @@ class PlanningHeadSingleMode(nn.Module):
             'map_fusion_mode must be gated_residual/force_residual, got '
             f'{map_fusion_mode}')
         self.map_fusion_mode = map_fusion_mode
+        assert map_fusion_position in ('pre_bev', 'post_bev'), (
+            'map_fusion_position must be pre_bev/post_bev, got '
+            f'{map_fusion_position}')
+        self.map_fusion_position = map_fusion_position
         self.map_force_scale = float(map_force_scale)
         assert lane_anchor_mode in (
                 'none', 'replace', 'residual', 'blend', 'learned_blend'), (
@@ -164,16 +169,29 @@ class PlanningHeadSingleMode(nn.Module):
             f'{lane_anchor_direction_mode}')
         self.lane_anchor_direction_mode = lane_anchor_direction_mode
         if use_map_lane:
+            module_prefix = (
+                'post_map' if map_fusion_position == 'post_bev' else 'map')
             map_attn_layer = nn.TransformerDecoderLayer(
                 embed_dims, 8, dim_feedforward=embed_dims*2,
                 dropout=0.1, batch_first=False)
-            self.map_attn_module = nn.TransformerDecoder(
-                map_attn_layer, map_attn_layers)
-            self.map_delta_proj = nn.Linear(embed_dims, embed_dims)
-            self.map_gate = nn.Sequential(
-                nn.Linear(embed_dims * 2, embed_dims),
-                nn.ReLU(inplace=True),
+            setattr(
+                self,
+                f'{module_prefix}_attn_module',
+                nn.TransformerDecoder(map_attn_layer, map_attn_layers))
+            setattr(
+                self,
+                f'{module_prefix}_delta_proj',
                 nn.Linear(embed_dims, embed_dims))
+            setattr(
+                self,
+                f'{module_prefix}_gate',
+                nn.Sequential(
+                    nn.Linear(embed_dims * 2, embed_dims),
+                    nn.ReLU(inplace=True),
+                    nn.Linear(embed_dims, embed_dims)))
+            map_delta_proj = getattr(
+                self, f'{module_prefix}_delta_proj')
+            map_gate = getattr(self, f'{module_prefix}_gate')
             # map_delta_init controls how the map->plan residual projection
             # starts. 'zeros' (default, preserves the historical behaviour of
             # base_e2e_lidar_plan_mapfuse) makes the map delta identically 0 at
@@ -186,11 +204,11 @@ class PlanningHeadSingleMode(nn.Module):
             assert map_delta_init in ('zeros', 'small'), (
                 f'map_delta_init must be zeros/small, got {map_delta_init}')
             if map_delta_init == 'zeros':
-                nn.init.zeros_(self.map_delta_proj.weight)
+                nn.init.zeros_(map_delta_proj.weight)
             else:
-                nn.init.xavier_uniform_(self.map_delta_proj.weight, gain=0.1)
-            nn.init.zeros_(self.map_delta_proj.bias)
-            nn.init.constant_(self.map_gate[-1].bias, map_gate_init)
+                nn.init.xavier_uniform_(map_delta_proj.weight, gain=0.1)
+            nn.init.zeros_(map_delta_proj.bias)
+            nn.init.constant_(map_gate[-1].bias, map_gate_init)
         
         self.mlp_fuser = nn.Sequential(
                 nn.Linear(embed_dims*fuser_dim, embed_dims),
@@ -357,16 +375,26 @@ class PlanningHeadSingleMode(nn.Module):
             plan_query.dtype)
         if lane_mem is None:
             return plan_query, None
-        map_context = self.map_attn_module(
+        module_prefix = (
+            'post_map'
+            if self.map_fusion_position == 'post_bev'
+            else 'map')
+        map_attn_module = getattr(
+            self, f'{module_prefix}_attn_module')
+        map_delta_proj = getattr(
+            self, f'{module_prefix}_delta_proj')
+        map_gate_module = getattr(self, f'{module_prefix}_gate')
+        map_context = map_attn_module(
             plan_query, lane_mem, memory_key_padding_mask=lane_mask)
         if self.map_fusion_mode == 'force_residual':
             map_delta = map_context - plan_query
             applied_delta = self.map_force_scale * map_delta
             gate_mean = plan_query.new_tensor(self.map_force_scale)
         else:
-            map_delta = self.map_delta_proj(map_context - plan_query)
+            map_delta = map_delta_proj(map_context - plan_query)
             map_gate = torch.sigmoid(
-                self.map_gate(torch.cat([plan_query, map_context], dim=-1)))
+                map_gate_module(
+                    torch.cat([plan_query, map_context], dim=-1)))
             applied_delta = map_gate * map_delta
             gate_mean = map_gate.mean()
 
@@ -622,12 +650,17 @@ class PlanningHeadSingleMode(nn.Module):
       
         pos_embed = self.pos_embed.weight
         plan_query = plan_query + pos_embed[None]  # [1, 1, 256]
-        plan_query, map_fusion_stats = self._apply_map_lane_attention(
-            plan_query, outs_map)
+        map_fusion_stats = None
+        if self.map_fusion_position == 'pre_bev':
+            plan_query, map_fusion_stats = self._apply_map_lane_attention(
+                plan_query, outs_map)
         
         # plan_query: [1, 1, 256]
         # bev_feat: [40000, 1, 256]
         plan_query = self.attn_module(plan_query, bev_feat)   # [1, 1, 256]
+        if self.map_fusion_position == 'post_bev':
+            plan_query, map_fusion_stats = self._apply_map_lane_attention(
+                plan_query, outs_map)
         
         sdc_traj_all = self.reg_branch(plan_query).view((-1, self.planning_steps, 2))
         sdc_traj_all[...,:2] = torch.cumsum(sdc_traj_all[...,:2], dim=1)
