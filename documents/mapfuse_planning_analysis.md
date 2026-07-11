@@ -689,6 +689,32 @@ subset run to close a meaningful part of the `0.06935` oracle-selection gap.
 Only after that should C2 be trained on the full set. A map-off causal ablation
 remains mandatory for any trained successor.
 
+### C2.1: straight-through discrete selector
+
+C2.1 is implemented in
+`base_e2e_lidar_plan_mapfuse_v4_c21_st_selector_train.py`. It changes only the
+candidate selection relaxation:
+
+- Forward train/test uses the selector's hard argmax, so the anchor is always
+  one surveyed lane candidate rather than a coordinate average of lanes.
+- During training, `hard - soft.detach() + soft` supplies a straight-through
+  softmax gradient, allowing planning ADE to update selector logits.
+- Candidate sampling still uses the frozen base trajectory and no GT geometry;
+  GT is used only by the selector supervision score.
+- C1 and C2 modes remain unchanged and their checkpoints remain reproducible.
+
+A deterministic tensor test verified that train and eval forward outputs are
+exactly the argmax candidate, while backpropagation produces nonzero selector
+logit gradients. A 100-sample, 5-GPU smoke train then completed 20/20 iterations
+without DDP mismatch, NaN, or process residue. At iteration 20, `loss_ade` was
+`0.2416`, selector loss `1.4383`, and gradient norm `1.8742`. This validates the
+implementation only; the tiny run is not evidence of planning improvement.
+
+The promotion gate is a paired pilot: train C2.1 on a fixed 2000-sample train
+subset, then compare C1 and C2.1 on the same 1500-sample validation subset. Do
+not start full training unless C2.1 improves hard-anchor selection and final
+planning L2 without a collision regression.
+
 Reproduce the zero-shot audit with:
 
 ```bash

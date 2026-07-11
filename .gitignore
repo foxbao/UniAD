@@ -160,6 +160,6 @@ onnx/
 *.py.*backup
 
 # Sensitive local materials; do not publish to public remotes.
-documents/
+documents/patent_*/
 outputs/
 tools/analysis_tools/anchor_viz_out/

@@ -162,9 +162,11 @@ class PlanningHeadSingleMode(nn.Module):
         self.lane_anchor_reference = lane_anchor_reference
         assert lane_anchor_select_mode in (
                 'first_point', 'closest_point', 'best_endpoint',
-                'learned_selector', 'soft_selector'), (
+                'learned_selector', 'soft_selector',
+                'straight_through_selector'), (
             'lane_anchor_select_mode must be first_point/closest_point/'
-            'best_endpoint/learned_selector/soft_selector, got '
+            'best_endpoint/learned_selector/soft_selector/'
+            'straight_through_selector, got '
             f'{lane_anchor_select_mode}')
         self.lane_anchor_select_mode = lane_anchor_select_mode
         self.lane_anchor_candidate_k = int(lane_anchor_candidate_k)
@@ -275,7 +277,9 @@ class PlanningHeadSingleMode(nn.Module):
             nn.init.zeros_(self.lane_anchor_residual_head[-1].weight)
             nn.init.zeros_(self.lane_anchor_residual_head[-1].bias)
 
-        if lane_anchor_select_mode in ('learned_selector', 'soft_selector'):
+        if lane_anchor_select_mode in (
+                'learned_selector', 'soft_selector',
+                'straight_through_selector'):
             selector_ctl_dim = embed_dims + planning_steps * 2 * 3
             self.lane_anchor_selector_head = nn.Sequential(
                 nn.Linear(selector_ctl_dim, embed_dims // 2),
@@ -605,6 +609,20 @@ class PlanningHeadSingleMode(nn.Module):
             gt_mask = gt_mask.to(device=base_traj.device, dtype=torch.bool)
         return gt_ref, gt_mask
 
+    def _select_learned_anchor(self, anchors, pred_idx, selector_probs):
+        if self.lane_anchor_select_mode == 'soft_selector':
+            weights = selector_probs
+        else:
+            hard_weights = F.one_hot(
+                pred_idx, num_classes=anchors.size(1)).to(selector_probs)
+            if (self.training and self.lane_anchor_select_mode ==
+                    'straight_through_selector'):
+                weights = (
+                    hard_weights - selector_probs.detach() + selector_probs)
+            else:
+                weights = hard_weights
+        return torch.sum(weights[..., None, None] * anchors, dim=1)
+
     def _learned_selector_lane_anchor(self, outs_map, plan_query, base_traj,
                                       sdc_planning, sdc_planning_mask):
         if (self.lane_anchor_mode == 'none' or outs_map is None
@@ -647,9 +665,10 @@ class PlanningHeadSingleMode(nn.Module):
         pred_idx = selector_logits.argmax(dim=1)
         selector_probs = torch.softmax(
             selector_logits / self.lane_anchor_selector_temperature, dim=1)
-        if self.lane_anchor_select_mode == 'soft_selector':
-            lane_anchor = torch.sum(
-                selector_probs[..., None, None] * anchors, dim=1)
+        if self.lane_anchor_select_mode in (
+                'soft_selector', 'straight_through_selector'):
+            lane_anchor = self._select_learned_anchor(
+                anchors, pred_idx, selector_probs)
         elif self.training and self.lane_anchor_selector_teacher_force:
             select_idx = oracle_target
             batch_idx = torch.arange(
@@ -856,7 +875,8 @@ class PlanningHeadSingleMode(nn.Module):
         lane_anchor_residual = None
         lane_selector_stats = None
         if self.lane_anchor_select_mode in (
-                'learned_selector', 'soft_selector'):
+                'learned_selector', 'soft_selector',
+                'straight_through_selector'):
             lane_anchor, lane_selector_stats = \
                 self._learned_selector_lane_anchor(
                     outs_map, plan_query, sdc_traj_all, sdc_planning,
@@ -1075,7 +1095,8 @@ class PlanningHeadSingleMode(nn.Module):
                 self.lane_anchor_static_gate_loss_weight
             loss_dict['loss_lane_anchor_static_gate'] = loss_static_gate
         if (self.training and self.lane_anchor_select_mode in
-                ('learned_selector', 'soft_selector')):
+                ('learned_selector', 'soft_selector',
+                 'straight_through_selector')):
             selector_zero = sum(
                 parameter.sum() * 0.0
                 for parameter in self.lane_anchor_selector_head.parameters())
