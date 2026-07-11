@@ -634,6 +634,71 @@ the final planning loss differentiable with respect to selector logits and
 removes teacher forcing. It starts from C1 epoch1 and trains selector, anchor
 gate, and anchor residual heads for one epoch.
 
+### C2 pre-training audit: current route is not yet effective (2026-07-11)
+
+The first 5-GPU C2 launch did not train: a batch with no valid planning GT on
+one rank omitted selector log keys, so MMDistributedDataParallel stopped at the
+first iteration with `loss log variables are different across GPUs`. Selector
+training now emits the same loss/stat keys on every rank, including zero-valued
+keys for ranks with no valid target. A 20-sample, 5-GPU smoke run completed all
+four iterations after the fix.
+
+More importantly, the original C0 `avg.L2=0.2653` is not a realizable C2 upper
+bound. C0 used GT future speed/distance and GT direction to construct its lane
+anchor. C2 must construct candidates from the frozen base prediction. The
+evaluator now reports true planning L2 for three deployable candidate outputs:
+
+- `oracle anchor`: best candidate chosen with GT, but candidate geometry is
+  generated only from the frozen base trajectory and map.
+- `pred anchor`: hard candidate selected by the C1 selector.
+- `selected anchor`: temperature-0.5 soft mixture used by C2.
+
+Full-validation zero-shot evaluation loaded C1 epoch1 into the C2 structure,
+without any C2 optimization:
+
+| output | L2@1s | L2@2s | L2@3s | avg.L2 |
+|---|---:|---:|---:|---:|
+| realizable oracle anchor | 0.2555 | 0.5714 | 0.9396 | **0.58884** |
+| selector hard anchor | 0.2814 | 0.6428 | 1.0809 | **0.66837** |
+| selector soft anchor | 0.2766 | 0.6341 | 1.0639 | **0.65819** |
+| C2 zero-shot final plan | 0.2595 | 0.5939 | 1.0234 | **0.62562** |
+
+The C2 zero-shot final collision rate is `0.9477%`. For comparison, A is
+`0.60495 / 0.9637%` and C1 is `0.62966 / 0.9483%` for avg.L2 / collision.
+Soft selection recovers only `0.00404` avg.L2 from C1 and remains `0.02067`
+(`3.4%`) worse than A. The realizable oracle is only `0.01611` (`2.7%`) better
+than A, far smaller than the optimistic C0 gap.
+
+The selector is also too uncertain for geometric averaging: overall entropy is
+`2.342`, max probability is `0.148`, and the soft anchor is `0.06935` avg.L2
+worse than the realizable oracle. Static and turning remain the weakest groups:
+
+| split | oracle anchor | hard anchor | soft anchor |
+|---|---:|---:|---:|
+| Static | 0.125 | 0.309 | 0.269 |
+| Slow | 0.520 | 0.591 | 0.580 |
+| MovingStraight | 0.730 | 0.778 | 0.778 |
+| Turning | 0.857 | 1.038 | 0.995 |
+
+Decision: do not spend a full epoch on the current C2 unchanged. It has a
+small candidate-level upper bound, but neither the learned selector nor the
+soft mixture realizes it, and averaging multiple lanes can create a trajectory
+that is not itself a lane. The next experiment should first improve candidate
+construction/representation and selector supervision, then require a short
+subset run to close a meaningful part of the `0.06935` oracle-selection gap.
+Only after that should C2 be trained on the full set. A map-off causal ablation
+remains mandatory for any trained successor.
+
+Reproduce the zero-shot audit with:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3,4 MASTER_PORT=28763 \
+  ./tools/uniad_dist_eval.sh \
+  projects/configs/stage2_e2e_lidar/eval/base_e2e_lidar_plan_mapfuse_v4_c2_soft_selector_zeroshot_eval.py \
+  projects/work_dirs/stage2_e2e_lidar/base_e2e_lidar_plan_mapfuse_v4_c1_lane_selector_train/epoch_1.pth \
+  5
+```
+
 Recommended C1 direction:
 
 - Generate or supervise a discrete lane-anchor target from GT future endpoint /

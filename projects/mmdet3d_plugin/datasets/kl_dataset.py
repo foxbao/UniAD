@@ -1510,9 +1510,14 @@ class KlDataset(Custom3DDataset):
         }
 
         def new_selector_stats():
-            return dict(n=0, correct=0, oracle_sum=0.0, pred_sum=0.0,
-                        selected_sum=0.0, entropy_sum=0.0,
-                        max_prob_sum=0.0, num_valid_sum=0.0)
+            stats = dict(n=0, correct=0, oracle_sum=0.0, pred_sum=0.0,
+                         selected_sum=0.0, entropy_sum=0.0,
+                         max_prob_sum=0.0, num_valid_sum=0.0)
+            for name in ('oracle', 'pred', 'selected'):
+                stats[f'{name}_eval_l2_sum'] = np.zeros(T_max)
+                stats[f'{name}_eval_l2_n'] = np.zeros(
+                    T_max, dtype=np.int64)
+            return stats
 
         selector_stats = new_selector_stats()
         per_bucket_selector = {
@@ -1526,7 +1531,7 @@ class KlDataset(Custom3DDataset):
             value = np.asarray(self._planning_to_numpy(value)).reshape(-1)
             return value[0].item() if value.size else default
 
-        def add_selector_stats(agg, blob):
+        def add_selector_stats(agg, blob, gt_xy, valid_steps, T):
             valid = selector_scalar(
                 blob, 'lane_anchor_selector_valid', False)
             if not bool(valid):
@@ -1553,6 +1558,26 @@ class KlDataset(Custom3DDataset):
                 blob, 'lane_anchor_selector_max_prob', 0.0))
             agg['num_valid_sum'] += float(selector_scalar(
                 blob, 'lane_anchor_selector_num_valid', 0.0))
+            anchor_keys = {
+                'oracle': 'lane_anchor_selector_oracle_anchor',
+                'pred': 'lane_anchor_selector_pred_anchor',
+                'selected': 'lane_anchor_selector_selected_anchor',
+            }
+            for name, key in anchor_keys.items():
+                anchor = blob.get(key)
+                if anchor is None:
+                    continue
+                anchor = np.asarray(
+                    self._planning_to_numpy(anchor), dtype=np.float64)
+                anchor = anchor.reshape(-1, anchor.shape[-1])
+                anchor_T = min(T, len(anchor))
+                error = np.linalg.norm(
+                    anchor[:anchor_T, :2] - gt_xy[:anchor_T, :2], axis=-1)
+                for step in range(anchor_T):
+                    if not valid_steps[step]:
+                        continue
+                    agg[f'{name}_eval_l2_sum'][step] += float(error[step])
+                    agg[f'{name}_eval_l2_n'][step] += 1
 
         def wrap_pi(angle):
             return (angle + math.pi) % (2.0 * math.pi) - math.pi
@@ -1699,9 +1724,12 @@ class KlDataset(Custom3DDataset):
             T = min(T_max, pred_xy.shape[0], gt_xy.shape[0], len(mask))
             err = np.linalg.norm(pred_xy[:T, :2] - gt_xy[:T, :2], axis=-1)
             bucket_name = planning_bucket(gt_plan, mask)
-            add_selector_stats(selector_stats, pred_blob)
+            add_selector_stats(
+                selector_stats, pred_blob, gt_xy, mask, T)
             if bucket_name in per_bucket_selector:
-                add_selector_stats(per_bucket_selector[bucket_name], pred_blob)
+                add_selector_stats(
+                    per_bucket_selector[bucket_name], pred_blob,
+                    gt_xy, mask, T)
             add_l2(dict(l2_sum=l2_sum, l2_n=l2_n), err, mask, T)
             add_final_disp(disp_stats, pred_xy, gt_xy, mask, T)
             if cmd_id in per_cmd:
@@ -1912,10 +1940,26 @@ class KlDataset(Custom3DDataset):
             ret_dict[f'{prefix}/max_prob'] = max_prob
             ret_dict[f'{prefix}/num_candidates'] = num_valid
             ret_dict[f'{prefix}/N'] = n
+            anchor_avg_l2 = {}
+            for name in ('oracle', 'pred', 'selected'):
+                values = []
+                for step, label in zip(eval_steps, labels):
+                    count = agg[f'{name}_eval_l2_n'][step]
+                    value = (agg[f'{name}_eval_l2_sum'][step] / count
+                             if count > 0 else float('nan'))
+                    ret_dict[f'{prefix}/{name}_anchor_L2_{label}'] = value
+                    values.append(value)
+                anchor_avg_l2[name] = float(np.nanmean(values))
+                ret_dict[f'{prefix}/{name}_anchor_avg.L2'] = \
+                    anchor_avg_l2[name]
             return (
                 f'  {title:14s} N={n:5d}  acc {100.0 * acc:5.1f}%  '
                 f'oracle {oracle:.3f}  pred {pred:.3f}  '
-                f'gap {pred - oracle:.3f}  selected {selected:.3f}')
+                f'gap {pred - oracle:.3f}  selected {selected:.3f}  '
+                f'anchor avg.L2 o/p/s '
+                f'{anchor_avg_l2["oracle"]:.3f}/'
+                f'{anchor_avg_l2["pred"]:.3f}/'
+                f'{anchor_avg_l2["selected"]:.3f}')
 
         selector_lines = ['', 'Lane-anchor selector diagnostics:']
         overall_line = emit_selector_metrics(

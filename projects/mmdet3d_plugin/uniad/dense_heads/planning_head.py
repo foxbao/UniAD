@@ -672,6 +672,10 @@ class PlanningHeadSingleMode(nn.Module):
             lane_anchor, has_candidate, score_ref, gt_mask)
         entropy = -(selector_probs * selector_probs.clamp_min(1e-8).log()) \
             .sum(dim=1)
+        batch_idx = torch.arange(
+            base_traj.size(0), device=base_traj.device)
+        oracle_anchor = anchors[batch_idx, oracle_target]
+        pred_anchor = anchors[batch_idx, pred_idx]
         stats = dict(
             lane_anchor_selector_logits=selector_logits,
             lane_anchor_selector_probs=selector_probs,
@@ -686,6 +690,9 @@ class PlanningHeadSingleMode(nn.Module):
             lane_anchor_selector_selected_l2=selected_l2,
             lane_anchor_selector_entropy=entropy,
             lane_anchor_selector_max_prob=selector_probs.max(dim=1).values,
+            lane_anchor_selector_oracle_anchor=oracle_anchor,
+            lane_anchor_selector_pred_anchor=pred_anchor,
+            lane_anchor_selector_selected_anchor=lane_anchor,
         )
         return lane_anchor, stats
 
@@ -1067,41 +1074,51 @@ class PlanningHeadSingleMode(nn.Module):
             loss_static_gate = loss_static_gate * \
                 self.lane_anchor_static_gate_loss_weight
             loss_dict['loss_lane_anchor_static_gate'] = loss_static_gate
-        if (self.lane_anchor_selector_loss_weight > 0
-                and 'lane_anchor_selector_logits' in outs_planning):
-            logits = outs_planning['lane_anchor_selector_logits']
-            target = outs_planning['lane_anchor_selector_target']
-            valid = outs_planning.get('lane_anchor_selector_valid')
-            if valid is None:
-                valid = torch.ones_like(target, dtype=torch.bool)
-            if valid.any():
-                loss_selector = F.cross_entropy(logits[valid], target[valid])
-                loss_selector = (
-                    loss_selector * self.lane_anchor_selector_loss_weight)
-                loss_dict['loss_lane_anchor_selector'] = loss_selector
-                pred = outs_planning['lane_anchor_selector_pred']
-                acc = (pred[valid] == target[valid]).to(logits).mean()
-                loss_dict['lane_anchor_selector_acc'] = acc.detach()
-                loss_dict['lane_anchor_selector_oracle_l2'] = (
-                    outs_planning['lane_anchor_selector_oracle_l2'][valid]
-                    .mean().detach())
-                loss_dict['lane_anchor_selector_pred_l2'] = (
-                    outs_planning['lane_anchor_selector_pred_l2'][valid]
-                    .mean().detach())
+        if (self.training and self.lane_anchor_select_mode in
+                ('learned_selector', 'soft_selector')):
+            selector_zero = sum(
+                parameter.sum() * 0.0
+                for parameter in self.lane_anchor_selector_head.parameters())
+            loss_dict['loss_lane_anchor_selector'] = selector_zero
+            for key in (
+                    'lane_anchor_selector_valid_rate',
+                    'lane_anchor_selector_acc',
+                    'lane_anchor_selector_oracle_l2',
+                    'lane_anchor_selector_pred_l2',
+                    'lane_anchor_selector_selected_l2',
+                    'lane_anchor_selector_entropy',
+                    'lane_anchor_selector_max_prob'):
+                loss_dict[key] = selector_zero.detach()
+
+            if (self.lane_anchor_selector_loss_weight > 0
+                    and 'lane_anchor_selector_logits' in outs_planning):
+                logits = outs_planning['lane_anchor_selector_logits']
+                target = outs_planning['lane_anchor_selector_target']
+                valid = outs_planning.get('lane_anchor_selector_valid')
+                if valid is None:
+                    valid = torch.ones_like(target, dtype=torch.bool)
+                loss_dict['lane_anchor_selector_valid_rate'] = \
+                    valid.to(logits).mean().detach()
                 for key in (
-                        'lane_anchor_selector_selected_l2',
                         'lane_anchor_selector_entropy',
                         'lane_anchor_selector_max_prob'):
                     if key in outs_planning:
-                        loss_dict[key] = outs_planning[key][valid] \
-                            .mean().detach()
-            else:
-                loss_dict['loss_lane_anchor_selector'] = logits.sum() * 0.0
-        elif (self.training and self.lane_anchor_select_mode in
-              ('learned_selector', 'soft_selector')):
-            loss_dict['loss_lane_anchor_selector'] = sum(
-                parameter.sum() * 0.0
-                for parameter in self.lane_anchor_selector_head.parameters())
+                        loss_dict[key] = outs_planning[key].mean().detach()
+                if valid.any():
+                    loss_selector = F.cross_entropy(
+                        logits[valid], target[valid])
+                    loss_dict['loss_lane_anchor_selector'] = (
+                        loss_selector * self.lane_anchor_selector_loss_weight)
+                    pred = outs_planning['lane_anchor_selector_pred']
+                    acc = (pred[valid] == target[valid]).to(logits).mean()
+                    loss_dict['lane_anchor_selector_acc'] = acc.detach()
+                    for key in (
+                            'lane_anchor_selector_oracle_l2',
+                            'lane_anchor_selector_pred_l2',
+                            'lane_anchor_selector_selected_l2'):
+                        if key in outs_planning:
+                            loss_dict[key] = outs_planning[key][valid] \
+                                .mean().detach()
         if planning_bucket is not None:
             loss_dict['motion_bucket_weight'] = planning_weight.detach()
         for key in (

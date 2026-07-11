@@ -206,6 +206,9 @@ def _compact_planning_for_eval(planning):
             'lane_anchor_selector_selected_l2': torch.float32,
             'lane_anchor_selector_entropy': torch.float32,
             'lane_anchor_selector_max_prob': torch.float32,
+            'lane_anchor_selector_oracle_anchor': torch.float32,
+            'lane_anchor_selector_pred_anchor': torch.float32,
+            'lane_anchor_selector_selected_anchor': torch.float32,
         }
         for key, dtype in selector_field_dtypes.items():
             if key in result_planning:
