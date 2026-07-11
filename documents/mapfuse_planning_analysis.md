@@ -715,6 +715,53 @@ subset, then compare C1 and C2.1 on the same 1500-sample validation subset. Do
 not start full training unless C2.1 improves hard-anchor selection and final
 planning L2 without a collision regression.
 
+#### C2.1 pilot result
+
+The deterministic pilot used the first 24 complete training scenes (`2091`
+frames, `4.8%` of the full train set) and 419 optimizer iterations on five
+GPUs. `make_scene_subset.py` creates the same temporal subset without breaking
+scene queues. The first paired check used `kl_infos_val_sub1k_geo.pkl`: despite
+its filename it contains 1500 raw frames and produced 316 valid planning
+samples, heavily biased toward Static (`188/316`).
+
+| 1500-frame subset | C1 | C2.1 pilot | delta |
+|---|---:|---:|---:|
+| planning avg.L2 | 0.36116 | **0.33361** | -7.63% |
+| avg.Collision | 14.2577% | 14.2577% | 0 |
+| selector top-1 | 21.8% | **59.2%** | +37.4 pp |
+| hard-anchor avg.L2 | 0.34459 | **0.28604** | -17.0% |
+| selector score gap | 0.190 | **0.096** | -49.4% |
+
+Because that subset is biased, the pilot checkpoint was then evaluated on the
+full validation set (`4585` valid selector samples):
+
+| full validation | A | C1 | C2.1 pilot |
+|---|---:|---:|---:|
+| planning avg.L2 | **0.60495** | 0.62966 | 0.60656 |
+| avg.Collision | 0.9637% | 0.9483% | 0.9557% |
+| selector top-1 | - | 40.9% | **48.1%** |
+| hard-anchor avg.L2 | - | 0.66837 | **0.65512** |
+| selector score gap | - | 0.148 | **0.132** |
+
+C2.1 improves C1 avg.L2 by `0.02310` (`3.67%`) and comes within `0.00161`
+(`0.27%`) of A after seeing only 4.8% of the training set. Collision remains
+flat. Static, MovingStraight, and Turning final L2 improve relative to C1;
+Slow regresses (`0.49252 -> 0.51793`). The full-validation selector changes are:
+
+| split | C1 acc | C2.1 acc | C1 gap | C2.1 gap |
+|---|---:|---:|---:|---:|
+| Overall | 40.9% | **48.1%** | 0.148 | **0.132** |
+| Static | 15.0% | **62.2%** | 0.289 | **0.148** |
+| Slow | **49.1%** | 42.7% | **0.131** | 0.209 |
+| MovingStraight | 45.9% | **47.4%** | 0.100 | **0.084** |
+| Turning | 25.4% | **26.1%** | 0.398 | **0.330** |
+
+Decision: C2.1 passes the pilot gate and is worth one full training epoch. It
+has not yet beaten A, so the full run is still an experiment, not the new
+champion. Full-run acceptance requires avg.L2 below `0.60495`, no collision
+regression, and no material Slow-bucket regression. If Slow remains worse, add
+bucket-balanced selector supervision before changing candidate geometry again.
+
 Reproduce the zero-shot audit with:
 
 ```bash
