@@ -552,7 +552,60 @@ B1 is the next least-invasive step before a full lane-candidate planner.
 
 ---
 
-## 14. Reproduce
+## 14. C0 oracle: explicit map-anchor upper bound
+
+After A/B1/B2, the evidence is now:
+
+- A learned lane-anchor blend is the current champion (`avg.L2 0.60495`).
+- B1 pre-BEV map fusion has no measurable causal effect.
+- B2 post-attention map fusion receives gradient, but its learned residual hurts
+  the final trajectory (`avg.L2 0.6082`), and map-off returns exactly to A
+  (`avg.L2 0.60495`).
+
+The next route should therefore stop treating map as a weak hidden feature and
+instead test explicit map geometry. `tools/analyze_map_anchor_oracle.py` is the
+C0 diagnostic: it does not run the detector or train anything. It reads
+`kl_infos_val.pkl`, transforms the surveyed map lanes into each ego frame using
+`ego2global`, and asks how close a local lane-centerline anchor can get to GT
+planning if the best lane/direction were selected by oracle.
+
+Run:
+
+```bash
+cd UniAD_train/UniAD
+/home/baojiali/anaconda3/envs/uniad_train/bin/python \
+  tools/analyze_map_anchor_oracle.py
+```
+
+Full validation result:
+
+| split | N | L2@1s | L2@2s | L2@3s | avg.L2 | anchor/GT final disp |
+|---|---:|---:|---:|---:|---:|---:|
+| ALL | 4963 | 0.1637 | 0.2479 | 0.2536 | **0.2653** | 5.100 / 5.298 |
+| Static | 811 | 0.0166 | 0.0220 | 0.0266 | 0.0318 | 0.062 / 0.072 |
+| Slow | 1195 | 0.1905 | 0.3157 | 0.4342 | 0.3419 | 0.895 / 1.156 |
+| MovingStraight | 2816 | 0.1915 | 0.2752 | 0.2284 | 0.2960 | 8.360 / 8.596 |
+| Turning | 141 | 0.1947 | 0.3510 | 0.4745 | 0.3464 | 4.605 / 4.576 |
+
+Compared with A epoch1 (`avg.L2 0.60495`), the oracle lane-anchor upper bound is
+`-0.3397` avg.L2. This is a strong positive signal: the surveyed map geometry is
+not useless. The failure is that the current planner cannot select/use the right
+map anchor from BEV/query features. C1 should therefore make map-anchor selection
+and conditioning explicit instead of adding another latent feature-fusion block.
+
+Recommended C1 direction:
+
+- Generate or supervise a discrete lane-anchor target from GT future endpoint /
+  short-horizon trajectory.
+- Let the planner predict/select among nearby candidate lane anchors.
+- Condition trajectory regression on the selected anchor, with A as the fallback
+  base trajectory.
+- Keep C0 as the gate: if future C1 cannot beat A, inspect anchor selection
+  accuracy before tuning trajectory regression.
+
+---
+
+## 15. Reproduce
 
 ```bash
 cd UniAD_train/UniAD
