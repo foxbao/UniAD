@@ -1509,6 +1509,51 @@ class KlDataset(Custom3DDataset):
             for name in obstacle_names
         }
 
+        def new_selector_stats():
+            return dict(n=0, correct=0, oracle_sum=0.0, pred_sum=0.0,
+                        selected_sum=0.0, entropy_sum=0.0,
+                        max_prob_sum=0.0, num_valid_sum=0.0)
+
+        selector_stats = new_selector_stats()
+        per_bucket_selector = {
+            name: new_selector_stats() for name in bucket_names
+        }
+
+        def selector_scalar(blob, key, default=None):
+            value = blob.get(key)
+            if value is None:
+                return default
+            value = np.asarray(self._planning_to_numpy(value)).reshape(-1)
+            return value[0].item() if value.size else default
+
+        def add_selector_stats(agg, blob):
+            valid = selector_scalar(
+                blob, 'lane_anchor_selector_valid', False)
+            if not bool(valid):
+                return
+            target = selector_scalar(blob, 'lane_anchor_selector_target')
+            pred = selector_scalar(blob, 'lane_anchor_selector_pred')
+            oracle = selector_scalar(blob, 'lane_anchor_selector_oracle_l2')
+            pred_l2 = selector_scalar(blob, 'lane_anchor_selector_pred_l2')
+            selected = selector_scalar(
+                blob, 'lane_anchor_selector_selected_l2', pred_l2)
+            values = (target, pred, oracle, pred_l2, selected)
+            if any(value is None for value in values):
+                return
+            if not np.isfinite([oracle, pred_l2, selected]).all():
+                return
+            agg['n'] += 1
+            agg['correct'] += int(int(pred) == int(target))
+            agg['oracle_sum'] += float(oracle)
+            agg['pred_sum'] += float(pred_l2)
+            agg['selected_sum'] += float(selected)
+            agg['entropy_sum'] += float(selector_scalar(
+                blob, 'lane_anchor_selector_entropy', 0.0))
+            agg['max_prob_sum'] += float(selector_scalar(
+                blob, 'lane_anchor_selector_max_prob', 0.0))
+            agg['num_valid_sum'] += float(selector_scalar(
+                blob, 'lane_anchor_selector_num_valid', 0.0))
+
         def wrap_pi(angle):
             return (angle + math.pi) % (2.0 * math.pi) - math.pi
 
@@ -1654,6 +1699,9 @@ class KlDataset(Custom3DDataset):
             T = min(T_max, pred_xy.shape[0], gt_xy.shape[0], len(mask))
             err = np.linalg.norm(pred_xy[:T, :2] - gt_xy[:T, :2], axis=-1)
             bucket_name = planning_bucket(gt_plan, mask)
+            add_selector_stats(selector_stats, pred_blob)
+            if bucket_name in per_bucket_selector:
+                add_selector_stats(per_bucket_selector[bucket_name], pred_blob)
             add_l2(dict(l2_sum=l2_sum, l2_n=l2_n), err, mask, T)
             add_final_disp(disp_stats, pred_xy, gt_xy, mask, T)
             if cmd_id in per_cmd:
@@ -1843,6 +1891,46 @@ class KlDataset(Custom3DDataset):
                 ret_dict[f'planning/{title}/Collision_{lbl}'] = cl
         if len(per_obstacle_lines) > 2:
             lines.extend(per_obstacle_lines)
+
+        def emit_selector_metrics(prefix, agg, title):
+            n = agg['n']
+            if n == 0:
+                return None
+            acc = agg['correct'] / n
+            oracle = agg['oracle_sum'] / n
+            pred = agg['pred_sum'] / n
+            selected = agg['selected_sum'] / n
+            entropy = agg['entropy_sum'] / n
+            max_prob = agg['max_prob_sum'] / n
+            num_valid = agg['num_valid_sum'] / n
+            ret_dict[f'{prefix}/acc'] = acc
+            ret_dict[f'{prefix}/oracle_score'] = oracle
+            ret_dict[f'{prefix}/pred_score'] = pred
+            ret_dict[f'{prefix}/selected_score'] = selected
+            ret_dict[f'{prefix}/score_gap'] = pred - oracle
+            ret_dict[f'{prefix}/entropy'] = entropy
+            ret_dict[f'{prefix}/max_prob'] = max_prob
+            ret_dict[f'{prefix}/num_candidates'] = num_valid
+            ret_dict[f'{prefix}/N'] = n
+            return (
+                f'  {title:14s} N={n:5d}  acc {100.0 * acc:5.1f}%  '
+                f'oracle {oracle:.3f}  pred {pred:.3f}  '
+                f'gap {pred - oracle:.3f}  selected {selected:.3f}')
+
+        selector_lines = ['', 'Lane-anchor selector diagnostics:']
+        overall_line = emit_selector_metrics(
+            'planning/selector', selector_stats, 'Overall')
+        if overall_line is not None:
+            selector_lines.append(overall_line)
+            for bucket_name in bucket_names:
+                title = bucket_title[bucket_name]
+                line = emit_selector_metrics(
+                    f'planning/selector/{title}',
+                    per_bucket_selector[bucket_name], title)
+                if line is not None:
+                    selector_lines.append(line)
+        if len(selector_lines) > 2:
+            lines.extend(selector_lines)
 
         for line in lines:
             print_log(line, logger=logger)

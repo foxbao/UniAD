@@ -472,7 +472,9 @@ class UniADMotionLidar(UniADTrackLidar):
                 'seg_out': bev_embed.new_zeros((1, 1, 1, 1, 1)).long()}
             result_planning = self.planning_head.forward_test(
                 bev_embed, outs_motion, occ_for_plan, command,
-                outs_map=outs_map, sdc_goal=kwargs.get('sdc_goal'))
+                outs_map=outs_map, sdc_goal=kwargs.get('sdc_goal'),
+                sdc_planning=sdc_planning,
+                sdc_planning_mask=sdc_planning_mask)
             results[0]['planning'] = dict(
                 planning_gt=dict(
                     segmentation=kwargs.get('gt_segmentation'),

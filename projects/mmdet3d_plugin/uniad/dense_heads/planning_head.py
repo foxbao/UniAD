@@ -53,6 +53,8 @@ class PlanningHeadSingleMode(nn.Module):
                  lane_anchor_static_disp_thresh=0.5,
                  lane_anchor_selector_loss_weight=0.0,
                  lane_anchor_selector_teacher_force=True,
+                 lane_anchor_selector_sample_teacher=True,
+                 lane_anchor_selector_temperature=1.0,
                  ablate_ego_status='none',
                  planning_motion_loss_weights=None,
                  use_goal=False,
@@ -160,9 +162,10 @@ class PlanningHeadSingleMode(nn.Module):
         self.lane_anchor_reference = lane_anchor_reference
         assert lane_anchor_select_mode in (
                 'first_point', 'closest_point', 'best_endpoint',
-                'learned_selector'), (
+                'learned_selector', 'soft_selector'), (
             'lane_anchor_select_mode must be first_point/closest_point/'
-            f'best_endpoint/learned_selector, got {lane_anchor_select_mode}')
+            'best_endpoint/learned_selector/soft_selector, got '
+            f'{lane_anchor_select_mode}')
         self.lane_anchor_select_mode = lane_anchor_select_mode
         self.lane_anchor_candidate_k = int(lane_anchor_candidate_k)
         assert self.lane_anchor_candidate_k > 0, (
@@ -176,6 +179,13 @@ class PlanningHeadSingleMode(nn.Module):
             lane_anchor_selector_loss_weight)
         self.lane_anchor_selector_teacher_force = bool(
             lane_anchor_selector_teacher_force)
+        self.lane_anchor_selector_sample_teacher = bool(
+            lane_anchor_selector_sample_teacher)
+        self.lane_anchor_selector_temperature = float(
+            lane_anchor_selector_temperature)
+        assert self.lane_anchor_selector_temperature > 0.0, (
+            'lane_anchor_selector_temperature must be > 0, got '
+            f'{lane_anchor_selector_temperature}')
         if use_map_lane:
             module_prefix = (
                 'post_map' if map_fusion_position == 'post_bev' else 'map')
@@ -265,7 +275,7 @@ class PlanningHeadSingleMode(nn.Module):
             nn.init.zeros_(self.lane_anchor_residual_head[-1].weight)
             nn.init.zeros_(self.lane_anchor_residual_head[-1].bias)
 
-        if lane_anchor_select_mode == 'learned_selector':
+        if lane_anchor_select_mode in ('learned_selector', 'soft_selector'):
             selector_ctl_dim = embed_dims + planning_steps * 2 * 3
             self.lane_anchor_selector_head = nn.Sequential(
                 nn.Linear(selector_ctl_dim, embed_dims // 2),
@@ -316,7 +326,8 @@ class PlanningHeadSingleMode(nn.Module):
         return ret_dict
 
     def forward_test(self, bev_embed, outs_motion={}, outs_occflow={},
-                     command=None, outs_map=None, sdc_goal=None):
+                     command=None, outs_map=None, sdc_goal=None,
+                     sdc_planning=None, sdc_planning_mask=None):
         sdc_traj_query = outs_motion['sdc_traj_query']
         sdc_track_query = outs_motion['sdc_track_query']
         bev_pos = outs_motion['bev_pos']
@@ -324,7 +335,9 @@ class PlanningHeadSingleMode(nn.Module):
 
         outs_planning = self(bev_embed, occ_mask, bev_pos, sdc_traj_query,
                              sdc_track_query, command, outs_map=outs_map,
-                             sdc_goal=sdc_goal)
+                             sdc_goal=sdc_goal,
+                             sdc_planning=sdc_planning,
+                             sdc_planning_mask=sdc_planning_mask)
         return outs_planning
 
     def _lane_memory(self, outs_map, batch_size, device, dtype):
@@ -478,16 +491,29 @@ class PlanningHeadSingleMode(nn.Module):
         anchor = anchor * has_lane[:, None, None].to(dtype)
         return anchor * self.lane_anchor_scale
 
-    def _anchor_ref_score(self, anchor, has_lane, ref_traj):
+    def _anchor_ref_score(self, anchor, has_lane, ref_traj, ref_mask=None):
         ref_xy = ref_traj[..., :2].to(anchor)
-        endpoint = torch.linalg.norm(anchor[:, -1] - ref_xy[:, -1], dim=-1)
-        traj = torch.linalg.norm(anchor - ref_xy, dim=-1).mean(dim=1)
+        step_error = torch.linalg.norm(anchor - ref_xy, dim=-1)
+        if ref_mask is None:
+            endpoint = step_error[:, -1]
+            traj = step_error.mean(dim=1)
+            has_ref = torch.ones_like(has_lane)
+        else:
+            ref_mask = ref_mask.to(device=anchor.device, dtype=torch.bool)
+            has_ref = ref_mask.any(dim=1)
+            last = ref_mask.long().sum(dim=1).clamp_min(1) - 1
+            endpoint = step_error.gather(1, last[:, None]).squeeze(1)
+            traj = (step_error * ref_mask.to(step_error)).sum(dim=1) / \
+                ref_mask.sum(dim=1).clamp_min(1).to(step_error)
         score = endpoint + 0.25 * traj
-        return score.masked_fill(~has_lane, float('inf'))
+        return score.masked_fill(~(has_lane & has_ref), float('inf'))
 
     def _lane_anchor_candidates(self, lane_points, lane_valid, dtype,
-                                ref_traj):
-        """Build K local lane anchors and oracle scores against ref_traj."""
+                                sample_ref_traj, score_ref_traj=None,
+                                score_ref_mask=None):
+        """Build K local lane anchors and score them against a separate ref."""
+        if score_ref_traj is None:
+            score_ref_traj = sample_ref_traj
         lane_dist = torch.linalg.norm(
             lane_points[..., :2], dim=-1).min(dim=-1).values
         lane_dist = lane_dist.masked_fill(~lane_valid, float('inf'))
@@ -501,28 +527,35 @@ class PlanningHeadSingleMode(nn.Module):
 
         cand_anchors = []
         cand_scores = []
+        cand_valid = []
         for rank in range(k):
             idx = cand_idx[:, rank]
             has_lane = torch.isfinite(lane_dist[batch_idx, idx])
             points = lane_points[batch_idx, idx]
             anchor = self._local_forward_lane_anchor(
-                points, has_lane, dtype, ref_traj)
-            score = self._anchor_ref_score(anchor, has_lane, ref_traj)
+                points, has_lane, dtype, sample_ref_traj)
 
             if self.lane_anchor_direction_mode == 'bidirectional':
                 rev_points = torch.flip(points, dims=[1])
                 rev_anchor = self._local_forward_lane_anchor(
-                    rev_points, has_lane, dtype, ref_traj)
-                rev_score = self._anchor_ref_score(
-                    rev_anchor, has_lane, ref_traj)
-                use_rev = rev_score < score
+                    rev_points, has_lane, dtype, sample_ref_traj)
+                forward_sample_score = self._anchor_ref_score(
+                    anchor, has_lane, sample_ref_traj)
+                reverse_sample_score = self._anchor_ref_score(
+                    rev_anchor, has_lane, sample_ref_traj)
+                use_rev = reverse_sample_score < forward_sample_score
                 anchor = torch.where(use_rev[:, None, None], rev_anchor, anchor)
-                score = torch.minimum(score, rev_score)
+
+            score = self._anchor_ref_score(
+                anchor, has_lane, score_ref_traj, score_ref_mask)
 
             cand_anchors.append(anchor)
             cand_scores.append(score)
+            cand_valid.append(has_lane)
 
-        return torch.stack(cand_anchors, dim=1), torch.stack(cand_scores, dim=1)
+        return (torch.stack(cand_anchors, dim=1),
+                torch.stack(cand_scores, dim=1),
+                torch.stack(cand_valid, dim=1))
 
     def _best_endpoint_lane_anchor(self, lane_points, lane_valid, dtype,
                                    ref_traj):
@@ -531,7 +564,8 @@ class PlanningHeadSingleMode(nn.Module):
             lane_points, lane_valid, dtype, ref_traj)
         if cands is None:
             return None
-        anchors, scores = cands
+        anchors, scores, candidate_valid = cands
+        scores = scores.masked_fill(~candidate_valid, float('inf'))
         batch_size = anchors.size(0)
         batch_idx = torch.arange(batch_size, device=lane_points.device)
         best = scores.argmin(dim=1)
@@ -556,6 +590,21 @@ class PlanningHeadSingleMode(nn.Module):
         logits = self.lane_anchor_selector_head(feat).squeeze(-1)
         return logits
 
+    def _planning_reference(self, sdc_planning, sdc_planning_mask, base_traj):
+        if sdc_planning is None:
+            return None, None
+        gt_ref = sdc_planning[0, :, :self.planning_steps, :2]
+        if gt_ref.size(0) != base_traj.size(0):
+            return None, None
+        gt_ref = gt_ref.to(base_traj).detach()
+        gt_mask = None
+        if sdc_planning_mask is not None:
+            gt_mask = sdc_planning_mask[0, :, :self.planning_steps]
+            if gt_mask.dim() == 3:
+                gt_mask = gt_mask.any(dim=-1)
+            gt_mask = gt_mask.to(device=base_traj.device, dtype=torch.bool)
+        return gt_ref, gt_mask
+
     def _learned_selector_lane_anchor(self, outs_map, plan_query, base_traj,
                                       sdc_planning, sdc_planning_mask):
         if (self.lane_anchor_mode == 'none' or outs_map is None
@@ -572,40 +621,71 @@ class PlanningHeadSingleMode(nn.Module):
         else:
             lane_valid = lane_valid.to(device=base_traj.device).bool()
 
-        teacher_ref = base_traj.detach()
-        if self.training and sdc_planning is not None:
-            gt_ref = sdc_planning[0, :, :self.planning_steps, :2]
-            if gt_ref.size(0) == base_traj.size(0):
-                teacher_ref = gt_ref.to(base_traj).detach()
+        base_ref = base_traj.detach()
+        gt_ref, gt_mask = self._planning_reference(
+            sdc_planning, sdc_planning_mask, base_traj)
+        sample_ref = base_ref
+        if (self.training and self.lane_anchor_selector_sample_teacher
+                and gt_ref is not None):
+            sample_ref = gt_ref
+        score_ref = gt_ref if gt_ref is not None else sample_ref
         cands = self._lane_anchor_candidates(
-            lane_points, lane_valid, base_traj.dtype, teacher_ref)
+            lane_points, lane_valid, base_traj.dtype, sample_ref,
+            score_ref_traj=score_ref, score_ref_mask=gt_mask)
         if cands is None:
             return None, None
-        anchors, oracle_scores = cands
-        finite = torch.isfinite(oracle_scores)
-        if not finite.any():
+        anchors, oracle_scores, candidate_valid = cands
+        if not candidate_valid.any():
             return None, None
 
         selector_logits = self._selector_logits(
             plan_query, base_traj, anchors)
-        selector_logits = selector_logits.masked_fill(~finite, -1e4)
-        oracle_target = oracle_scores.argmin(dim=1)
+        selector_logits = selector_logits.masked_fill(~candidate_valid, -1e4)
+        finite_oracle = torch.isfinite(oracle_scores) & candidate_valid
+        target_scores = oracle_scores.masked_fill(~finite_oracle, 1e4)
+        oracle_target = target_scores.argmin(dim=1)
         pred_idx = selector_logits.argmax(dim=1)
-        if self.training and self.lane_anchor_selector_teacher_force:
+        selector_probs = torch.softmax(
+            selector_logits / self.lane_anchor_selector_temperature, dim=1)
+        if self.lane_anchor_select_mode == 'soft_selector':
+            lane_anchor = torch.sum(
+                selector_probs[..., None, None] * anchors, dim=1)
+        elif self.training and self.lane_anchor_selector_teacher_force:
             select_idx = oracle_target
+            batch_idx = torch.arange(
+                base_traj.size(0), device=base_traj.device)
+            lane_anchor = anchors[batch_idx, select_idx]
         else:
             select_idx = pred_idx
-        batch_idx = torch.arange(base_traj.size(0), device=base_traj.device)
-        lane_anchor = anchors[batch_idx, select_idx]
+            batch_idx = torch.arange(
+                base_traj.size(0), device=base_traj.device)
+            lane_anchor = anchors[batch_idx, select_idx]
+        has_candidate = candidate_valid.any(dim=1)
+        if gt_ref is None:
+            has_target_ref = torch.zeros_like(has_candidate)
+        elif gt_mask is None:
+            has_target_ref = torch.ones_like(has_candidate)
+        else:
+            has_target_ref = gt_mask.any(dim=1)
+        target_valid = has_candidate & has_target_ref & finite_oracle.any(dim=1)
+        selected_l2 = self._anchor_ref_score(
+            lane_anchor, has_candidate, score_ref, gt_mask)
+        entropy = -(selector_probs * selector_probs.clamp_min(1e-8).log()) \
+            .sum(dim=1)
         stats = dict(
             lane_anchor_selector_logits=selector_logits,
+            lane_anchor_selector_probs=selector_probs,
             lane_anchor_selector_target=oracle_target,
             lane_anchor_selector_pred=pred_idx,
-            lane_anchor_selector_valid=finite.any(dim=1),
+            lane_anchor_selector_valid=target_valid,
+            lane_anchor_selector_num_valid=candidate_valid.sum(dim=1),
             lane_anchor_selector_oracle_l2=oracle_scores.gather(
                 1, oracle_target[:, None]).squeeze(1),
             lane_anchor_selector_pred_l2=oracle_scores.gather(
                 1, pred_idx[:, None]).squeeze(1),
+            lane_anchor_selector_selected_l2=selected_l2,
+            lane_anchor_selector_entropy=entropy,
+            lane_anchor_selector_max_prob=selector_probs.max(dim=1).values,
         )
         return lane_anchor, stats
 
@@ -768,7 +848,8 @@ class PlanningHeadSingleMode(nn.Module):
         lane_anchor_gate = None
         lane_anchor_residual = None
         lane_selector_stats = None
-        if self.lane_anchor_select_mode == 'learned_selector':
+        if self.lane_anchor_select_mode in (
+                'learned_selector', 'soft_selector'):
             lane_anchor, lane_selector_stats = \
                 self._learned_selector_lane_anchor(
                     outs_map, plan_query, sdc_traj_all, sdc_planning,
@@ -1007,6 +1088,20 @@ class PlanningHeadSingleMode(nn.Module):
                 loss_dict['lane_anchor_selector_pred_l2'] = (
                     outs_planning['lane_anchor_selector_pred_l2'][valid]
                     .mean().detach())
+                for key in (
+                        'lane_anchor_selector_selected_l2',
+                        'lane_anchor_selector_entropy',
+                        'lane_anchor_selector_max_prob'):
+                    if key in outs_planning:
+                        loss_dict[key] = outs_planning[key][valid] \
+                            .mean().detach()
+            else:
+                loss_dict['loss_lane_anchor_selector'] = logits.sum() * 0.0
+        elif (self.training and self.lane_anchor_select_mode in
+              ('learned_selector', 'soft_selector')):
+            loss_dict['loss_lane_anchor_selector'] = sum(
+                parameter.sum() * 0.0
+                for parameter in self.lane_anchor_selector_head.parameters())
         if planning_bucket is not None:
             loss_dict['motion_bucket_weight'] = planning_weight.detach()
         for key in (

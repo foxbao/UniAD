@@ -593,6 +593,47 @@ not useless. The failure is that the current planner cannot select/use the right
 map anchor from BEV/query features. C1 should therefore make map-anchor selection
 and conditioning explicit instead of adding another latent feature-fusion block.
 
+### C1 learned hard selector result and diagnosis (2026-07-11)
+
+C1 added a 16-candidate lane-anchor classifier, trained with the GT-best
+candidate and teacher-forced anchor. Its epoch-1 validation result was:
+
+| model | L2@1s | L2@2s | L2@3s | avg.L2 | avg.Collision |
+|---|---:|---:|---:|---:|---:|
+| A epoch1 | 0.2536 | 0.5735 | 0.9878 | **0.60495** | 0.9637% |
+| C1 hard selector | 0.2611 | 0.5974 | 1.0304 | **0.62966** | 0.9483% |
+
+C1 regressed avg.L2 by `+0.02471` (`+4.1%`) while collision stayed flat. The
+new validation diagnostics pass GT only to the scoring path; prediction remains
+GT-independent. Full-val selector results:
+
+| split | N | top-1 acc | oracle score | predicted score | gap |
+|---|---:|---:|---:|---:|---:|
+| Overall | 4585 | 40.9% | 1.013 | 1.162 | 0.148 |
+| Static | 772 | 15.0% | 0.203 | 0.492 | 0.289 |
+| Slow | 1093 | 49.1% | 0.858 | 0.990 | 0.131 |
+| MovingStraight | 2578 | 45.9% | 1.292 | 1.391 | 0.100 |
+| Turning | 142 | 25.4% | 1.558 | 1.956 | 0.398 |
+
+The score is the selector objective (`endpoint L2 + 0.25 * trajectory mean
+L2`), not planning avg.L2. Static and turning have the largest selection gaps.
+Two train/eval mismatches explain why training ADE looked good but validation
+regressed:
+
+1. Hard `argmax` blocks planning ADE gradients from reaching the selector; only
+   cross-entropy trains it.
+2. C1 training generated anchor distance samples from GT trajectory speed and
+   selected lane direction against GT, while inference used the base planner.
+   The selector therefore saw different candidate geometry at train and test.
+
+C2 is implemented in
+`base_e2e_lidar_plan_mapfuse_v4_c2_soft_selector_train.py`. It always generates
+candidates from the frozen base trajectory, uses GT only to score supervision,
+and replaces hard selection with a temperature-0.5 softmax mixture. This makes
+the final planning loss differentiable with respect to selector logits and
+removes teacher forcing. It starts from C1 epoch1 and trains selector, anchor
+gate, and anchor residual heads for one epoch.
+
 Recommended C1 direction:
 
 - Generate or supervise a discrete lane-anchor target from GT future endpoint /

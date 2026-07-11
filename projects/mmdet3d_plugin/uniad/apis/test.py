@@ -195,6 +195,22 @@ def _compact_planning_for_eval(planning):
     if isinstance(result_planning, dict) and 'sdc_traj' in result_planning:
         compact['result_planning']['sdc_traj'] = _planning_eval_tensor(
             result_planning['sdc_traj'], dtype=torch.float32)
+    if isinstance(result_planning, dict):
+        selector_field_dtypes = {
+            'lane_anchor_selector_target': torch.long,
+            'lane_anchor_selector_pred': torch.long,
+            'lane_anchor_selector_valid': torch.bool,
+            'lane_anchor_selector_num_valid': torch.long,
+            'lane_anchor_selector_oracle_l2': torch.float32,
+            'lane_anchor_selector_pred_l2': torch.float32,
+            'lane_anchor_selector_selected_l2': torch.float32,
+            'lane_anchor_selector_entropy': torch.float32,
+            'lane_anchor_selector_max_prob': torch.float32,
+        }
+        for key, dtype in selector_field_dtypes.items():
+            if key in result_planning:
+                compact['result_planning'][key] = _planning_eval_tensor(
+                    result_planning[key], dtype=dtype)
 
     if isinstance(planning_gt, dict):
         field_dtypes = {
