@@ -955,6 +955,48 @@ Turning, and 63 without valid planning GT. The next decision is based on this
 pilot followed by the unchanged full validation set; the smoke run is only an
 implementation check.
 
+#### C2.3 balanced pilot result
+
+The 2,010-frame balanced pilot completed 402/402 iterations and the unchanged
+4,676-frame full validation. Checkpoint comparison again found exactly four
+changed gate-head tensors; all other 1,697 parameters and buffers were
+bit-identical to C2.1 epoch1.
+
+| full validation | C2.1 full | C2.2 strict | C2.3 balanced | C2.3 vs C2.1 |
+|---|---:|---:|---:|---:|
+| L2@1s | 0.2512 | 0.2500 | **0.2443** | -0.0069 |
+| L2@2s | 0.5697 | 0.5680 | **0.5588** | -0.0109 |
+| L2@3s | 0.9826 | 0.9805 | **0.9673** | -0.0153 |
+| avg.L2 | 0.6012 | 0.5995 | **0.5901** | -0.0111 (-1.85%) |
+| avg.Collision | 0.9637% | 0.96% | **0.96%** | effectively flat |
+| Static avg.L2 | 0.2812 | 0.2814 | **0.2803** | -0.0009 |
+| Slow avg.L2 | 0.4840 | 0.4914 | **0.4838** | -0.0002 |
+| MovingStraight avg.L2 | 0.7202 | 0.7148 | **0.7023** | -0.0179 |
+| Turning avg.L2 | 0.8972 | 0.8854 | **0.8782** | -0.0190 |
+| FrontClear avg.L2 | 0.6280 | 0.6144 | **0.6006** | -0.0274 |
+| FrontObstacle avg.L2 | 0.5897 | 0.5930 | **0.5854** | -0.0043 |
+
+C2.3 passes every pre-declared promotion condition: global L2 improves,
+collision remains flat, and neither Slow nor FrontObstacle regresses. It also
+retains and strengthens the MovingStraight, Turning, and FrontClear gains. This
+is a clean objective-alignment result because the architecture and inference
+path are unchanged from C2.1 and only the gate supervision and pilot sampling
+changed.
+
+On the same first 512 validation frames used for the earlier diagnostics, 503
+samples had valid planning GT. C2.3's mean gate is `0.238`, lower than C2.2's
+`0.277`. Samples where the final map path helps have mean gate `0.251`, compared
+with `0.229` where it hurts; gate-to-gain correlation is positive at `+0.148`.
+Bucket gate means are Static `0.196`, Slow `0.244`, Moving `0.237`, and Turning
+`0.337`. C2.3 therefore fixes C2.2's broad gate inflation while preserving
+stronger map use for turns.
+
+Decision: promote C2.3 as the current map-planning baseline. The next controlled
+experiment is a full-dataset gate-only run from the same C2.1 checkpoint, using
+the evaluation-aligned target. Evaluate each epoch and retain the best full
+validation checkpoint; do not unfreeze the selector or residual path until that
+run confirms the balanced-pilot gain at full training scale.
+
 An earlier attempted ablation using only `use_map_lane=False` produced values
 identical to map-ON and is invalid: the explicit selector continued consuming
 `outs_map['lane_points']`. Those numbers must not be used as evidence that C2.1
