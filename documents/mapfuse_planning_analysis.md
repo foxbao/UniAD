@@ -1098,17 +1098,41 @@ The generated visual checks are under
 
 ### D1 implementation decision
 
-D1 will use SparseDriveV2-style factorized coarse-to-fine scoring rather than
-feeding all 1,000 candidates through attention:
+D1 ultimately targets SparseDriveV2-style factorized coarse-to-fine scoring.
+The first trainable MVP deliberately scores the full candidate set because the
+measured runtime generator overhead is only `0.06-0.10 s/frame`, and this avoids
+mixing scorer learnability with a new top-k recall failure mode:
 
-1. Encode path geometry and lateral offset, score about `16 x 9 = 144` geometry
-   candidates with map tokens and the base planning query.
-2. Keep the top 16 geometry candidates and combine each with the eight speed
-   profiles, yielding 128 fine candidates.
-3. Let each fine candidate query cross-attend local lane tokens and predicted
-   agent tokens, then output a score and bounded trajectory residual.
-4. Include the current C2.3 base trajectory as candidate zero and use explicit
-   collision/boundary/route costs for final rescoring.
+1. Reproduce D0's up-to-1,152 map candidates exactly at runtime and append the
+   current C2.3 trajectory as a fallback.
+2. Encode each six-step candidate, add the frozen planning context, and
+   cross-attend the 64 surveyed lane tokens.
+3. Train a listwise score against evaluation-horizon L2 and a bounded `1.5 m`
+   residual on the oracle raw candidate. The forward path uses hard selection
+   with a straight-through score gradient.
+4. Initialize the fallback with a positive score bias and zero residual, so an
+   untrained D1 checkpoint preserves C2.3 output instead of selecting an
+   arbitrary map mode.
+
+After the full-candidate scorer demonstrates oracle recall, replace it with the
+planned `144 -> top-16 -> 128` geometry/speed coarse-to-fine path and add agent
+tokens plus explicit collision/boundary/route rescoring. This optimization is
+therefore conditional on model evidence rather than bundled into the first D1
+experiment.
+
+The D1 implementation adds 666,381 trainable parameters; checkpoint inspection
+confirms that these are the only unfrozen parameters. Runtime candidates match
+the D0 implementation exactly on a frame (`1,152` candidates, maximum absolute
+difference `0.0`). A real-data single-GPU forward/backward and a five-GPU DDP
+smoke both pass. At five GPUs, step 10 uses about `716 MB/GPU`, averages `3.09 s`
+per step including startup data time, and the listwise score loss has already
+moved from its zero-logit baseline near `7.05` to `6.60`. The smoke processes
+were stopped after verification and did not produce a promotion checkpoint.
+
+Evaluation has three configurations: D1 map-on, D1-candidate-off while keeping
+the C2.3 fallback, and full-map-off which also removes the C2.3 lane anchor.
+Oracle recall uses a `1 cm` cost tolerance rather than strict candidate index,
+because the stop profile creates many geometrically identical candidates.
 
 D1 first freezes the UniAD perception, motion, and map encoder and trains only
 the new candidate scorer/residual head. Promotion requires a meaningful gap to

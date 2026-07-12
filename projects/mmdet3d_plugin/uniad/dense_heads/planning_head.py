@@ -12,6 +12,7 @@ from mmdet.models.builder import HEADS, build_loss
 from einops import rearrange
 from projects.mmdet3d_plugin.models.utils.functional import bivariate_gaussian_activation
 from .planning_head_plugin import CollisionNonlinearOptimizer
+from .map_multimodal_planner import MapMultimodalPlanner
 import numpy as np
 import copy
 
@@ -63,6 +64,7 @@ class PlanningHeadSingleMode(nn.Module):
                  ablate_ego_status='none',
                  planning_motion_loss_weights=None,
                  use_goal=False,
+                 multimodal_planner=None,
                 ):
         """
         Single Mode Planning Head for Autonomous Driving.
@@ -92,6 +94,12 @@ class PlanningHeadSingleMode(nn.Module):
         self.planning_eval = planning_eval
         self.planning_motion_loss_weights = (
             planning_motion_loss_weights or None)
+        self.map_multimodal_planner = None
+        if multimodal_planner is not None:
+            self.map_multimodal_planner = MapMultimodalPlanner(
+                embed_dims=embed_dims,
+                planning_steps=planning_steps,
+                **multimodal_planner)
         
         #### planning head
         # Goal-conditioned planning (feat/plan-goal). When use_goal is False the
@@ -928,6 +936,11 @@ class PlanningHeadSingleMode(nn.Module):
                 sdc_traj_all, lane_anchor_gate, lane_anchor_residual = \
                     self._apply_learned_lane_anchor(
                         plan_query, sdc_traj_all, lane_anchor)
+        multimodal_outputs = None
+        if self.map_multimodal_planner is not None:
+            multimodal_outputs = self.map_multimodal_planner(
+                plan_query, sdc_traj_all, outs_map=outs_map)
+            sdc_traj_all = multimodal_outputs['multimodal_selected_traj']
         if self.use_col_optim and not self.training:
             # post process, only used when testing
             assert occ_mask is not None
@@ -948,6 +961,17 @@ class PlanningHeadSingleMode(nn.Module):
             ret.update(lane_selector_stats)
         if map_fusion_stats is not None:
             ret.update(map_fusion_stats)
+        if multimodal_outputs is not None:
+            if self.training:
+                ret.update(multimodal_outputs)
+            else:
+                ret['multimodal_selected_index'] = \
+                    multimodal_outputs['multimodal_selected_index']
+                ret['multimodal_fallback_index'] = \
+                    multimodal_outputs['multimodal_fallback_index']
+                ret['multimodal_candidate_count'] = \
+                    multimodal_outputs['multimodal_candidate_valid'].sum(
+                        dim=-1)
         return ret
 
     def collision_optimization(self, sdc_traj_all, occ_mask):
@@ -1286,6 +1310,13 @@ class PlanningHeadSingleMode(nn.Module):
                         if key in outs_planning:
                             loss_dict[key] = outs_planning[key][valid] \
                                 .mean().detach()
+        if (self.training and self.map_multimodal_planner is not None
+                and 'multimodal_logits' in outs_planning):
+            gt_traj = sdc_planning[0, :, :self.planning_steps, :2]
+            gt_valid = torch.any(
+                sdc_planning_mask[0, :, :self.planning_steps], dim=-1)
+            loss_dict.update(self.map_multimodal_planner.loss(
+                outs_planning, gt_traj, gt_valid))
         if planning_bucket is not None:
             loss_dict['motion_bucket_weight'] = planning_weight.detach()
         for key in (

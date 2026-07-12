@@ -104,7 +104,9 @@ class UniADMotionLidar(UniADTrackLidar):
         """
         if self.map_lane_encoder is None or ego2global is None:
             return dict(lane_query=None, lane_query_pos=None, lane_valid=None,
-                        lane_centroids=None, lane_points=None)
+                        lane_centroids=None, lane_points=None,
+                        planning_candidates=None,
+                        planning_candidate_valid=None)
         lane_outputs = \
             self.map_lane_encoder(
                 ego2global, device=bev_embed.device, dtype=bev_embed.dtype)
@@ -114,9 +116,15 @@ class UniADMotionLidar(UniADTrackLidar):
         else:
             lane_query, lane_query_pos, lane_valid, lane_centroids, lane_points = \
                 lane_outputs
-        return dict(lane_query=lane_query, lane_query_pos=lane_query_pos,
-                    lane_valid=lane_valid, lane_centroids=lane_centroids,
-                    lane_points=lane_points)
+        planning_candidates, planning_candidate_valid = \
+            self.map_lane_encoder.build_planning_candidates(
+                ego2global, device=bev_embed.device, dtype=bev_embed.dtype)
+        return dict(
+            lane_query=lane_query, lane_query_pos=lane_query_pos,
+            lane_valid=lane_valid, lane_centroids=lane_centroids,
+            lane_points=lane_points,
+            planning_candidates=planning_candidates,
+            planning_candidate_valid=planning_candidate_valid)
 
     @property
     def with_motion_head(self):
