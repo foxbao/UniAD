@@ -1039,6 +1039,83 @@ experiment. The target definition is no longer the main issue; the remaining
 issue is that full-data optimization overuses the map path in Slow/Static
 contexts. Do not unfreeze selector or residual parameters yet.
 
+## 16. D route: map-conditioned multimodal planning
+
+The C2 results establish that map-conditioned gate calibration is useful but
+capacity-limited. The planner still compresses the scene to one planning query,
+selects an independent lane polyline, and applies one scalar blend to one base
+trajectory. This cannot represent route branches, reverse driving, lateral
+work-zone motion, or independent speed choices. D therefore changes the output
+space from one gated trajectory to a scored set of map-conditioned candidates.
+
+### D0 topology and candidate oracle (2026-07-12)
+
+D0 was implemented on branch `feat/map-multimodal-planner` without changing the
+C2 inference path. `HDMapParser` now preserves lane IDs, predecessor/successor
+IDs, left/right neighbors, direction, turn type, speed limit, and boundaries;
+the old `(64, 20, 7)` encoder output remains unchanged. Cache files are now
+versioned by parser schema and point count, so D0's dense 80-point geometry
+cannot overwrite the training-time 20-point cache.
+
+The training data produces eight deployable cumulative-distance profiles: a
+fixed stop profile plus seven balanced KMeans profiles over complete six-step
+trajectories. Static/Slow/MovingStraight/Turning samples are inverse-frequency
+weighted during clustering. The profile vocabulary spans `0.0` to `17.4 m` at
+3 seconds, with mean assignment RMSE `0.320 m` over 37,606 complete training
+samples. The generator is
+`tools/data_converter/generate_planning_speed_profiles.py`.
+
+The D0 candidate generator follows both successor and predecessor directions
+because the port data contains reverse driving; it builds up to 16 lane chains,
+combines each chain with the eight speed profiles, and adds nine smooth lateral
+offset variants from `-2.0` to `+2.0 m` in `0.5 m` steps. This produces roughly
+1,000 raw candidates per frame. The lateral variants are important: on the 214
+`command=1` validation frames they reduce the deployable oracle from `0.6390`
+with centerlines only to `0.3319`. They model short-horizon lateral work and
+lane-change motion that is not represented by the lane centerline alone.
+
+The full validation oracle uses no per-sample GT speed. It uses only the map,
+ego pose, lane topology, and the training-derived speed vocabulary:
+
+| split | L2@1s | L2@2s | L2@3s | avg.L2 |
+|---|---:|---:|---:|---:|
+| ALL | 0.1953 | 0.3073 | 0.4819 | **0.3282** |
+| Static | 0.0333 | 0.0419 | 0.0614 | **0.0455** |
+| Slow | 0.2019 | 0.3432 | 0.5456 | **0.3636** |
+| MovingStraight | 0.2347 | 0.3660 | 0.5694 | **0.3900** |
+| Turning | 0.2452 | 0.2603 | 0.4502 | **0.3186** |
+
+All 4,963 validation samples with valid planning GT have candidates; there are
+no map-coverage failures. The exact-speed geometry diagnostic is `avg.L2=
+0.1105`, which confirms that the remaining D0 gap is primarily speed/profile
+quantization and candidate scoring, not missing map geometry. Command-level
+deployable oracle values are `0.2680/0.3319/0.3341` for commands 0/1/2.
+
+The oracle is an upper bound, not a model result. It passes D0's promotion gate
+by a wide margin: it is `0.2619` lower than the current C2.3 `avg.L2=0.5901`.
+The generated visual checks are under
+`projects/work_dirs/stage2_e2e_lidar/map_multimodal_d0/plots`.
+
+### D1 implementation decision
+
+D1 will use SparseDriveV2-style factorized coarse-to-fine scoring rather than
+feeding all 1,000 candidates through attention:
+
+1. Encode path geometry and lateral offset, score about `16 x 9 = 144` geometry
+   candidates with map tokens and the base planning query.
+2. Keep the top 16 geometry candidates and combine each with the eight speed
+   profiles, yielding 128 fine candidates.
+3. Let each fine candidate query cross-attend local lane tokens and predicted
+   agent tokens, then output a score and bounded trajectory residual.
+4. Include the current C2.3 base trajectory as candidate zero and use explicit
+   collision/boundary/route costs for final rescoring.
+
+D1 first freezes the UniAD perception, motion, and map encoder and trains only
+the new candidate scorer/residual head. Promotion requires a meaningful gap to
+the D0 oracle, `avg.L2 < 0.5901`, no Slow/Turning regression, and a map-off
+causal degradation. Only after that pilot succeeds will the map/agent query
+interaction be unfrozen.
+
 An earlier attempted ablation using only `use_map_lane=False` produced values
 identical to map-ON and is invalid: the explicit selector continued consuming
 `outs_map['lane_points']`. Those numbers must not be used as evidence that C2.1

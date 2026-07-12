@@ -21,6 +21,8 @@ from projects.mmdet3d_plugin.models.utils.functional import (
 class HDMapParser:
     """Parse protobuf-text HD map and cache lane polylines."""
 
+    CACHE_SCHEMA_VERSION = 2
+
     def __init__(self, map_path: str, num_points_per_lane: int = 20):
         self.map_path = map_path
         self.num_points_per_lane = num_points_per_lane
@@ -35,21 +37,63 @@ class HDMapParser:
                 '(expected protobuf-text with `lane {{ central_curve ... }}` '
                 'blocks); otherwise the encoder silently emits all-invalid '
                 'lanes and MapLaneEncoder degrades to a no-op.')
+        self.lane_by_id = {
+            str(lane['id']): lane for lane in self.lanes
+            if lane.get('id') is not None
+        }
 
     def _cache_path(self) -> str:
-        return self.map_path + '.parsed.npz'
+        return f'{self.map_path}.parsed.{self.num_points_per_lane}.npz'
 
     def _load_or_parse(self) -> List[dict]:
         cache = self._cache_path()
         map_mtime = os.path.getmtime(self.map_path)
         if os.path.exists(cache):
             data = np.load(cache, allow_pickle=True)
-            if float(data.get('mtime', 0)) == map_mtime:
+            schema_version = int(data.get('schema_version', 0))
+            if (float(data.get('mtime', 0)) == map_mtime
+                    and schema_version == self.CACHE_SCHEMA_VERSION):
                 return list(data['lanes'])
         lanes = self._parse_map()
         np.savez(cache, lanes=np.array(lanes, dtype=object),
-                 mtime=map_mtime)
+                 mtime=map_mtime,
+                 schema_version=self.CACHE_SCHEMA_VERSION)
         return lanes
+
+    @staticmethod
+    def _extract_id(block: str, field: str) -> Optional[str]:
+        match = re.search(
+            rf'\b{re.escape(field)}\s*\{{\s*id:\s*"([^"]+)"',
+            block)
+        return match.group(1) if match else None
+
+    @staticmethod
+    def _extract_ids(block: str, field: str) -> List[str]:
+        return re.findall(
+            rf'\b{re.escape(field)}\s*\{{\s*id:\s*"([^"]+)"',
+            block)
+
+    @staticmethod
+    def _extract_float(block: str, field: str,
+                       default: float = 0.0) -> float:
+        match = re.search(
+            rf'\b{re.escape(field)}:\s*([-\d.e+]+)', block)
+        return float(match.group(1)) if match else float(default)
+
+    @staticmethod
+    def _extract_enum(block: str, field: str,
+                      default: str = '') -> str:
+        match = re.search(
+            rf'\b{re.escape(field)}:\s*([A-Za-z0-9_]+)', block)
+        return match.group(1) if match else default
+
+    @staticmethod
+    def _extract_bool(block: str, field: str,
+                      default: bool = False) -> bool:
+        match = re.search(
+            rf'\b{re.escape(field)}:\s*(true|false)', block,
+            flags=re.IGNORECASE)
+        return match.group(1).lower() == 'true' if match else default
 
     def _extract_points(self, block: str) -> np.ndarray:
         pts = []
@@ -116,9 +160,25 @@ class HDMapParser:
             right_resampled = (self._resample(right, n)
                                if len(right) > 1 else None)
             lanes.append(dict(
+                id=self._extract_id(lane_block, 'id'),
                 central=central_resampled,
                 left=left_resampled,
-                right=right_resampled))
+                right=right_resampled,
+                predecessor_ids=self._extract_ids(
+                    lane_block, 'predecessor_id'),
+                successor_ids=self._extract_ids(
+                    lane_block, 'successor_id'),
+                left_neighbor_forward_ids=self._extract_ids(
+                    lane_block, 'left_neighbor_forward_lane_id'),
+                right_neighbor_forward_ids=self._extract_ids(
+                    lane_block, 'right_neighbor_forward_lane_id'),
+                speed_limit=self._extract_float(
+                    lane_block, 'speed_limit'),
+                turn=self._extract_enum(lane_block, 'turn'),
+                direction=self._extract_enum(lane_block, 'direction'),
+                lane_type=self._extract_enum(lane_block, 'type'),
+                is_reverse_road=self._extract_bool(
+                    lane_block, 'is_reverse_road')))
         return lanes
 
     def _lateral_offset(self, central: np.ndarray,
