@@ -997,6 +997,48 @@ the evaluation-aligned target. Evaluate each epoch and retain the best full
 validation checkpoint; do not unfreeze the selector or residual path until that
 run confirms the balanced-pilot gain at full training scale.
 
+#### C2.3 full-data result
+
+The full-data C2.3 run completed 8,797/8,797 iterations and the same 4,676-frame
+validation. It remained strictly gate-only: checkpoint comparison found exactly
+four changed tensors, all in `planning_head.lane_anchor_gate_head`. The two
+Static `nan` strings in the log are expected final-displacement ratios for
+zero-displacement Static GT, not NaN losses or gradients; there were no OOMs or
+tracebacks.
+
+| full validation | C2.1 full | C2.3 balanced | C2.3 full-data |
+|---|---:|---:|---:|
+| L2@1s | 0.2512 | **0.2443** | 0.2455 |
+| L2@2s | 0.5697 | **0.5588** | 0.5598 |
+| L2@3s | 0.9826 | **0.9673** | 0.9699 |
+| avg.L2 | 0.6012 | **0.5901** | 0.5917 |
+| avg.Collision | 0.9637% | 0.96% | **0.96%** |
+| Static avg.L2 | 0.2812 | **0.2803** | 0.2844 |
+| Slow avg.L2 | **0.4840** | **0.4838** | 0.4919 |
+| MovingStraight avg.L2 | 0.7202 | **0.7023** | **0.7004** |
+| Turning avg.L2 | 0.8972 | **0.8782** | 0.8824 |
+| FrontClear avg.L2 | 0.6280 | **0.6006** | 0.6066 |
+| FrontObstacle avg.L2 | 0.5897 | 0.5854 | **0.5852** |
+
+Full-data training preserves most of the C2.3 gain: avg.L2 improves by `0.0095`
+over C2.1, MovingStraight and FrontObstacle reach their best values, and
+collision remains flat. It does not pass the strict promotion gate because Slow
+regresses by `0.0079` versus C2.1, and Static also regresses by `0.0032`.
+
+The matching 503-sample diagnostic shows the distribution shift directly. Full
+data raises mean gate from the balanced pilot's `0.238` to `0.254`; Slow rises
+from `0.244` to `0.308`, Turning from `0.337` to `0.373`, and Static from
+`0.196` to `0.230`. Gate-to-gain correlation drops from `+0.148` to `+0.128`.
+The full-data checkpoint is therefore a useful candidate, but the balanced pilot
+checkpoint remains the current best because it is the only C2.3 result that
+passes every bucket-level acceptance condition.
+
+Next controlled direction: keep the balanced C2.3 checkpoint as the reference,
+and add distribution-aware gate supervision or balanced sampling to a C2.4
+experiment. The target definition is no longer the main issue; the remaining
+issue is that full-data optimization overuses the map path in Slow/Static
+contexts. Do not unfreeze selector or residual parameters yet.
+
 An earlier attempted ablation using only `use_map_lane=False` produced values
 identical to map-ON and is invalid: the explicit selector continued consuming
 `outs_map['lane_points']`. Those numbers must not be used as evidence that C2.1
