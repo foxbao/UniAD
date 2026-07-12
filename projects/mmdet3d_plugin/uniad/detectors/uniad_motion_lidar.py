@@ -1,4 +1,5 @@
 import torch
+import torch.nn as nn
 from mmcv.runner import auto_fp16
 from mmdet.models import DETECTORS, build_head
 
@@ -20,6 +21,7 @@ class UniADMotionLidar(UniADTrackLidar):
                  llm_probe_only=False,
                  freeze_non_llm=False,
                  freeze_except_prefixes=None,
+                 freeze_except_eval=False,
                  **kwargs):
         super().__init__(**kwargs)
         self.motion_head = build_head(motion_head) if motion_head else None
@@ -32,6 +34,7 @@ class UniADMotionLidar(UniADTrackLidar):
         self.llm_probe_only = llm_probe_only
         self.freeze_non_llm = freeze_non_llm or llm_probe_only
         self.freeze_except_prefixes = tuple(freeze_except_prefixes or [])
+        self.freeze_except_eval = bool(freeze_except_eval)
 
         # HD-map lane prior. It is a detector-level module (an external survey
         # input, not a perception output), encoding surveyed lanes into
@@ -49,6 +52,8 @@ class UniADMotionLidar(UniADTrackLidar):
             self._freeze_non_llm_modules()
         if self.freeze_except_prefixes:
             self._freeze_except_prefixes()
+        if self.freeze_except_eval:
+            self._set_frozen_modules_eval()
 
     def _freeze_non_llm_modules(self):
         """Freeze every detector child except the LLM probe head."""
@@ -64,12 +69,30 @@ class UniADMotionLidar(UniADTrackLidar):
                 name.startswith(prefix)
                 for prefix in self.freeze_except_prefixes)
 
+    def _set_frozen_modules_eval(self):
+        """Freeze stateful leaves without changing task-head control flow."""
+        stateful_types = (
+            nn.modules.batchnorm._BatchNorm,
+            nn.Dropout, nn.Dropout1d, nn.Dropout2d, nn.Dropout3d,
+            nn.AlphaDropout, nn.FeatureAlphaDropout,
+        )
+        for name, module in self.named_modules():
+            if not name or not isinstance(module, stateful_types):
+                continue
+            is_trainable = any(
+                name == prefix or name.startswith(f'{prefix}.')
+                for prefix in self.freeze_except_prefixes)
+            if not is_trainable:
+                module.eval()
+
     def train(self, mode=True):
         super().train(mode)
         if self.freeze_non_llm:
             self._freeze_non_llm_modules()
         if self.freeze_except_prefixes:
             self._freeze_except_prefixes()
+        if mode and self.freeze_except_eval:
+            self._set_frozen_modules_eval()
         return self
 
     def _build_outs_map(self, bev_embed, ego2global):

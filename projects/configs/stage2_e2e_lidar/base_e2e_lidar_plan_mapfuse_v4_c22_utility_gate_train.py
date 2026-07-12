@@ -4,6 +4,7 @@ _base_ = ['./base_e2e_lidar_plan_mapfuse_v4_c21_st_selector_train.py']
 # only the scalar blend gate with a direct per-sample target: the least-squares
 # alpha on the line from the frozen base trajectory to the map trajectory.
 model = dict(
+    freeze_except_eval=True,
     freeze_except_prefixes=[
         'planning_head.lane_anchor_gate_head',
     ],

@@ -870,7 +870,17 @@ iterations without DDP mismatch, NaN, OOM, or process residue. Across iterations
 10/20/30, utility-target valid rate was `0.90/0.94/0.90`, target mean
 `0.469/0.344/0.369`, gate MAE `0.408/0.318/0.356`, and gradient norm
 `2.64/1.96/1.82`. This validates the implementation and loss scale; it is not
-an accuracy result.
+an accuracy result. A strict smoke rerun also verified that only the four gate
+parameter tensors changed from the C2.1 checkpoint; all other parameters and
+buffers were bit-identical. The C2.2 config therefore enables
+`freeze_except_eval=True`, which freezes BatchNorm/Dropout state without changing
+the task heads' `self.training` control flow.
+
+The first full pilot attempt produced `avg.L2=0.6122`, but it used the earlier
+parameter-only freeze and allowed frozen BatchNorm state to update. Because its
+selector diagnostics changed despite selector weights being frozen, that result
+is invalid and is discarded. The strict-frozen-eval pilot is the authoritative
+test.
 
 An earlier attempted ablation using only `use_map_lane=False` produced values
 identical to map-ON and is invalid: the explicit selector continued consuming
