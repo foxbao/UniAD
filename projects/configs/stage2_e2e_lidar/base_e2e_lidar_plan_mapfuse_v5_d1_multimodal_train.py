@@ -34,15 +34,17 @@ model = dict(
             dropout=0.1,
             coordinate_scale=20.0,
             residual_scale=1.5,
-            fallback_logit_bias=2.0,
+            fallback_logit_bias=0.1,
             score_temperature=0.25,
+            score_target_mode='multi_positive',
+            positive_cost_margin=0.05,
             score_loss_weight=1.0,
             residual_loss_weight=1.0,
             eval_horizon_indices=[1, 3, 5],
             oracle_recall_tolerance=0.01,
         )))
 
-optimizer = dict(type='AdamW', lr=5e-5, weight_decay=0.01)
+optimizer = dict(type='AdamW', lr=5e-4, weight_decay=0.01)
 total_epochs = 1
 runner = dict(type='EpochBasedRunner', max_epochs=1)
 

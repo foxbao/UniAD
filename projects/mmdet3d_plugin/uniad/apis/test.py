@@ -209,6 +209,9 @@ def _compact_planning_for_eval(planning):
             'lane_anchor_selector_oracle_anchor': torch.float32,
             'lane_anchor_selector_pred_anchor': torch.float32,
             'lane_anchor_selector_selected_anchor': torch.float32,
+            'multimodal_selected_index': torch.long,
+            'multimodal_fallback_index': torch.long,
+            'multimodal_candidate_count': torch.long,
         }
         for key, dtype in selector_field_dtypes.items():
             if key in result_planning:

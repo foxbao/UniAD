@@ -13,12 +13,18 @@ class MapMultimodalPlanner(nn.Module):
                  dropout=0.1,
                  coordinate_scale=20.0,
                  residual_scale=1.5,
-                 fallback_logit_bias=2.0,
+                 fallback_logit_bias=0.1,
                  score_temperature=0.25,
+                 score_target_mode='multi_positive',
+                 positive_cost_margin=0.05,
                  score_loss_weight=1.0,
                  residual_loss_weight=1.0,
                  eval_horizon_indices=(1, 3, 5),
                  oracle_recall_tolerance=0.01,
+                 use_utility_gate=False,
+                 utility_gate_init=-2.0,
+                 utility_gate_loss_weight=1.0,
+                 utility_min_improvement=0.01,
                  ablate_map=False):
         super().__init__()
         self.planning_steps = int(planning_steps)
@@ -26,14 +32,24 @@ class MapMultimodalPlanner(nn.Module):
         self.residual_scale = float(residual_scale)
         self.fallback_logit_bias = float(fallback_logit_bias)
         self.score_temperature = float(score_temperature)
+        if score_target_mode not in ('softmax', 'multi_positive'):
+            raise ValueError(
+                'score_target_mode must be softmax/multi_positive, got '
+                f'{score_target_mode}')
+        self.score_target_mode = score_target_mode
+        self.positive_cost_margin = float(positive_cost_margin)
         self.score_loss_weight = float(score_loss_weight)
         self.residual_loss_weight = float(residual_loss_weight)
         self.eval_horizon_indices = tuple(int(x) for x in eval_horizon_indices)
         self.oracle_recall_tolerance = float(oracle_recall_tolerance)
+        self.use_utility_gate = bool(use_utility_gate)
+        self.utility_gate_loss_weight = float(utility_gate_loss_weight)
+        self.utility_min_improvement = float(utility_min_improvement)
         self.ablate_map = bool(ablate_map)
         assert self.coordinate_scale > 0.0
         assert self.residual_scale >= 0.0
         assert self.score_temperature > 0.0
+        assert self.positive_cost_margin >= 0.0
 
         trajectory_dims = self.planning_steps * 2
         self.candidate_encoder = nn.Sequential(
@@ -56,6 +72,15 @@ class MapMultimodalPlanner(nn.Module):
             nn.Linear(embed_dims, embed_dims),
             nn.ReLU(inplace=True),
             nn.Linear(embed_dims, trajectory_dims))
+        self.utility_gate_head = None
+        if self.use_utility_gate:
+            self.utility_gate_head = nn.Sequential(
+                nn.Linear(embed_dims * 3, embed_dims),
+                nn.ReLU(inplace=True),
+                nn.Linear(embed_dims, 1))
+            nn.init.zeros_(self.utility_gate_head[-1].weight)
+            nn.init.constant_(
+                self.utility_gate_head[-1].bias, float(utility_gate_init))
 
         nn.init.zeros_(self.score_head.weight)
         nn.init.zeros_(self.score_head.bias)
@@ -153,26 +178,76 @@ class MapMultimodalPlanner(nn.Module):
         feature = self.ffn_norm(feature + self.ffn(feature))
 
         logits = self.score_head(feature).squeeze(-1)
-        fallback_bias = torch.zeros_like(logits)
-        fallback_bias[:, -1] = self.fallback_logit_bias
-        logits = logits + fallback_bias
+        if not self.use_utility_gate:
+            fallback_bias = torch.zeros_like(logits)
+            fallback_bias[:, -1] = self.fallback_logit_bias
+            logits = logits + fallback_bias
         logits = logits.masked_fill(~valid, -1e4)
         residual = torch.tanh(self.residual_head(feature)).reshape(
             batch_size, num_candidates, self.planning_steps, 2)
         residual = residual * self.residual_scale
+        if self.use_utility_gate:
+            # The safety fallback must remain byte-for-byte C2.3. Residual
+            # capacity is reserved for explicit map candidates only.
+            residual = residual * (source == 0).to(residual)[..., None, None]
         refined_candidates = raw_candidates + residual
 
-        probabilities = torch.softmax(logits, dim=-1)
-        selected_index = logits.argmax(dim=-1)
-        hard_weights = F.one_hot(
-            selected_index, num_classes=num_candidates).to(probabilities)
-        if self.training:
-            selection_weights = (
-                hard_weights + probabilities - probabilities.detach())
+        utility_logit = None
+        utility_probability = None
+        map_selected_index = None
+        fallback_index = num_candidates - 1
+        if self.use_utility_gate and num_candidates > 1:
+            map_logits = logits[:, :-1]
+            map_probabilities = torch.softmax(map_logits, dim=-1)
+            map_selected_index = map_logits.argmax(dim=-1)
+            map_hard_weights = F.one_hot(
+                map_selected_index,
+                num_classes=num_candidates - 1).to(map_probabilities)
+            if self.training:
+                map_weights = (
+                    map_hard_weights + map_probabilities
+                    - map_probabilities.detach())
+            else:
+                map_weights = map_hard_weights
+            selected_map = torch.sum(
+                refined_candidates[:, :-1]
+                * map_weights[..., None, None], dim=1)
+            selected_map_feature = torch.sum(
+                feature[:, :-1] * map_weights[..., None], dim=1)
+            utility_input = torch.cat(
+                [context, selected_map_feature, feature[:, -1]], dim=-1)
+            utility_logit = self.utility_gate_head(utility_input).squeeze(-1)
+            utility_probability = torch.sigmoid(utility_logit)
+            map_hard = (utility_probability >= 0.5).to(utility_probability)
+            if self.training:
+                map_weight = (
+                    map_hard + utility_probability
+                    - utility_probability.detach())
+            else:
+                map_weight = map_hard
+            fallback_traj = refined_candidates[:, -1]
+            selected = fallback_traj + map_weight[:, None, None] * (
+                selected_map - fallback_traj)
+            selected_index = torch.where(
+                map_hard.to(torch.bool), map_selected_index,
+                map_selected_index.new_full(
+                    map_selected_index.shape, fallback_index))
+            probabilities = torch.cat([
+                map_probabilities * utility_probability[:, None],
+                (1.0 - utility_probability)[:, None]], dim=-1)
         else:
-            selection_weights = hard_weights
-        selected = torch.sum(
-            refined_candidates * selection_weights[..., None, None], dim=1)
+            probabilities = torch.softmax(logits, dim=-1)
+            selected_index = logits.argmax(dim=-1)
+            hard_weights = F.one_hot(
+                selected_index, num_classes=num_candidates).to(probabilities)
+            if self.training:
+                selection_weights = (
+                    hard_weights + probabilities - probabilities.detach())
+            else:
+                selection_weights = hard_weights
+            selected = torch.sum(
+                refined_candidates * selection_weights[..., None, None],
+                dim=1)
         return dict(
             multimodal_raw_candidates=raw_candidates,
             multimodal_refined_candidates=refined_candidates,
@@ -182,7 +257,10 @@ class MapMultimodalPlanner(nn.Module):
             multimodal_selection_probabilities=probabilities,
             multimodal_residual=residual,
             multimodal_fallback_index=raw_candidates.new_full(
-                (batch_size,), num_candidates - 1, dtype=torch.long),
+                (batch_size,), fallback_index, dtype=torch.long),
+            multimodal_map_selected_index=map_selected_index,
+            multimodal_utility_logit=utility_logit,
+            multimodal_utility_probability=utility_probability,
             multimodal_selected_traj=selected,
         )
 
@@ -214,16 +292,26 @@ class MapMultimodalPlanner(nn.Module):
         stats = dict(
             loss_multimodal_score=zero,
             loss_multimodal_residual=zero,
+            loss_multimodal_utility_gate=zero,
             multimodal_valid_rate=zero.detach(),
             multimodal_candidate_count=zero.detach(),
             multimodal_top1_oracle_recall=zero.detach(),
             multimodal_top5_oracle_recall=zero.detach(),
+            multimodal_positive_count=zero.detach(),
+            multimodal_positive_probability=zero.detach(),
+            multimodal_fallback_target_rate=zero.detach(),
             multimodal_oracle_l2=zero.detach(),
             multimodal_selected_raw_l2=zero.detach(),
             multimodal_selected_refined_l2=zero.detach(),
             multimodal_regret=zero.detach(),
             multimodal_fallback_rate=zero.detach(),
             multimodal_residual_norm=zero.detach(),
+            multimodal_utility_target_rate=zero.detach(),
+            multimodal_utility_probability=zero.detach(),
+            multimodal_utility_accuracy=zero.detach(),
+            multimodal_map_oracle_l2=zero.detach(),
+            multimodal_pred_map_l2=zero.detach(),
+            multimodal_fallback_l2=zero.detach(),
         )
         batch_size = min(logits.size(0), gt.size(0), valid.size(0))
         if batch_size == 0:
@@ -241,19 +329,85 @@ class MapMultimodalPlanner(nn.Module):
             return stats
 
         masked_costs = costs.masked_fill(~candidate_valid, 1e4)
-        target_probabilities = torch.softmax(
-            -masked_costs / self.score_temperature, dim=-1).detach()
-        log_probabilities = F.log_softmax(logits, dim=-1)
-        score_loss = -(target_probabilities * log_probabilities).sum(dim=-1)
-        stats['loss_multimodal_score'] = (
-            score_loss[sample_valid].mean() * self.score_loss_weight)
-
+        if self.use_utility_gate and logits.size(1) > 1:
+            score_logits = logits[:, :-1]
+            score_costs = masked_costs[:, :-1]
+            score_valid = candidate_valid[:, :-1]
+        else:
+            score_logits = logits
+            score_costs = masked_costs
+            score_valid = candidate_valid
+        score_sample_valid = sample_valid & score_valid.any(dim=-1)
+        score_costs = score_costs.masked_fill(~score_valid, 1e4)
+        score_oracle_index = score_costs.argmin(dim=-1)
         oracle_index = masked_costs.argmin(dim=-1)
-        selected_index = outputs['multimodal_selected_index'][:batch_size]
         batch_index = torch.arange(batch_size, device=raw.device)
-        oracle_raw = raw[batch_index, oracle_index]
+        oracle_cost = masked_costs[batch_index, oracle_index]
+        score_oracle_cost = score_costs[batch_index, score_oracle_index]
+        log_probabilities = F.log_softmax(score_logits, dim=-1)
+        if self.score_target_mode == 'multi_positive':
+            positive = score_valid & (
+                score_costs <= score_oracle_cost[:, None]
+                + self.positive_cost_margin)
+            positive_log_probability = torch.logsumexp(
+                log_probabilities.masked_fill(~positive, -1e4), dim=-1)
+            score_loss = -positive_log_probability
+            probabilities = torch.softmax(score_logits, dim=-1)
+            stats['multimodal_positive_count'] = positive.to(raw).sum(
+                dim=-1)[score_sample_valid].mean().detach()
+            stats['multimodal_positive_probability'] = (
+                probabilities * positive.to(probabilities)
+            ).sum(dim=-1)[score_sample_valid].mean().detach()
+            if not self.use_utility_gate:
+                stats['multimodal_fallback_target_rate'] = positive[
+                    score_sample_valid, -1].to(raw).mean().detach()
+        else:
+            target_probabilities = torch.softmax(
+                -score_costs / self.score_temperature, dim=-1).detach()
+            score_loss = -(
+                target_probabilities * log_probabilities).sum(dim=-1)
+        stats['loss_multimodal_score'] = (
+            score_loss[score_sample_valid].mean() * self.score_loss_weight)
+
+        if self.use_utility_gate:
+            fallback_cost = masked_costs[:, -1]
+            map_selected_index = outputs[
+                'multimodal_map_selected_index'][:batch_size]
+            predicted_map_cost = score_costs[
+                batch_index, map_selected_index]
+            utility_target = score_sample_valid & (
+                predicted_map_cost + self.utility_min_improvement
+                < fallback_cost)
+            utility_logit = outputs['multimodal_utility_logit'][:batch_size]
+            stats['loss_multimodal_utility_gate'] = (
+                F.binary_cross_entropy_with_logits(
+                    utility_logit[sample_valid],
+                    utility_target[sample_valid].to(utility_logit))
+                * self.utility_gate_loss_weight)
+            utility_probability = torch.sigmoid(utility_logit)
+            stats['multimodal_utility_target_rate'] = utility_target[
+                sample_valid].to(raw).mean().detach()
+            stats['multimodal_utility_probability'] = utility_probability[
+                sample_valid].mean().detach()
+            stats['multimodal_utility_accuracy'] = (
+                (utility_probability[sample_valid] >= 0.5)
+                == utility_target[sample_valid]
+            ).to(raw).mean().detach()
+            stats['multimodal_map_oracle_l2'] = score_oracle_cost[
+                sample_valid].mean().detach()
+            stats['multimodal_pred_map_l2'] = predicted_map_cost[
+                sample_valid].mean().detach()
+            stats['multimodal_fallback_l2'] = fallback_cost[
+                sample_valid].mean().detach()
+            stats['multimodal_fallback_target_rate'] = (
+                ~utility_target[sample_valid]).to(raw).mean().detach()
+
+        selected_index = outputs['multimodal_selected_index'][:batch_size]
+        residual_oracle_index = (
+            score_oracle_index if self.use_utility_gate else oracle_index)
+        oracle_raw = raw[batch_index, residual_oracle_index]
         residual = outputs['multimodal_residual'][:batch_size]
-        oracle_residual = residual[batch_index, oracle_index]
+        oracle_residual = residual[batch_index, residual_oracle_index]
         residual_target = (gt - oracle_raw).clamp(
             min=-self.residual_scale, max=self.residual_scale).detach()
         residual_error = F.smooth_l1_loss(
@@ -265,20 +419,27 @@ class MapMultimodalPlanner(nn.Module):
             residual_loss[sample_valid].mean()
             * self.residual_loss_weight)
 
-        oracle_cost = masked_costs[batch_index, oracle_index]
         selected_cost = masked_costs[batch_index, selected_index]
         refined = outputs['multimodal_refined_candidates'][:batch_size]
         refined_costs, _ = self._metric_cost(refined, gt, valid)
         selected_refined_cost = refined_costs[batch_index, selected_index]
-        top_k = min(5, logits.size(-1))
-        top_indices = logits.topk(top_k, dim=-1).indices
-        top_costs = masked_costs.gather(dim=-1, index=top_indices)
-        near_oracle = oracle_cost + self.oracle_recall_tolerance
+        top_k = min(5, score_logits.size(-1))
+        top_indices = score_logits.topk(top_k, dim=-1).indices
+        top_costs = score_costs.gather(dim=-1, index=top_indices)
+        score_selected_index = (
+            outputs['multimodal_map_selected_index'][:batch_size]
+            if self.use_utility_gate else selected_index)
+        score_selected_cost = score_costs[
+            batch_index, score_selected_index]
         stats['multimodal_top1_oracle_recall'] = (
-            selected_cost[sample_valid] <= near_oracle[sample_valid]
+            score_selected_cost[score_sample_valid]
+            <= (score_oracle_cost + self.oracle_recall_tolerance)[
+                score_sample_valid]
         ).to(raw).mean().detach()
         stats['multimodal_top5_oracle_recall'] = (
-            top_costs[sample_valid] <= near_oracle[sample_valid, None]
+            top_costs[score_sample_valid]
+            <= (score_oracle_cost + self.oracle_recall_tolerance)[
+                score_sample_valid, None]
         ).any(dim=-1).to(raw).mean().detach()
         stats['multimodal_oracle_l2'] = \
             oracle_cost[sample_valid].mean().detach()

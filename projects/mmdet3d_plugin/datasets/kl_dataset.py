@@ -1523,6 +1523,11 @@ class KlDataset(Custom3DDataset):
         per_bucket_selector = {
             name: new_selector_stats() for name in bucket_names
         }
+        multimodal_stats = dict(n=0, map_selected=0, candidate_sum=0.0)
+        per_bucket_multimodal = {
+            name: dict(n=0, map_selected=0, candidate_sum=0.0)
+            for name in bucket_names
+        }
 
         def selector_scalar(blob, key, default=None):
             value = blob.get(key)
@@ -1578,6 +1583,16 @@ class KlDataset(Custom3DDataset):
                         continue
                     agg[f'{name}_eval_l2_sum'][step] += float(error[step])
                     agg[f'{name}_eval_l2_n'][step] += 1
+
+        def add_multimodal_stats(agg, blob):
+            selected = selector_scalar(blob, 'multimodal_selected_index')
+            fallback = selector_scalar(blob, 'multimodal_fallback_index')
+            count = selector_scalar(blob, 'multimodal_candidate_count')
+            if selected is None or fallback is None or count is None:
+                return
+            agg['n'] += 1
+            agg['map_selected'] += int(int(selected) != int(fallback))
+            agg['candidate_sum'] += float(count)
 
         def wrap_pi(angle):
             return (angle + math.pi) % (2.0 * math.pi) - math.pi
@@ -1726,10 +1741,13 @@ class KlDataset(Custom3DDataset):
             bucket_name = planning_bucket(gt_plan, mask)
             add_selector_stats(
                 selector_stats, pred_blob, gt_xy, mask, T)
+            add_multimodal_stats(multimodal_stats, pred_blob)
             if bucket_name in per_bucket_selector:
                 add_selector_stats(
                     per_bucket_selector[bucket_name], pred_blob,
                     gt_xy, mask, T)
+                add_multimodal_stats(
+                    per_bucket_multimodal[bucket_name], pred_blob)
             add_l2(dict(l2_sum=l2_sum, l2_n=l2_n), err, mask, T)
             add_final_disp(disp_stats, pred_xy, gt_xy, mask, T)
             if cmd_id in per_cmd:
@@ -1919,6 +1937,26 @@ class KlDataset(Custom3DDataset):
                 ret_dict[f'planning/{title}/Collision_{lbl}'] = cl
         if len(per_obstacle_lines) > 2:
             lines.extend(per_obstacle_lines)
+
+        multimodal_lines = ['', 'D1 multimodal selection diagnostics:']
+        for name, agg in [('Overall', multimodal_stats)] + [
+                (bucket_title[bucket], per_bucket_multimodal[bucket])
+                for bucket in bucket_names]:
+            if agg['n'] == 0:
+                continue
+            map_rate = agg['map_selected'] / agg['n']
+            candidate_mean = agg['candidate_sum'] / agg['n']
+            prefix = ('planning/multimodal' if name == 'Overall' else
+                      f'planning/multimodal/{name}')
+            ret_dict[f'{prefix}/map_selection_rate'] = map_rate
+            ret_dict[f'{prefix}/candidate_count'] = candidate_mean
+            ret_dict[f'{prefix}/N'] = agg['n']
+            multimodal_lines.append(
+                f'  {name:14s} N={agg["n"]:5d}  '
+                f'map selected {100.0 * map_rate:5.1f}%  '
+                f'candidates {candidate_mean:.1f}')
+        if len(multimodal_lines) > 2:
+            lines.extend(multimodal_lines)
 
         def emit_selector_metrics(prefix, agg, title):
             n = agg['n']

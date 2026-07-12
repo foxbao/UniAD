@@ -1125,14 +1125,75 @@ confirms that these are the only unfrozen parameters. Runtime candidates match
 the D0 implementation exactly on a frame (`1,152` candidates, maximum absolute
 difference `0.0`). A real-data single-GPU forward/backward and a five-GPU DDP
 smoke both pass. At five GPUs, step 10 uses about `716 MB/GPU`, averages `3.09 s`
-per step including startup data time, and the listwise score loss has already
-moved from its zero-logit baseline near `7.05` to `6.60`. The smoke processes
-were stopped after verification and did not produce a promotion checkpoint.
+per step including startup data time, and the listwise score loss moved from its
+zero-logit baseline near `7.05` to `6.60`.
+An initial `+2.0` fallback logit margin still selected fallback on `98%` of
+samples at step 140, so it was rejected as too conservative. D1 uses `+0.1`:
+this still deterministically preserves fallback at zero initialization while
+allowing modest learned evidence to select a map candidate.
+
+The same diagnostic exposed a second issue before promotion: a soft target over
+roughly 1,000 candidates stayed diffuse around duplicated and near-duplicated
+paths. D1 therefore uses a multi-positive listwise loss: every candidate within
+`0.05 m` of the raw oracle is positive, and the loss maximizes their summed
+probability. This avoids arbitrary supervision among identical stop candidates
+while giving map-mode selection a sharper learning signal. The old temperature
+softmax target remains available as an ablation.
+
+Because D1 starts 666k parameters from scratch while every inherited module is
+frozen, it uses `AdamW(lr=5e-4)` rather than C2's fine-tuning rate `5e-5`.
+At `5e-5`, the positive-set probability remained at its random baseline through
+60 steps; that run was stopped before producing a checkpoint. Warmup and the
+existing global gradient clipping remain enabled.
 
 Evaluation has three configurations: D1 map-on, D1-candidate-off while keeping
 the C2.3 fallback, and full-map-off which also removes the C2.3 lane anchor.
 Oracle recall uses a `1 cm` cost tolerance rather than strict candidate index,
 because the stop profile creates many geometrically identical candidates.
+
+### D1 balanced pilot result and rejection
+
+The corrected multi-positive D1 pilot completed 402/402 five-GPU iterations at
+`lr=5e-4`. Full validation gives:
+
+| full validation | C2.3 balanced | D1 bias 0.1 | D1 bias 0.0 |
+|---|---:|---:|---:|
+| avg.L2 | **0.5901** | 0.5840 | 0.5840 |
+| Static | **0.2803** | 0.3286 | 0.3286 |
+| Slow | **0.4838** | 0.4876 | 0.4876 |
+| MovingStraight | 0.7023 | **0.6788** | **0.6788** |
+| Turning | 0.8782 | **0.8448** | **0.8448** |
+| FrontClear | **0.6006** | 0.6175 | 0.6175 |
+| FrontObstacle | 0.5854 | **0.5695** | **0.5695** |
+| avg.Collision | **0.96%** | 0.97% | 0.97% |
+
+The apparent `0.0061` global gain is not evidence for multimodal candidate
+planning. After retaining and aggregating D1 selection IDs, zero-bias inference
+selects a map candidate on exactly `0/4676` frames, including `0%` in every
+motion bucket. Removing the remaining `0.1` margin changes avg.L2 by less than
+`0.000002`. D1 learned a map-attended residual on the C2.3 fallback, which
+explains both the dynamic gains and the Static regression; it did not learn the
+intended map-mode decision. D1 therefore fails promotion.
+
+### D1.1 separated utility gate
+
+D1.1 removes the fallback shortcut from candidate ranking:
+
+1. The listwise score loss sees map candidates only, so it must learn path,
+   speed, and lateral mode ranking rather than source classification.
+2. A separate binary utility gate is supervised on whether the scorer's current
+   map top-1 beats C2.3 fallback by at least `1 cm`.
+3. Map residuals are supervised on the map oracle, while fallback residual is
+   hard-zeroed. A closed utility gate is therefore exactly C2.3, not a learned
+   perturbation of it.
+4. The gate starts at sigmoid(`-2`) and uses hard forward selection with a
+   straight-through gradient. It can only expose map trajectories after the
+   map scorer supplies useful modes.
+
+Synthetic forward/backward verifies exact initial fallback preservation and
+non-zero gradients for the map score, map residual, and utility gate heads.
+D1.1 starts fresh from the balanced C2.3 checkpoint rather than inheriting the
+D1 fallback-source shortcut.
 
 D1 first freezes the UniAD perception, motion, and map encoder and trains only
 the new candidate scorer/residual head. Promotion requires a meaningful gap to
