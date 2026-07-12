@@ -1,8 +1,8 @@
 # HD-Map Fusion for LiDAR Planning — Analysis & Findings
 
-**Status:** In progress (v2 retrain at epoch 2/6 as of 2026-07-08). Early evidence
-strongly suggests the HD-map branch adds no measurable value to planning in this
-port ODD, but the final verdict awaits the epoch-6 ablation.
+**Status:** Updated 2026-07-12. Latent map-feature fusion remains ineffective, but
+the C2.1 straight-through discrete lane-anchor path has now shown a measurable
+causal map contribution and is the current planning champion on full validation.
 
 **Audience:** A collaborator/agent analyzing whether the HD-map planning fusion is
 worth keeping. This doc is self-contained — no prior context needed.
@@ -49,6 +49,12 @@ twice —
 The **map-ON vs map-OFF delta on the SAME checkpoint** = the net causal contribution
 of the map branch. Everything except the map forward path is identical, so any L2
 delta is attributable to the map alone.
+
+For the later explicit lane-anchor routes, `use_map_lane=False` is not sufficient:
+that switch only disables latent map attention, while the selector still reads
+`outs_map['lane_points']`. Their strict map-OFF evaluation instead uses the
+eval-only `ablate_lane_anchor=True` switch, which preserves all checkpoint modules
+but skips lane-anchor construction and fusion in `forward`.
 
 > Note: a **planning-eval mask bug** was found and fixed earlier this session
 > (`kl_dataset._evaluate_planning` mis-parsed the 4D `sdc_planning_mask`, inflating
@@ -761,6 +767,58 @@ has not yet beaten A, so the full run is still an experiment, not the new
 champion. Full-run acceptance requires avg.L2 below `0.60495`, no collision
 regression, and no material Slow-bucket regression. If Slow remains worse, add
 bucket-balanced selector supervision before changing candidate geometry again.
+
+#### C2.1 full-training result and causal ablation (2026-07-12)
+
+The promoted C2.1 model trained for one full epoch and completed its built-in
+full validation normally. It passes all three acceptance criteria:
+
+| model | L2@1s | L2@2s | L2@3s | avg.L2 | avg.Collision |
+|---|---:|---:|---:|---:|---:|
+| A epoch1 | 0.2536 | 0.5735 | 0.9878 | 0.60495 | 0.9637% |
+| C1 hard selector | 0.2611 | 0.5974 | 1.0304 | 0.62966 | 0.9483% |
+| C2.1 pilot | - | - | - | 0.60656 | 0.9557% |
+| **C2.1 full** | **0.25124** | **0.56975** | **0.98261** | **0.60120** | **0.9637%** |
+
+C2.1 full improves A by `0.00375` avg.L2 (`0.62%`) with effectively identical
+collision, and improves C1 by `0.02846` (`4.52%`). The pilot's Slow regression
+did not persist: Slow improved from `0.51793` in the pilot to `0.48401` in the
+full run. Full-run motion buckets are Static `0.28121`, Slow `0.48401`,
+MovingStraight `0.72017`, and Turning `0.89723`.
+
+Selector top-1 accuracy is `48.1%`, the selector score gap is `0.11915`, and the
+selected hard-anchor avg.L2 is `0.64982`. Accuracy did not rise beyond the pilot,
+but the score gap and hard-anchor quality improved, and the learned gate/residual
+converted that anchor into the best final planning result so far. Turning remains
+the weakest selector bucket (`26.8%` accuracy, `0.348` score gap), so it is the
+main remaining target for selector/candidate work.
+
+The strict causal ablation evaluates the same C2.1 checkpoint with
+`ablate_lane_anchor=True`; latent map fusion is already disabled by
+`map_force_scale=0`. Model structure and loaded weights are otherwise identical:
+
+| metric | map-ON | strict map-OFF | map benefit (OFF-ON) |
+|---|---:|---:|---:|
+| avg.L2 | **0.60120** | 0.61519 | **0.01399 (2.27%)** |
+| avg.Collision | **0.9637%** | 0.9797% | 0.0160 pp |
+| Static avg.L2 | **0.28121** | 0.29269 | 0.01148 |
+| Slow avg.L2 | 0.48401 | **0.46086** | -0.02315 |
+| MovingStraight avg.L2 | **0.72017** | 0.74560 | 0.02543 |
+| Turning avg.L2 | **0.89723** | 0.98744 | 0.09021 |
+| FrontClear avg.L2 | **0.62800** | 0.69137 | 0.06337 |
+| FrontObstacle avg.L2 | 0.58970 | **0.58305** | -0.00665 |
+
+This is the first route in this project with a clear same-checkpoint map
+contribution. The gain is concentrated in MovingStraight, Turning, and
+FrontClear scenes; Slow and FrontObstacle still prefer the base trajectory.
+The next iteration should therefore keep the C2.1 discrete anchor path and make
+its application more selective by motion/occupancy context, rather than replacing
+it with another latent fusion block.
+
+An earlier attempted ablation using only `use_map_lane=False` produced values
+identical to map-ON and is invalid: the explicit selector continued consuming
+`outs_map['lane_points']`. Those numbers must not be used as evidence that C2.1
+ignores the map.
 
 Reproduce the zero-shot audit with:
 

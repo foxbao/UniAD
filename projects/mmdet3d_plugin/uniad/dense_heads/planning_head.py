@@ -55,6 +55,7 @@ class PlanningHeadSingleMode(nn.Module):
                  lane_anchor_selector_teacher_force=True,
                  lane_anchor_selector_sample_teacher=True,
                  lane_anchor_selector_temperature=1.0,
+                 ablate_lane_anchor=False,
                  ablate_ego_status='none',
                  planning_motion_loss_weights=None,
                  use_goal=False,
@@ -185,6 +186,7 @@ class PlanningHeadSingleMode(nn.Module):
             lane_anchor_selector_sample_teacher)
         self.lane_anchor_selector_temperature = float(
             lane_anchor_selector_temperature)
+        self.ablate_lane_anchor = bool(ablate_lane_anchor)
         assert self.lane_anchor_selector_temperature > 0.0, (
             'lane_anchor_selector_temperature must be > 0, got '
             f'{lane_anchor_selector_temperature}')
@@ -874,17 +876,19 @@ class PlanningHeadSingleMode(nn.Module):
         lane_anchor_gate = None
         lane_anchor_residual = None
         lane_selector_stats = None
-        if self.lane_anchor_select_mode in (
-                'learned_selector', 'soft_selector',
-                'straight_through_selector'):
-            lane_anchor, lane_selector_stats = \
-                self._learned_selector_lane_anchor(
-                    outs_map, plan_query, sdc_traj_all, sdc_planning,
-                    sdc_planning_mask)
-        else:
-            lane_anchor = self._lane_anchor_trajectory(
-                outs_map, sdc_traj_all.device, sdc_traj_all.dtype,
-                ref_traj=sdc_traj_all.detach())
+        lane_anchor = None
+        if not self.ablate_lane_anchor:
+            if self.lane_anchor_select_mode in (
+                    'learned_selector', 'soft_selector',
+                    'straight_through_selector'):
+                lane_anchor, lane_selector_stats = \
+                    self._learned_selector_lane_anchor(
+                        outs_map, plan_query, sdc_traj_all, sdc_planning,
+                        sdc_planning_mask)
+            else:
+                lane_anchor = self._lane_anchor_trajectory(
+                    outs_map, sdc_traj_all.device, sdc_traj_all.dtype,
+                    ref_traj=sdc_traj_all.detach())
         if lane_anchor is not None:
             if self.lane_anchor_mode == 'replace':
                 sdc_traj_all = lane_anchor + (
