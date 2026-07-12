@@ -815,6 +815,46 @@ The next iteration should therefore keep the C2.1 discrete anchor path and make
 its application more selective by motion/occupancy context, rather than replacing
 it with another latent fusion block.
 
+#### C2.1 gate diagnostic and C2.2 proposal (2026-07-12)
+
+The first version of `tools/analysis_tools/diagnose_lane_anchor_gate.py` did not
+apply `sdc_planning_mask`, so its Static statistics included invalid padded
+samples. The tool was corrected before interpreting the diagnostic below. On
+the first 512 validation frames, it retained 503 samples with valid planning GT
+and additionally measured base/final/anchor L2 against the valid GT steps.
+
+The final C2.1 trajectory improved over the base trajectory on only `41.7%` of
+these samples. The current learned gate is not selecting those samples well:
+
+| group | N | gate mean | final gain vs base | selector accuracy |
+|---|---:|---:|---:|---:|
+| map helped | 210 | 0.2179 | +0.1266 m | 53.8% |
+| map hurt | 293 | 0.2330 | -0.0784 m | 29.7% |
+
+Gate-to-gain correlation is `-0.164`, while selector max-probability-to-gain
+correlation is only `-0.078`. The selector's confidence is therefore not yet a
+safe inference threshold. Selector correctness, however, is strongly associated
+with map utility, which supports improving selection and gate supervision
+together rather than deleting the map path.
+
+The next experiment is **C2.2 utility-supervised gate**:
+
+1. Keep C2.1's discrete selector and candidate construction unchanged.
+2. For each valid training sample, form the candidate endpoint after the current
+   residual head, `map_traj`, and the base trajectory `base_traj`.
+3. Compute the continuous gate target that minimizes squared trajectory error on
+   the line `base_traj + alpha * (map_traj - base_traj)`, with `alpha` clamped to
+   `[0, 1]`. Stop-gradient through this target.
+4. Add an auxiliary MSE loss from the predicted `lane_anchor_gate` to this
+   target. Initially train only the gate head from the C2.1 checkpoint, keeping
+   selector and residual weights frozen; this isolates whether selective map use
+   fixes the Slow/FrontObstacle regressions.
+
+The first C2.2 pilot should use a small scene subset and compare the same full
+validation protocol. Promotion requires `avg.L2 <= 0.60120`, no collision
+regression, and no Slow regression. If gate-only C2.2 fails, retain C2.1 as the
+baseline and then investigate selector ranking/Turning candidates separately.
+
 An earlier attempted ablation using only `use_map_lane=False` produced values
 identical to map-ON and is invalid: the explicit selector continued consuming
 `outs_map['lane_points']`. Those numbers must not be used as evidence that C2.1

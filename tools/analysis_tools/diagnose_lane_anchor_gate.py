@@ -84,10 +84,25 @@ def final_disp(traj: np.ndarray) -> np.ndarray:
     return np.linalg.norm(traj[:, -1, :2], axis=-1)
 
 
-def classify_gt(gt_traj: np.ndarray, args: argparse.Namespace) -> str:
+def planning_mask(value, length: int):
+    arr = to_numpy(value)
+    if arr is None:
+        return np.ones(length, dtype=bool)
+    arr = np.asarray(arr)
+    if arr.ndim >= 2:
+        arr = arr.any(axis=-1)
+    return arr.reshape(-1).astype(bool)[:length]
+
+
+def classify_gt(gt_traj: np.ndarray, valid: np.ndarray,
+                args: argparse.Namespace) -> str:
     if gt_traj is None or len(gt_traj) == 0:
         return 'all'
     traj = gt_traj[0]
+    valid = valid[:len(traj)]
+    traj = traj[valid]
+    if len(traj) == 0:
+        return 'all'
     disp = float(np.linalg.norm(traj[-1, :2]))
     if disp < args.static_thr:
         return 'static'
@@ -104,6 +119,16 @@ def classify_gt(gt_traj: np.ndarray, args: argparse.Namespace) -> str:
         if ratio >= args.turn_lateral_thr:
             return 'turning'
     return 'moving'
+
+
+def gt_l2(traj: np.ndarray, gt: np.ndarray, valid: np.ndarray) -> float:
+    length = min(traj.shape[1], gt.shape[1], len(valid))
+    valid = valid[:length]
+    if not valid.any():
+        return float('nan')
+    error = np.linalg.norm(
+        traj[0, :length, :2] - gt[0, :length, :2], axis=-1)
+    return float(np.mean(error[valid]))
 
 
 def add_stats(rows: List[Dict[str, float]], bucket: str, stats: Dict[str, list]):
@@ -172,7 +197,11 @@ def main():
         name: {
             'gate': [], 'residual_l2': [], 'anchor_delta_l2': [],
             'final_delta_l2': [], 'base_final_disp': [], 'final_disp': [],
-            'anchor_final_disp': [],
+            'anchor_final_disp': [], 'base_gt_l2': [], 'final_gt_l2': [],
+            'anchor_gt_l2': [], 'final_gain_vs_base': [],
+            'anchor_gain_vs_base': [], 'map_helped': [],
+            'selector_max_prob': [], 'selector_entropy': [],
+            'selector_correct': [],
         } for name in BUCKET_ORDER
     }
 
@@ -190,16 +219,34 @@ def main():
         anchor = first_traj(result_planning.get('lane_anchor'))
         residual = first_traj(result_planning.get('lane_anchor_residual'))
         gt = first_traj(planning_gt.get('sdc_planning'), channels=2)
+        valid = planning_mask(
+            planning_gt.get('sdc_planning_mask'),
+            gt.shape[1] if gt is not None else 0)
         if gate is None or base is None or final is None or anchor is None:
             continue
+        if gt is None or not valid.any():
+            continue
 
-        bucket = classify_gt(gt, args)
+        bucket = classify_gt(gt, valid, args)
+        if bucket == 'all':
+            continue
         residual_l2 = 0.0 if residual is None else float(
             np.linalg.norm(residual.reshape(-1, 2), axis=-1).mean())
         anchor_delta_l2 = float(
             np.linalg.norm((anchor - base).reshape(-1, 2), axis=-1).mean())
         final_delta_l2 = float(
             np.linalg.norm((final - base).reshape(-1, 2), axis=-1).mean())
+        base_gt_l2 = gt_l2(base, gt, valid)
+        final_gt_l2 = gt_l2(final, gt, valid)
+        anchor_gt_l2 = gt_l2(anchor, gt, valid)
+        selector_max_prob = scalar_array(
+            result_planning.get('lane_anchor_selector_max_prob'))
+        selector_entropy = scalar_array(
+            result_planning.get('lane_anchor_selector_entropy'))
+        selector_pred = scalar_array(
+            result_planning.get('lane_anchor_selector_pred'))
+        selector_target = scalar_array(
+            result_planning.get('lane_anchor_selector_target'))
         row = dict(
             index=idx,
             bucket=bucket,
@@ -210,6 +257,21 @@ def main():
             base_final_disp=float(final_disp(base)[0]),
             final_disp=float(final_disp(final)[0]),
             anchor_final_disp=float(final_disp(anchor)[0]),
+            base_gt_l2=base_gt_l2,
+            final_gt_l2=final_gt_l2,
+            anchor_gt_l2=anchor_gt_l2,
+            final_gain_vs_base=base_gt_l2 - final_gt_l2,
+            anchor_gain_vs_base=base_gt_l2 - anchor_gt_l2,
+            map_helped=float(final_gt_l2 < base_gt_l2),
+            selector_max_prob=(
+                float(selector_max_prob[0])
+                if selector_max_prob is not None else float('nan')),
+            selector_entropy=(
+                float(selector_entropy[0])
+                if selector_entropy is not None else float('nan')),
+            selector_correct=float(
+                selector_pred is not None and selector_target is not None
+                and int(selector_pred[0]) == int(selector_target[0])),
         )
         per_sample.append(row)
         for name in ('all', bucket):
