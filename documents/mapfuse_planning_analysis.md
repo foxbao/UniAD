@@ -1223,6 +1223,27 @@ only when predicted improvement exceeds `1 cm`. This replaces the unstable
 binary target with magnitude-aware supervision while keeping a closed gate
 exactly equal to C2.3.
 
+D1.2 completed its 402-step balanced pilot. Default full validation is
+`avg.L2=0.59133`, slightly worse than C2.3. It selects map on `3.12%` overall,
+but the selection is misallocated: Static `7.77%`, Slow `2.29%`,
+MovingStraight `2.25%`, and Turning `0%`. Bucket L2 is Static `0.27754`, Slow
+`0.48387`, MovingStraight `0.70515`, and Turning `0.87815`. The small Static
+gain is outweighed by MovingStraight regression.
+
+An offline sweep from predicted improvement `-0.50` to `+0.50 m` finds no
+threshold that beats fallback. At `+0.02`, only `0.5%` of frames use map and
+avg.L2 is still `0.5903`; at `+0.04` the model is effectively fallback-only and
+returns `0.5901`. Lower thresholds open bad map candidates and regress rapidly.
+D1.2 therefore fails promotion, and post-hoc utility-gate calibration stops
+here.
+
+The next structural experiment must put map candidates and fallback on one
+calibrated scale: predict evaluation-horizon cost for every candidate,
+supervise those costs directly (with balanced near-best/fallback weighting),
+and select minimum predicted cost. This removes the separate utility gate while
+retaining the demonstrated map-top1/fallback oracle of `0.4864` as the target
+upper bound.
+
 D1 first freezes the UniAD perception, motion, and map encoder and trains only
 the new candidate scorer/residual head. Promotion requires a meaningful gap to
 the D0 oracle, `avg.L2 < 0.5901`, no Slow/Turning regression, and a map-off
