@@ -25,6 +25,9 @@ class MapMultimodalPlanner(nn.Module):
                  utility_gate_init=-2.0,
                  utility_gate_loss_weight=1.0,
                  utility_min_improvement=0.01,
+                 utility_threshold=0.5,
+                 utility_target_mode='binary',
+                 utility_regression_clip=2.0,
                  ablate_map=False):
         super().__init__()
         self.planning_steps = int(planning_steps)
@@ -45,6 +48,13 @@ class MapMultimodalPlanner(nn.Module):
         self.use_utility_gate = bool(use_utility_gate)
         self.utility_gate_loss_weight = float(utility_gate_loss_weight)
         self.utility_min_improvement = float(utility_min_improvement)
+        self.utility_threshold = float(utility_threshold)
+        if utility_target_mode not in ('binary', 'improvement_regression'):
+            raise ValueError(
+                'utility_target_mode must be binary/improvement_regression, '
+                f'got {utility_target_mode}')
+        self.utility_target_mode = utility_target_mode
+        self.utility_regression_clip = float(utility_regression_clip)
         self.ablate_map = bool(ablate_map)
         assert self.coordinate_scale > 0.0
         assert self.residual_scale >= 0.0
@@ -73,6 +83,7 @@ class MapMultimodalPlanner(nn.Module):
             nn.ReLU(inplace=True),
             nn.Linear(embed_dims, trajectory_dims))
         self.utility_gate_head = None
+        self.utility_regression_head = None
         if self.use_utility_gate:
             self.utility_gate_head = nn.Sequential(
                 nn.Linear(embed_dims * 3, embed_dims),
@@ -81,6 +92,15 @@ class MapMultimodalPlanner(nn.Module):
             nn.init.zeros_(self.utility_gate_head[-1].weight)
             nn.init.constant_(
                 self.utility_gate_head[-1].bias, float(utility_gate_init))
+            if self.utility_target_mode == 'improvement_regression':
+                utility_dims = embed_dims * 3 + trajectory_dims * 3
+                self.utility_regression_head = nn.Sequential(
+                    nn.Linear(utility_dims, embed_dims),
+                    nn.ReLU(inplace=True),
+                    nn.Linear(embed_dims, 1))
+                nn.init.zeros_(self.utility_regression_head[-1].weight)
+                nn.init.constant_(
+                    self.utility_regression_head[-1].bias, -0.1)
 
         nn.init.zeros_(self.score_head.weight)
         nn.init.zeros_(self.score_head.bias)
@@ -193,9 +213,12 @@ class MapMultimodalPlanner(nn.Module):
         refined_candidates = raw_candidates + residual
 
         utility_logit = None
+        utility_score = None
         utility_probability = None
         map_selected_index = None
+        selected_map = None
         fallback_index = num_candidates - 1
+        fallback_traj = refined_candidates[:, -1]
         if self.use_utility_gate and num_candidates > 1:
             map_logits = logits[:, :-1]
             map_probabilities = torch.softmax(map_logits, dim=-1)
@@ -216,16 +239,33 @@ class MapMultimodalPlanner(nn.Module):
                 feature[:, :-1] * map_weights[..., None], dim=1)
             utility_input = torch.cat(
                 [context, selected_map_feature, feature[:, -1]], dim=-1)
-            utility_logit = self.utility_gate_head(utility_input).squeeze(-1)
-            utility_probability = torch.sigmoid(utility_logit)
-            map_hard = (utility_probability >= 0.5).to(utility_probability)
+            if self.utility_target_mode == 'improvement_regression':
+                trajectory_input = torch.cat([
+                    selected_map, fallback_traj,
+                    selected_map - fallback_traj], dim=-1).reshape(
+                        batch_size, -1) / self.coordinate_scale
+                utility_score = self.utility_regression_head(torch.cat(
+                    [utility_input, trajectory_input], dim=-1)).squeeze(-1)
+                utility_logit = utility_score
+                utility_probability = torch.sigmoid(utility_score)
+                map_hard = (
+                    utility_score >= self.utility_min_improvement
+                ).to(utility_score)
+                gate_soft = torch.sigmoid(
+                    utility_score - self.utility_min_improvement)
+            else:
+                utility_logit = self.utility_gate_head(
+                    utility_input).squeeze(-1)
+                utility_probability = torch.sigmoid(utility_logit)
+                map_hard = (
+                    utility_probability >= self.utility_threshold
+                ).to(utility_probability)
+                gate_soft = utility_probability
             if self.training:
                 map_weight = (
-                    map_hard + utility_probability
-                    - utility_probability.detach())
+                    map_hard + gate_soft - gate_soft.detach())
             else:
                 map_weight = map_hard
-            fallback_traj = refined_candidates[:, -1]
             selected = fallback_traj + map_weight[:, None, None] * (
                 selected_map - fallback_traj)
             selected_index = torch.where(
@@ -260,7 +300,10 @@ class MapMultimodalPlanner(nn.Module):
                 (batch_size,), fallback_index, dtype=torch.long),
             multimodal_map_selected_index=map_selected_index,
             multimodal_utility_logit=utility_logit,
+            multimodal_utility_score=utility_score,
             multimodal_utility_probability=utility_probability,
+            multimodal_selected_map_traj=selected_map,
+            multimodal_fallback_traj=fallback_traj,
             multimodal_selected_traj=selected,
         )
 
@@ -309,6 +352,8 @@ class MapMultimodalPlanner(nn.Module):
             multimodal_utility_target_rate=zero.detach(),
             multimodal_utility_probability=zero.detach(),
             multimodal_utility_accuracy=zero.detach(),
+            multimodal_utility_target_mean=zero.detach(),
+            multimodal_utility_mae=zero.detach(),
             multimodal_map_oracle_l2=zero.detach(),
             multimodal_pred_map_l2=zero.detach(),
             multimodal_fallback_l2=zero.detach(),
@@ -379,18 +424,37 @@ class MapMultimodalPlanner(nn.Module):
                 predicted_map_cost + self.utility_min_improvement
                 < fallback_cost)
             utility_logit = outputs['multimodal_utility_logit'][:batch_size]
-            stats['loss_multimodal_utility_gate'] = (
-                F.binary_cross_entropy_with_logits(
-                    utility_logit[sample_valid],
-                    utility_target[sample_valid].to(utility_logit))
-                * self.utility_gate_loss_weight)
+            utility_improvement = (fallback_cost - predicted_map_cost).clamp(
+                min=-self.utility_regression_clip,
+                max=self.utility_regression_clip).detach()
+            if self.utility_target_mode == 'improvement_regression':
+                stats['loss_multimodal_utility_gate'] = (
+                    F.smooth_l1_loss(
+                        utility_logit[sample_valid],
+                        utility_improvement[sample_valid])
+                    * self.utility_gate_loss_weight)
+                utility_decision = (
+                    utility_logit >= self.utility_min_improvement)
+                stats['multimodal_utility_target_mean'] = utility_improvement[
+                    sample_valid].mean().detach()
+                stats['multimodal_utility_mae'] = (
+                    utility_logit[sample_valid]
+                    - utility_improvement[sample_valid]
+                ).abs().mean().detach()
+            else:
+                stats['loss_multimodal_utility_gate'] = (
+                    F.binary_cross_entropy_with_logits(
+                        utility_logit[sample_valid],
+                        utility_target[sample_valid].to(utility_logit))
+                    * self.utility_gate_loss_weight)
+                utility_decision = (torch.sigmoid(utility_logit) >= 0.5)
             utility_probability = torch.sigmoid(utility_logit)
             stats['multimodal_utility_target_rate'] = utility_target[
                 sample_valid].to(raw).mean().detach()
             stats['multimodal_utility_probability'] = utility_probability[
                 sample_valid].mean().detach()
             stats['multimodal_utility_accuracy'] = (
-                (utility_probability[sample_valid] >= 0.5)
+                utility_decision[sample_valid]
                 == utility_target[sample_valid]
             ).to(raw).mean().detach()
             stats['multimodal_map_oracle_l2'] = score_oracle_cost[

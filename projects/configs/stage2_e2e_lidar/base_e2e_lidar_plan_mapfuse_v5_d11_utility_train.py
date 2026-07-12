@@ -8,6 +8,7 @@ model = dict(planning_head=dict(multimodal_planner=dict(
     utility_gate_init=-2.0,
     utility_gate_loss_weight=1.0,
     utility_min_improvement=0.01,
+    utility_threshold=0.5,
 )))
 
 # Start D1.1 fresh: the D1 scorer learned the fallback-source shortcut.

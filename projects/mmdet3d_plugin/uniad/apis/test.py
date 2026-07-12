@@ -212,6 +212,11 @@ def _compact_planning_for_eval(planning):
             'multimodal_selected_index': torch.long,
             'multimodal_fallback_index': torch.long,
             'multimodal_candidate_count': torch.long,
+            'multimodal_map_selected_index': torch.long,
+            'multimodal_utility_probability': torch.float32,
+            'multimodal_utility_score': torch.float32,
+            'multimodal_selected_map_traj': torch.float32,
+            'multimodal_fallback_traj': torch.float32,
         }
         for key, dtype in selector_field_dtypes.items():
             if key in result_planning:

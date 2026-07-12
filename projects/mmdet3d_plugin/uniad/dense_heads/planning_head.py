@@ -972,6 +972,14 @@ class PlanningHeadSingleMode(nn.Module):
                 ret['multimodal_candidate_count'] = \
                     multimodal_outputs['multimodal_candidate_valid'].sum(
                         dim=-1)
+                for key in (
+                        'multimodal_map_selected_index',
+                        'multimodal_utility_probability',
+                        'multimodal_utility_score',
+                        'multimodal_selected_map_traj',
+                        'multimodal_fallback_traj'):
+                    if multimodal_outputs.get(key) is not None:
+                        ret[key] = multimodal_outputs[key]
         return ret
 
     def collision_optimization(self, sdc_traj_all, occ_mask):

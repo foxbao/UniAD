@@ -1195,6 +1195,34 @@ non-zero gradients for the map score, map residual, and utility gate heads.
 D1.1 starts fresh from the balanced C2.3 checkpoint rather than inheriting the
 D1 fallback-source shortcut.
 
+### D1.1 result and utility diagnosis
+
+The D1.1 balanced pilot completed 402/402 iterations. Its map-only ranking
+improved materially during training: top-1/top-5 near-oracle recall reached
+roughly `38%/64%`. At the default utility threshold, however, full validation
+selected map on `0/4676` frames and reproduced C2.3 exactly (`avg.L2=0.59011`,
+Static `0.28027`, Slow `0.48379`, MovingStraight `0.70230`, Turning `0.87817`).
+This confirms fallback safety but not map use.
+
+One additional evaluation retained the gate score, predicted map top-1, and
+fallback trajectory, allowing all thresholds to be swept offline with the
+official per-horizon aggregation. No fixed binary-gate threshold beats the
+fallback: threshold `0.42` opens `4.3%` of frames but gives `avg.L2=0.5930`,
+while lower thresholds regress sharply. The scorer itself is more promising:
+an oracle choosing between its map top-1 and fallback reaches `avg.L2=0.4864`
+and uses map on `43.7%` of valid frames. The bottleneck is therefore utility
+prediction, not total loss of the candidate-ranking signal.
+
+### D1.2 continuous utility regression
+
+D1.2 freezes D1.1's scorer and map residual and trains only a new utility head.
+The head receives planning context, selected-map/fallback features, both
+six-step trajectories, and their explicit difference. It regresses the clipped
+continuous target `fallback_cost - predicted_map_cost`; inference opens map
+only when predicted improvement exceeds `1 cm`. This replaces the unstable
+binary target with magnitude-aware supervision while keeping a closed gate
+exactly equal to C2.3.
+
 D1 first freezes the UniAD perception, motion, and map encoder and trains only
 the new candidate scorer/residual head. Promotion requires a meaningful gap to
 the D0 oracle, `avg.L2 < 0.5901`, no Slow/Turning regression, and a map-off
