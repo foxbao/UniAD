@@ -882,6 +882,46 @@ selector diagnostics changed despite selector weights being frozen, that result
 is invalid and is discarded. The strict-frozen-eval pilot is the authoritative
 test.
 
+#### C2.2 strict pilot result
+
+The strict pilot used the same first 24 complete scenes and 2091 frames as the
+C2.1 pilot. Checkpoint comparison confirmed that exactly four tensors changed,
+all under `planning_head.lane_anchor_gate_head`; every other parameter and buffer
+was bit-identical to C2.1 epoch1.
+
+| full validation | C2.1 full | C2.2 strict pilot | delta |
+|---|---:|---:|---:|
+| L2@1s | 0.2512 | **0.2500** | -0.0012 |
+| L2@2s | 0.5697 | **0.5680** | -0.0017 |
+| L2@3s | 0.9826 | **0.9805** | -0.0021 |
+| avg.L2 | 0.6012 | **0.5995** | -0.0017 (-0.28%) |
+| avg.Collision | 0.9637% | 0.96% | effectively flat |
+| Static avg.L2 | **0.2812** | 0.2814 | +0.0002 |
+| Slow avg.L2 | **0.4840** | 0.4914 | +0.0074 |
+| MovingStraight avg.L2 | 0.7202 | **0.7148** | -0.0054 |
+| Turning avg.L2 | 0.8972 | **0.8854** | -0.0118 |
+| FrontClear avg.L2 | 0.6280 | **0.6144** | -0.0136 |
+| FrontObstacle avg.L2 | **0.5897** | 0.5930 | +0.0033 |
+
+C2.2 improves every reported horizon and the global avg.L2, but fails the
+pre-declared promotion gate because Slow and FrontObstacle regress. It should
+not yet be trained on the full dataset.
+
+On the same 503 valid diagnostic samples, C2.2 increased mean gate from `0.227`
+to `0.277` and changed gate-to-final-gain correlation from `-0.164` to `+0.261`.
+This confirms that direct utility supervision is useful. However, it raises map
+use broadly: Slow gate `0.219 -> 0.277`, Moving `0.231 -> 0.285`, and Turning
+`0.275 -> 0.340`. The small diagnostic subset shows local improvements, while
+the 1093-sample full-validation Slow bucket regresses, exposing a distribution
+and objective mismatch.
+
+Recommended successor: keep strict gate-only isolation, but replace the current
+six-step least-squares target with an evaluation-aligned target. Search alpha on
+the base-to-map line using Euclidean errors at the actual 1s/2s/3s evaluation
+steps, and default to alpha=0 when the best map blend does not beat base by a
+minimum margin. Use a scene subset with adequate Slow/Turning representation
+before considering full training.
+
 An earlier attempted ablation using only `use_map_lane=False` produced values
 identical to map-ON and is invalid: the explicit selector continued consuming
 `outs_map['lane_points']`. Those numbers must not be used as evidence that C2.1
