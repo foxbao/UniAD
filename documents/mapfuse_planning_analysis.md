@@ -922,6 +922,39 @@ steps, and default to alpha=0 when the best map blend does not beat base by a
 minimum margin. Use a scene subset with adequate Slow/Turning representation
 before considering full training.
 
+#### C2.3 evaluation-aligned gate setup and smoke test (2026-07-12)
+
+C2.3 implements that successor while retaining C2.1's selector, candidate,
+residual, and inference path. For each valid sample it evaluates 21 uniformly
+spaced blend coefficients on `[0, 1]` using mean Euclidean L2 at trajectory
+indices 1/3/5 (the evaluator's 1s/2s/3s horizons). The supervised target is the
+best coefficient only when it improves over the base trajectory by at least
+`0.01 m`; otherwise the target is zero. The old least-squares target remains the
+default, so C2.1/C2.2 and older configs are behaviorally unchanged.
+
+The strict C2.3 config inherits C2.2's state-safe gate-only freeze and loads the
+C2.1 epoch1 checkpoint. Synthetic tests recovered exact grid targets `0.0`,
+`0.5`, and `1.0`, verified invalid-horizon masking, and confirmed that a
+`0.005 m` gain is rejected by the `0.01 m` margin. The C2.2 least-squares compatibility
+test also remains unchanged.
+
+A 148-frame, two-scene, five-GPU smoke run completed 30/30 iterations without
+DDP mismatch, NaN, OOM, or residual UniAD processes. At iterations 10/20/30,
+target use rate was `0.54/0.46/0.42`, target mean `0.394/0.310/0.310`, gate MAE
+was `0.329/0.291/0.303`, and gradient norm was `2.33/1.69/1.82`. Checkpoint
+comparison found exactly four changed tensors, all in
+`planning_head.lane_anchor_gate_head`; the other 1697 parameters and buffers
+were bit-identical to C2.1 epoch1.
+
+The full training set contains 43,981 samples across 584 scenes, including
+6,567 Slow and 1,458 Turning samples. To avoid repeating C2.2's scene-distribution
+mismatch, `make_planning_bucket_scene_subset.py` builds deterministic,
+scene-complete subsets with planning-bucket quotas. The C2.3 pilot subset has 41
+scenes and 2,010 samples: 258 Static, 428 Slow, 1,105 MovingStraight, 156
+Turning, and 63 without valid planning GT. The next decision is based on this
+pilot followed by the unchanged full validation set; the smoke run is only an
+implementation check.
+
 An earlier attempted ablation using only `use_map_lane=False` produced values
 identical to map-ON and is invalid: the explicit selector continued consuming
 `outs_map['lane_points']`. Those numbers must not be used as evidence that C2.1

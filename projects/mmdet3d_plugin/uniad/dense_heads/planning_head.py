@@ -52,6 +52,9 @@ class PlanningHeadSingleMode(nn.Module):
                  lane_anchor_static_gate_loss_weight=0.0,
                  lane_anchor_static_disp_thresh=0.5,
                  lane_anchor_utility_gate_loss_weight=0.0,
+                 lane_anchor_utility_target_mode='least_squares',
+                 lane_anchor_utility_grid_size=21,
+                 lane_anchor_utility_min_improvement=0.0,
                  lane_anchor_selector_loss_weight=0.0,
                  lane_anchor_selector_teacher_force=True,
                  lane_anchor_selector_sample_teacher=True,
@@ -159,6 +162,22 @@ class PlanningHeadSingleMode(nn.Module):
         assert self.lane_anchor_utility_gate_loss_weight >= 0.0, (
             'lane_anchor_utility_gate_loss_weight must be >= 0, got '
             f'{lane_anchor_utility_gate_loss_weight}')
+        assert lane_anchor_utility_target_mode in (
+            'least_squares', 'eval_grid'), (
+            'lane_anchor_utility_target_mode must be least_squares/eval_grid, '
+            f'got {lane_anchor_utility_target_mode}')
+        self.lane_anchor_utility_target_mode = \
+            lane_anchor_utility_target_mode
+        self.lane_anchor_utility_grid_size = int(
+            lane_anchor_utility_grid_size)
+        assert self.lane_anchor_utility_grid_size >= 2, (
+            'lane_anchor_utility_grid_size must be >= 2, got '
+            f'{lane_anchor_utility_grid_size}')
+        self.lane_anchor_utility_min_improvement = float(
+            lane_anchor_utility_min_improvement)
+        assert self.lane_anchor_utility_min_improvement >= 0.0, (
+            'lane_anchor_utility_min_improvement must be >= 0, got '
+            f'{lane_anchor_utility_min_improvement}')
         assert lane_anchor_sample_mode in ('whole_lane', 'local_forward'), (
             'lane_anchor_sample_mode must be whole_lane/local_forward, got '
             f'{lane_anchor_sample_mode}')
@@ -1094,6 +1113,46 @@ class PlanningHeadSingleMode(nn.Module):
         target = torch.where(has_target, target, torch.zeros_like(target))
         return target.detach(), has_target
 
+    @staticmethod
+    def _eval_grid_gate_target(base_traj, map_traj, gt_traj, valid_mask,
+                               grid_size=21, min_improvement=0.0, eps=1e-6):
+        """Search alpha using the evaluator's 1s/2s/3s Euclidean L2."""
+        base = base_traj[..., :2].detach()
+        delta = (map_traj[..., :2] - base).detach()
+        gt = gt_traj[..., :2].detach()
+        horizon_idx = torch.tensor(
+            [1, 3, 5], device=base.device, dtype=torch.long)
+        horizon_idx = horizon_idx[horizon_idx < base.size(-2)]
+        if horizon_idx.numel() == 0:
+            empty = base.new_zeros(base.size(0))
+            return empty, torch.zeros_like(empty, dtype=torch.bool), empty
+
+        base = base.index_select(-2, horizon_idx)
+        delta = delta.index_select(-2, horizon_idx)
+        gt = gt.index_select(-2, horizon_idx)
+        valid = valid_mask.to(device=base.device, dtype=torch.bool) \
+            .index_select(-1, horizon_idx)
+        has_target = valid.any(dim=-1) & \
+            (delta.square().sum(dim=(-2, -1)) > eps)
+
+        alphas = torch.linspace(
+            0.0, 1.0, grid_size, device=base.device, dtype=base.dtype)
+        candidates = base[:, None] + \
+            alphas[None, :, None, None] * delta[:, None]
+        errors = torch.linalg.norm(
+            candidates - gt[:, None], dim=-1)
+        valid_f = valid.to(errors.dtype)
+        costs = (errors * valid_f[:, None]).sum(dim=-1) / \
+            valid_f.sum(dim=-1, keepdim=True).clamp_min(1.0)
+        best_cost, best_idx = costs.min(dim=1)
+        base_cost = costs[:, 0]
+        improvement = (base_cost - best_cost).clamp_min(0.0)
+        target = alphas[best_idx]
+        target = torch.where(
+            has_target & (improvement >= min_improvement),
+            target, torch.zeros_like(target))
+        return target.detach(), has_target, improvement.detach()
+
     def _lane_anchor_utility_gate_loss(self, sdc_planning,
                                        sdc_planning_mask, outs_planning):
         gate = outs_planning['lane_anchor_gate'].reshape(-1)
@@ -1103,6 +1162,8 @@ class PlanningHeadSingleMode(nn.Module):
             lane_anchor_utility_valid_rate=zero.detach(),
             lane_anchor_utility_target_mean=zero.detach(),
             lane_anchor_utility_gate_mae=zero.detach(),
+            lane_anchor_utility_use_rate=zero.detach(),
+            lane_anchor_utility_improvement_mean=zero.detach(),
         )
         required = ('sdc_traj_base', 'lane_anchor', 'lane_anchor_residual')
         if any(key not in outs_planning for key in required):
@@ -1121,20 +1182,33 @@ class PlanningHeadSingleMode(nn.Module):
         if batch_size == 0:
             return stats
 
-        target, has_target = self._optimal_blend_gate_target(
-            base_traj[:batch_size], map_traj[:batch_size],
-            gt_traj[:batch_size], valid_mask[:batch_size])
+        if self.lane_anchor_utility_target_mode == 'eval_grid':
+            target, has_target, improvement = self._eval_grid_gate_target(
+                base_traj[:batch_size], map_traj[:batch_size],
+                gt_traj[:batch_size], valid_mask[:batch_size],
+                grid_size=self.lane_anchor_utility_grid_size,
+                min_improvement=self.lane_anchor_utility_min_improvement)
+        else:
+            target, has_target = self._optimal_blend_gate_target(
+                base_traj[:batch_size], map_traj[:batch_size],
+                gt_traj[:batch_size], valid_mask[:batch_size])
+            improvement = torch.zeros_like(target)
         stats['lane_anchor_utility_valid_rate'] = \
             has_target.to(gate).mean().detach()
         if has_target.any():
             pred = gate[:batch_size][has_target]
             target = target[has_target].to(pred)
+            improvement = improvement[has_target].to(pred)
             stats['loss_lane_anchor_utility_gate'] = (
                 F.mse_loss(pred, target)
                 * self.lane_anchor_utility_gate_loss_weight)
             stats['lane_anchor_utility_target_mean'] = target.mean().detach()
             stats['lane_anchor_utility_gate_mae'] = \
                 (pred - target).abs().mean().detach()
+            stats['lane_anchor_utility_use_rate'] = \
+                (target > 0).to(pred).mean().detach()
+            stats['lane_anchor_utility_improvement_mean'] = \
+                improvement.mean().detach()
         return stats
 
     def loss(self, sdc_planning, sdc_planning_mask, outs_planning, future_gt_bbox=None):
