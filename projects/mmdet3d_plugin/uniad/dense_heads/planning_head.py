@@ -51,6 +51,7 @@ class PlanningHeadSingleMode(nn.Module):
                  lane_anchor_init_alpha=0.3,
                  lane_anchor_static_gate_loss_weight=0.0,
                  lane_anchor_static_disp_thresh=0.5,
+                 lane_anchor_utility_gate_loss_weight=0.0,
                  lane_anchor_selector_loss_weight=0.0,
                  lane_anchor_selector_teacher_force=True,
                  lane_anchor_selector_sample_teacher=True,
@@ -153,6 +154,11 @@ class PlanningHeadSingleMode(nn.Module):
             lane_anchor_static_gate_loss_weight)
         self.lane_anchor_static_disp_thresh = float(
             lane_anchor_static_disp_thresh)
+        self.lane_anchor_utility_gate_loss_weight = float(
+            lane_anchor_utility_gate_loss_weight)
+        assert self.lane_anchor_utility_gate_loss_weight >= 0.0, (
+            'lane_anchor_utility_gate_loss_weight must be >= 0, got '
+            f'{lane_anchor_utility_gate_loss_weight}')
         assert lane_anchor_sample_mode in ('whole_lane', 'local_forward'), (
             'lane_anchor_sample_mode must be whole_lane/local_forward, got '
             f'{lane_anchor_sample_mode}')
@@ -1073,6 +1079,64 @@ class PlanningHeadSingleMode(nn.Module):
         weight = float(self.planning_motion_loss_weights.get(bucket, 1.0))
         return bucket, sdc_planning.new_tensor(weight)
 
+    @staticmethod
+    def _optimal_blend_gate_target(base_traj, map_traj, gt_traj, valid_mask,
+                                   eps=1e-6):
+        """Return the least-squares alpha on the base-to-map trajectory line."""
+        delta = (map_traj[..., :2] - base_traj[..., :2]).detach()
+        gt_delta = (gt_traj[..., :2] - base_traj[..., :2]).detach()
+        valid = valid_mask.to(device=delta.device, dtype=delta.dtype)
+        weighted_delta = delta * valid[..., None]
+        numerator = (weighted_delta * gt_delta).sum(dim=(-2, -1))
+        denominator = (weighted_delta * delta).sum(dim=(-2, -1))
+        has_target = valid.bool().any(dim=-1) & (denominator > eps)
+        target = (numerator / denominator.clamp_min(eps)).clamp(0.0, 1.0)
+        target = torch.where(has_target, target, torch.zeros_like(target))
+        return target.detach(), has_target
+
+    def _lane_anchor_utility_gate_loss(self, sdc_planning,
+                                       sdc_planning_mask, outs_planning):
+        gate = outs_planning['lane_anchor_gate'].reshape(-1)
+        zero = gate.sum() * 0.0
+        stats = dict(
+            loss_lane_anchor_utility_gate=zero,
+            lane_anchor_utility_valid_rate=zero.detach(),
+            lane_anchor_utility_target_mean=zero.detach(),
+            lane_anchor_utility_gate_mae=zero.detach(),
+        )
+        required = ('sdc_traj_base', 'lane_anchor', 'lane_anchor_residual')
+        if any(key not in outs_planning for key in required):
+            return stats
+
+        base_traj = outs_planning['sdc_traj_base'][..., :2]
+        map_traj = (
+            outs_planning['lane_anchor'][..., :2]
+            + outs_planning['lane_anchor_residual'][..., :2])
+        gt_traj = sdc_planning[0, :, :self.planning_steps, :2]
+        valid_mask = torch.any(
+            sdc_planning_mask[0, :, :self.planning_steps], dim=-1)
+        batch_size = min(
+            gate.numel(), base_traj.size(0), map_traj.size(0),
+            gt_traj.size(0), valid_mask.size(0))
+        if batch_size == 0:
+            return stats
+
+        target, has_target = self._optimal_blend_gate_target(
+            base_traj[:batch_size], map_traj[:batch_size],
+            gt_traj[:batch_size], valid_mask[:batch_size])
+        stats['lane_anchor_utility_valid_rate'] = \
+            has_target.to(gate).mean().detach()
+        if has_target.any():
+            pred = gate[:batch_size][has_target]
+            target = target[has_target].to(pred)
+            stats['loss_lane_anchor_utility_gate'] = (
+                F.mse_loss(pred, target)
+                * self.lane_anchor_utility_gate_loss_weight)
+            stats['lane_anchor_utility_target_mean'] = target.mean().detach()
+            stats['lane_anchor_utility_gate_mae'] = \
+                (pred - target).abs().mean().detach()
+        return stats
+
     def loss(self, sdc_planning, sdc_planning_mask, outs_planning, future_gt_bbox=None):
         sdc_traj_all = outs_planning['sdc_traj_all'] # b, p, t, 5
         loss_dict = dict()
@@ -1098,6 +1162,10 @@ class PlanningHeadSingleMode(nn.Module):
             loss_static_gate = loss_static_gate * \
                 self.lane_anchor_static_gate_loss_weight
             loss_dict['loss_lane_anchor_static_gate'] = loss_static_gate
+        if (self.lane_anchor_utility_gate_loss_weight > 0
+                and 'lane_anchor_gate' in outs_planning):
+            loss_dict.update(self._lane_anchor_utility_gate_loss(
+                sdc_planning, sdc_planning_mask, outs_planning))
         if (self.training and self.lane_anchor_select_mode in
                 ('learned_selector', 'soft_selector',
                  'straight_through_selector')):

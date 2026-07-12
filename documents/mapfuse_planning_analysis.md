@@ -855,6 +855,23 @@ validation protocol. Promotion requires `avg.L2 <= 0.60120`, no collision
 regression, and no Slow regression. If gate-only C2.2 fails, retain C2.1 as the
 baseline and then investigate selector ranking/Turning candidates separately.
 
+C2.2 is implemented in
+`base_e2e_lidar_plan_mapfuse_v4_c22_utility_gate_train.py`. The new utility loss
+is disabled by default, so older configs and checkpoints are unchanged. The
+training config loads C2.1 epoch1, disables the older static-gate and frozen
+selector losses, and exposes only the four `lane_anchor_gate_head` parameter
+tensors (`37,633` parameters) to the optimizer.
+
+Unit tests recovered exact targets `0.0`, `0.5`, and `1.0` for synthetic base,
+midpoint, and map GT trajectories; invalid masks were excluded. Backpropagation
+updated the predicted gate while the detached target produced no residual/map
+gradient. A 148-frame scene-complete, five-GPU smoke train completed 30/30
+iterations without DDP mismatch, NaN, OOM, or process residue. Across iterations
+10/20/30, utility-target valid rate was `0.90/0.94/0.90`, target mean
+`0.469/0.344/0.369`, gate MAE `0.408/0.318/0.356`, and gradient norm
+`2.64/1.96/1.82`. This validates the implementation and loss scale; it is not
+an accuracy result.
+
 An earlier attempted ablation using only `use_map_lane=False` produced values
 identical to map-ON and is invalid: the explicit selector continued consuming
 `outs_map['lane_points']`. Those numbers must not be used as evidence that C2.1
