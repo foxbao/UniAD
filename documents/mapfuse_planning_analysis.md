@@ -1425,6 +1425,24 @@ start only after D3 establishes that proposal coverage, rather than ranking,
 is the dominant bottleneck, or when research novelty is prioritized over the
 shortest deployment path.
 
+### LLM-assisted planning research
+
+A separate literature and architecture study is recorded in
+[`llm_assisted_map_planning_research.md`](llm_assisted_map_planning_research.md).
+Its recommendation is not to replace the trajectory head with free-form LLM
+coordinate generation. The preferred route is a hierarchical fast/slow system:
+an offline LLM/VLM teacher or occasional slow reasoner compiles map topology,
+rules, task context, and actor interactions into a validated Planning IR; a
+small frame-rate intent student conditions the D3 candidate reranker; the exact
+D2/C2.3 fallback remains available when guidance is absent or invalid.
+
+The immediate LLM work is limited to a no-training semantic-value audit in
+parallel with D2 evaluation. D3 remains the next core planner. LLM integration
+is promoted only if scene-specific Planning IR beats both D2 and an equal-input
+non-LLM graph/set baseline on Turning or designated port long-tail cases.
+Direct trajectory text, a full VLA, and world-model/diffusion planning remain
+later research routes after this causal gate passes.
+
 D1 first freezes the UniAD perception, motion, and map encoder and trains only
 the new candidate scorer/residual head. Promotion requires a meaningful gap to
 the D0 oracle, `avg.L2 < 0.5901`, no Slow/Turning regression, and a map-off
