@@ -1392,6 +1392,39 @@ checkpoint. The next controlled experiment is the same D2.0 head-only training
 on all 43,981 frames; D3 shortlist/set-aware reranking remains the successor if
 full-data scaling loses the medium calibration.
 
+### Post-D2 roadmap: D3 and diffusion proposals
+
+The current decision order is fixed so later experiments do not interrupt or
+confound D2 full-data training:
+
+1. Finish the independent 43,981-frame D2.0 run and evaluate it on the same
+   4,676-frame validation set. Keep the medium checkpoint as the promoted
+   reference until full data proves at least comparable calibration.
+2. D3 is the next practical architecture: use the learned first-stage scorer
+   to shortlist approximately 8-16 map candidates, append the exact fallback,
+   and jointly rerank that set with a set-aware Transformer. Unlike D2's
+   independent per-candidate cost regression, D3 explicitly models relative
+   candidate evidence and reduces noisy minimum selection over roughly 1,000
+   modes. It reuses the current generator, D1.1 representation, and D2 cost
+   supervision, so it is the lowest-risk structural successor.
+3. A map-conditioned diffusion proposal generator is the more radical route.
+   It would denoise continuous trajectories conditioned on BEV, ego state,
+   agents, and HD-map paths, replacing the fixed speed-profile/lateral-offset
+   vocabulary with learned continuous multimodal proposals. Diffusion does not
+   remove the selection problem and adds iterative inference, training-data,
+   TensorRT, and safety-validation cost.
+4. The preferred diffusion variant is hybrid rather than a full replacement:
+   first select a few topology paths, diffuse speed/lateral residuals around
+   those paths to produce 16-32 proposals, then use the D3 set-aware reranker.
+   This keeps map topology as the search-space constraint while letting the
+   generator cover continuous maneuvers absent from the hand-built profiles.
+
+D3 should start if full D2 loses the medium result or once D2's remaining
+selected-vs-fallback oracle gap justifies extra capacity. Diffusion should
+start only after D3 establishes that proposal coverage, rather than ranking,
+is the dominant bottleneck, or when research novelty is prioritized over the
+shortest deployment path.
+
 D1 first freezes the UniAD perception, motion, and map encoder and trains only
 the new candidate scorer/residual head. Promotion requires a meaningful gap to
 the D0 oracle, `avg.L2 < 0.5901`, no Slow/Turning regression, and a map-off
