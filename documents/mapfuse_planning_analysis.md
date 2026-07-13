@@ -1330,6 +1330,30 @@ headroom. The next experiment should train the same frozen-representation cost
 head on a deterministic scene-complete medium subset before considering full
 data; it should not add another threshold or gate.
 
+The D2 medium subset is generated deterministically from the 43,981-frame full
+training set with planning-bucket scene quotas. It contains 97 complete scenes
+and 10,238 frames: 1,515 Static, 1,647 Slow, 6,500 MovingStraight, 404 Turning,
+and 172 without valid planning GT. Its distribution is close to full training,
+while retaining enough Turning samples for diagnostics. The medium run starts
+again from D1.1, initializes a fresh cost head, uses 125 warmup iterations, and
+trains one epoch (about 2,048 optimizer steps on five GPUs).
+
+Generate and train it with:
+
+```bash
+python tools/data_converter/make_planning_bucket_scene_subset.py \
+  --input data/kl_8/kl_infos_train.pkl \
+  --output /tmp/kl_infos_d2_medium_10k_scenes.pkl \
+  --min-samples 10000 \
+  --target-static 1500 --target-slow 1500 \
+  --target-moving 6500 --target-turning 350
+
+CUDA_VISIBLE_DEVICES=0,1,2,3,4 MASTER_PORT=28815 \
+  ./tools/uniad_dist_train.sh \
+  projects/configs/stage2_e2e_lidar/base_e2e_lidar_plan_mapfuse_v6_d2_calibrated_cost_medium_train.py \
+  5
+```
+
 D1 first freezes the UniAD perception, motion, and map encoder and trains only
 the new candidate scorer/residual head. Promotion requires a meaningful gap to
 the D0 oracle, `avg.L2 < 0.5901`, no Slow/Turning regression, and a map-off
