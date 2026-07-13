@@ -461,6 +461,10 @@ class MapMultimodalPlanner(nn.Module):
             multimodal_candidate_cost_near_oracle=zero.detach(),
             multimodal_candidate_cost_fallback_accuracy=zero.detach(),
         )
+        if self.use_candidate_cost:
+            for horizon_index in self.eval_horizon_indices:
+                stats[f'multimodal_candidate_cost_mae_h{horizon_index}'] = \
+                    zero.detach()
         batch_size = min(logits.size(0), gt.size(0), valid.size(0))
         if batch_size == 0:
             return stats

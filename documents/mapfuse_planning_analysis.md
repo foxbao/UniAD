@@ -1275,6 +1275,10 @@ expected missing tensors, all from that head. A 10-iteration real-data CUDA
 smoke passed with about `1,067` candidates/sample, finite cost/ranking losses,
 finite `grad_norm=2.13`, and no OOM or NaN. This proves implementation and
 training-path viability only; it is not evidence of validation improvement.
+A five-GPU smoke subsequently exposed and fixed conditional per-horizon log
+keys on batches without valid evaluation horizons. After unconditional key
+initialization, five-GPU DDP ran through iteration 20 with identical log keys,
+finite losses, and all `h1/h3/h5` cost-MAE diagnostics present.
 
 Run the balanced D2.0 pilot with:
 
