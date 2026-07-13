@@ -225,13 +225,46 @@ D2.1 should unfreeze only:
 - `candidate_encoder`, `source_embed`;
 - `map_attention`, `attention_norm`;
 - `ffn`, `ffn_norm`;
+- `residual_head`;
 - `candidate_cost_head`.
 
-This raises trainable parameters from `69,635` to about `666,883` (roughly
-`0.99%` of the model). Keep the LiDAR/tracking/motion/occupancy stack, base
-planning trajectory, map candidate generator, and residual head frozen. Use a
-smaller learning rate and one controlled epoch from D2 full. If D2.1 does not
-beat D2 full without bucket regression, stop the D2 series.
+This raises trainable parameters from `69,635` to `735,759` (roughly `1.10%`
+of the model). Keep the LiDAR/tracking/motion/occupancy stack, base planning
+trajectory, and map candidate generator frozen. The residual head may adapt
+map candidates, but candidate-cost mode still hard-zeros fallback residuals,
+so selecting fallback remains byte-exact D2/C2.3 behavior. Use a smaller
+learning rate and one controlled epoch from D2 full. If D2.1 does not beat D2
+full without bucket regression, stop the D2 series.
+
+The implementation is ready:
+
+- full config:
+  `projects/configs/stage2_e2e_lidar/base_e2e_lidar_plan_mapfuse_v6_d21_joint_repr_train.py`;
+- 10k scene-complete control:
+  `projects/configs/stage2_e2e_lidar/base_e2e_lidar_plan_mapfuse_v6_d21_joint_repr_medium_train.py`;
+- normal and fallback-only evaluation:
+  `projects/configs/stage2_e2e_lidar/eval/base_e2e_lidar_plan_mapfuse_v6_d21_joint_repr_eval.py`
+  and
+  `projects/configs/stage2_e2e_lidar/eval/base_e2e_lidar_plan_mapfuse_v6_d21_candidateoff_eval.py`.
+
+A real five-GPU, 30-iteration smoke run completed without OOM, NaN, DDP key
+mismatch, or checkpoint incompatibility. It trained exactly `735,759`
+parameters. The final sampled batch had `loss=1.5865`, `grad_norm=3.0392`,
+`candidate_cost_mae=0.4693`, and `loss_multimodal_score=0`, as intended. The
+smoke run proves execution only; its 148 frames are too few for a quality
+decision.
+
+Run the scene-complete control from the activated `uniad_train` environment:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3,4 MASTER_PORT=28842 ./tools/uniad_dist_train.sh projects/configs/stage2_e2e_lidar/base_e2e_lidar_plan_mapfuse_v6_d21_joint_repr_medium_train.py 5
+```
+
+D2.1 advances to full training only if the unchanged full validation evaluator
+shows lower global L2 than D2 full (`0.56905`), no collision regression, no
+motion-bucket regression above `0.01 m`, and measurable degradation in the
+candidate-off control. Otherwise stop D2.1 and implement D3 instead of widening
+the unfreeze set further.
 
 D3 then remains the default architecture replacement:
 

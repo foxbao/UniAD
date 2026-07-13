@@ -72,6 +72,8 @@ class MapMultimodalPlannerAuditTest(unittest.TestCase):
         self.assertEqual(
             tuple(output['multimodal_audit_refined_candidates'].shape),
             (1, 3, 6, 2))
+        self.assertTrue(torch.equal(
+            output['multimodal_fallback_traj'], fallback))
 
         planner.train()
         output = planner(plan_query, fallback, outs_map)
