@@ -21,22 +21,22 @@ projects/work_dirs/stage2_e2e_lidar/
   base_e2e_lidar_plan_mapfuse_v6_d2_calibrated_cost_medium_train/epoch_1.pth
 ```
 
-The completed 43,981-frame **D2 full** checkpoint is the best global model:
+The completed 43,981-frame **D2 full** checkpoint remains the strict safety
+reference:
 
 ```text
 projects/work_dirs/stage2_e2e_lidar/
   base_e2e_lidar_plan_mapfuse_v6_d2_calibrated_cost_train/epoch_1.pth
 ```
 
-It reaches `avg.L2=0.56905` and `avg.Collision=0.9563%`, improving D2 medium by
-`0.00369 m`. It is not yet formally promoted because Turning regresses from
-`0.88123` to `0.89471` (`+0.01348 m`), above the `0.01 m` bucket gate, and the
-full checkpoint still needs a causal candidate-off/map-off control.
+It reaches `avg.L2=0.56905` and `avg.Collision=0.9563%`. The D2.1 10k control
+improves global L2 further to `0.54019` and fixes the Turning regression, but
+collision rises to `1.003%`. Candidate-off exactly reproduces C2.3, proving the
+accuracy gain is causal map value rather than fallback drift.
 
-The next short controlled experiment is **D2.1 partial unfreezing** of the
-candidate representation and cost head while preserving the exact fallback.
-After that, **D3** remains the core architecture: D2 top-K shortlist, explicit
-agent/occupancy/map-risk features, and a set-aware joint reranker.
+Do not run D2.1 full as-is. The next core architecture is **D3**: use the D2.1
+representation for a top-K shortlist, add explicit agent/occupancy/map-risk
+features, and train a set-aware safety reranker around the exact fallback.
 
 ## 2. Evaluation contract
 
@@ -106,7 +106,8 @@ Important invariants:
 | D0 deployable candidate oracle | `0.3282` | oracle only | strong coverage upper bound |
 | D2 2,010-frame pilot | `0.5952` | `0.9637%` | rejected: miscalibrated |
 | **D2 10,238-frame medium** | **`0.57274`** | **`0.9637%`** | **promoted** |
-| D2 43,981-frame full | **`0.56905`** | **`0.9563%`** | global best; Turning gate pending |
+| D2 43,981-frame full | **`0.56905`** | **`0.9563%`** | safety best; Turning gate fails |
+| D2.1 10,238-frame joint representation | **`0.54019`** | `1.003%` | accuracy best; collision gate fails |
 
 ### 4.2 D2 medium buckets
 
@@ -141,7 +142,44 @@ D2 full selects map on `14.86%` of validation frames, down from medium's
 use motivate jointly adapting the frozen candidate representation rather than
 training another scalar gate.
 
-### 4.4 Candidate coverage diagnosis
+### 4.4 D2.1 controlled result
+
+| split | D2 full | D2.1 | D2.1 - D2 full |
+|---|---:|---:|---:|
+| Static | 0.26848 | **0.19888** | -0.06960 |
+| Slow | **0.46428** | 0.46687 | +0.00259 |
+| MovingStraight | 0.67588 | **0.64487** | -0.03101 |
+| Turning | 0.89471 | **0.87864** | -0.01607 |
+| FrontClear | 0.59772 | **0.56650** | -0.03122 |
+| FrontObstacle | 0.55674 | **0.52894** | -0.02780 |
+
+D2.1 selects map on `58.23%` of validation frames. Its candidate-off control
+returns exactly to `avg.L2=0.59011`, `avg.Collision=0.9637%`, and zero map
+selection. The normal-vs-candidate-off gap therefore proves substantial causal
+map value.
+
+The paired collision audit covers `12,972` valid frame-horizon events:
+
+| trajectory | avg.L2 | avg.Collision | collision events |
+|---|---:|---:|---:|
+| D2 full | 0.56905 | 0.9563% | 124 |
+| exact fallback | 0.59011 | 0.9637% | 125 |
+| D2.1 selected raw candidate | 0.55852 | 0.9878% | 128 |
+| D2.1 selected refined candidate | **0.54022** | 1.0032% | 130 |
+
+Relative to D2 full, D2.1 refined adds six collision events and removes none.
+Five events are in four consecutive Static frames from scene
+`20251106_007/202511061345_record`; one is a Slow-frame 3-second event from
+`20260311_007/20260311165726_record`. Residual refinement accounts for two net
+events, while raw candidate selection still accounts for four net events.
+
+Neither refined nor raw cost-margin fallback passes the promotion contract.
+For example, raw with a `0.03 m` margin reaches `avg.L2=0.55358` but collision
+remains `0.9797%`. At `0.125 m`, collision only returns to fallback's
+`0.9637%`, while L2 regresses to `0.57458`. A scalar threshold cannot reproduce
+D2 full's candidate-specific collision avoidance.
+
+### 4.5 Candidate coverage diagnosis
 
 D0 combines up to 16 topology chains, 8 training-derived speed profiles, and 9
 lateral offsets. It covers all 4,963 valid-GT validation frames:
@@ -213,14 +251,14 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4 MASTER_PORT=28820 \
   5
 ```
 
-Decision: retain D2 medium as the formal promoted reference, record D2 full as
-the best global checkpoint, and initialize D2.1 from D2 full. Do not discard
-D2 full: it improves global, Slow, MovingStraight, FrontClear, FrontObstacle,
-and collision; only the strict Turning gate and causal control remain open.
+Decision at the end of D2: retain D2 medium as the formal promoted reference
+and use D2 full as the D2.1 initialization. After D2.1, D2 full remains the
+strict collision reference while D2.1 is the better representation and global
+L2 initialization.
 
-## 7. Next controlled steps: D2.1 then D3
+## 7. Completed D2.1 and next D3
 
-D2.1 should unfreeze only:
+D2.1 unfreezes only:
 
 - `candidate_encoder`, `source_embed`;
 - `map_attention`, `attention_norm`;
@@ -229,14 +267,12 @@ D2.1 should unfreeze only:
 - `candidate_cost_head`.
 
 This raises trainable parameters from `69,635` to `735,759` (roughly `1.10%`
-of the model). Keep the LiDAR/tracking/motion/occupancy stack, base planning
-trajectory, and map candidate generator frozen. The residual head may adapt
-map candidates, but candidate-cost mode still hard-zeros fallback residuals,
-so selecting fallback remains byte-exact D2/C2.3 behavior. Use a smaller
-learning rate and one controlled epoch from D2 full. If D2.1 does not beat D2
-full without bucket regression, stop the D2 series.
+of the model). The LiDAR/tracking/motion/occupancy stack, base planning
+trajectory, and map candidate generator remain frozen. Candidate-cost mode
+still hard-zeros fallback residuals, so selecting fallback remains byte-exact
+D2/C2.3 behavior.
 
-The implementation is ready:
+The completed implementation and audit use:
 
 - full config:
   `projects/configs/stage2_e2e_lidar/base_e2e_lidar_plan_mapfuse_v6_d21_joint_repr_train.py`;
@@ -245,35 +281,27 @@ The implementation is ready:
 - normal and fallback-only evaluation:
   `projects/configs/stage2_e2e_lidar/eval/base_e2e_lidar_plan_mapfuse_v6_d21_joint_repr_eval.py`
   and
-  `projects/configs/stage2_e2e_lidar/eval/base_e2e_lidar_plan_mapfuse_v6_d21_candidateoff_eval.py`.
+  `projects/configs/stage2_e2e_lidar/eval/base_e2e_lidar_plan_mapfuse_v6_d21_candidateoff_eval.py`;
+- Top-16 collision audit:
+  `projects/configs/stage2_e2e_lidar/eval/base_e2e_lidar_plan_mapfuse_v6_d21_collision_audit_eval.py`
+  and `tools/analysis_tools/analyze_d21_collision_audit.py`.
 
-A real five-GPU, 30-iteration smoke run completed without OOM, NaN, DDP key
-mismatch, or checkpoint incompatibility. It trained exactly `735,759`
-parameters. The final sampled batch had `loss=1.5865`, `grad_norm=3.0392`,
-`candidate_cost_mae=0.4693`, and `loss_multimodal_score=0`, as intended. The
-smoke run proves execution only; its 148 frames are too few for a quality
-decision.
+Decision: retain the D2.1 checkpoint as the best representation/accuracy
+initialization, but do not promote it and do not run the 43,981-frame D2.1
+schedule unchanged. The strict collision gate fails, and both residual-off and
+scalar-margin controls show that further D2.1 tuning is unlikely to address the
+missing safety relation.
 
-Run the scene-complete control from the activated `uniad_train` environment:
+D3 is now the default architecture replacement:
 
-```bash
-CUDA_VISIBLE_DEVICES=0,1,2,3,4 MASTER_PORT=28842 ./tools/uniad_dist_train.sh projects/configs/stage2_e2e_lidar/base_e2e_lidar_plan_mapfuse_v6_d21_joint_repr_medium_train.py 5
-```
-
-D2.1 advances to full training only if the unchanged full validation evaluator
-shows lower global L2 than D2 full (`0.56905`), no collision regression, no
-motion-bucket regression above `0.01 m`, and measurable degradation in the
-candidate-off control. Otherwise stop D2.1 and implement D3 instead of widening
-the unfreeze set further.
-
-D3 then remains the default architecture replacement:
-
-1. Use D2 to shortlist approximately 8-16 map candidates.
+1. Use D2.1 to shortlist approximately 8-16 map candidates.
 2. Append the exact C2.3 fallback unconditionally.
 3. Encode explicit candidate-to-agent, candidate-to-occupancy, route,
    boundary, speed-limit, and map-risk features.
-4. Jointly compare the set with a set-aware Transformer.
-5. Predict final cost and optionally a bounded residual.
+4. Jointly compare the set with a set-aware Transformer and a collision-aware
+   ranking objective.
+5. Start from raw candidates; make residual refinement optional and explicitly
+   safety-gated.
 
 D3 addresses two measured D2 limitations:
 
