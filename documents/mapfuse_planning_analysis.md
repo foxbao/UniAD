@@ -13,23 +13,30 @@ a no-op. The successful direction is to use map topology to construct explicit
 multimodal trajectory candidates and learn when each candidate is better than
 the exact C2.3 fallback.
 
-The current promoted checkpoint is **D2 medium**:
+The formal promoted reference remains **D2 medium** because it satisfies the
+motion-bucket gate:
 
 ```text
 projects/work_dirs/stage2_e2e_lidar/
   base_e2e_lidar_plan_mapfuse_v6_d2_calibrated_cost_medium_train/epoch_1.pth
 ```
 
-It improves `avg.L2` from the C2.3 fallback's `0.59011` to `0.57274` with the
-same `0.9637%` average collision rate. The independent 43,981-frame D2 full run
-is in progress. D2 medium remains the reference until full-data evaluation
-proves at least comparable calibration.
+The completed 43,981-frame **D2 full** checkpoint is the best global model:
 
-The next core architecture is **D3**: D2 top-K shortlist, exact fallback,
-agent/occupancy/map-risk features, and a set-aware joint reranker. An LLM
-Planning-IR audit may run in parallel, but it does not replace D3. Diffusion or
-a full VLA starts only after we prove proposal coverage, rather than ranking,
-is the dominant bottleneck.
+```text
+projects/work_dirs/stage2_e2e_lidar/
+  base_e2e_lidar_plan_mapfuse_v6_d2_calibrated_cost_train/epoch_1.pth
+```
+
+It reaches `avg.L2=0.56905` and `avg.Collision=0.9563%`, improving D2 medium by
+`0.00369 m`. It is not yet formally promoted because Turning regresses from
+`0.88123` to `0.89471` (`+0.01348 m`), above the `0.01 m` bucket gate, and the
+full checkpoint still needs a causal candidate-off/map-off control.
+
+The next short controlled experiment is **D2.1 partial unfreezing** of the
+candidate representation and cost head while preserving the exact fallback.
+After that, **D3** remains the core architecture: D2 top-K shortlist, explicit
+agent/occupancy/map-risk features, and a set-aware joint reranker.
 
 ## 2. Evaluation contract
 
@@ -99,7 +106,7 @@ Important invariants:
 | D0 deployable candidate oracle | `0.3282` | oracle only | strong coverage upper bound |
 | D2 2,010-frame pilot | `0.5952` | `0.9637%` | rejected: miscalibrated |
 | **D2 10,238-frame medium** | **`0.57274`** | **`0.9637%`** | **promoted** |
-| D2 43,981-frame full | pending | pending | training/eval required |
+| D2 43,981-frame full | **`0.56905`** | **`0.9563%`** | global best; Turning gate pending |
 
 ### 4.2 D2 medium buckets
 
@@ -118,7 +125,23 @@ selections, 566 (`68.9%`) beat fallback. The selected-map actual mean gain is
 calibration error. Its selected-trajectory-versus-fallback oracle is `0.56385`,
 so only about `0.00889 m` remains on that exact selected set.
 
-### 4.3 Candidate coverage diagnosis
+### 4.3 D2 full buckets
+
+| split | D2 medium | D2 full | full - medium |
+|---|---:|---:|---:|
+| Static | **0.26078** | 0.26848 | +0.00770 |
+| Slow | 0.48338 | **0.46428** | -0.01910 |
+| MovingStraight | 0.67745 | **0.67588** | -0.00157 |
+| Turning | **0.88123** | 0.89471 | +0.01348 |
+| FrontClear | about 0.5990 | **0.59772** | about -0.0013 |
+| FrontObstacle | about 0.5615 | **0.55674** | about -0.0048 |
+
+D2 full selects map on `14.86%` of validation frames, down from medium's
+`17.88%`. The global gain is real, but the Turning regression and lower map
+use motivate jointly adapting the frozen candidate representation rather than
+training another scalar gate.
+
+### 4.4 Candidate coverage diagnosis
 
 D0 combines up to 16 topology chains, 8 training-derived speed profiles, and 9
 lateral offsets. It covers all 4,963 valid-GT validation frames:
@@ -146,14 +169,14 @@ selection, not missing map geometry.
 | C2.3 balanced gate | Provides a stable exact fallback and `0.59011` reference. | Retain as safety baseline. |
 | D0 candidate oracle | Explicit topology/speed/lateral candidates have large headroom. | Candidate route justified. |
 | D1/D1.1/D1.2 | Ranking signal exists, but fallback shortcuts and separate utility calibration prevent useful deployment. | Unified calibration required. |
-| D2 | Shared horizon-cost prediction works after enough scene-complete data. | Current promoted route. |
+| D2 | Shared horizon-cost prediction works after enough scene-complete data. Full data improves global L2 but exposes Turning/representation limits. | Keep medium as formal reference; use full as D2.1 initialization. |
 
 The compact lesson is:
 
 > The map was not intrinsically useless. Weak hidden fusion could not expose its
 > value; explicit candidates plus calibrated selection can.
 
-## 6. Active experiment: D2 full
+## 6. Completed experiment: D2 full
 
 Configuration:
 
@@ -179,7 +202,8 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4 MASTER_PORT=28598 \
   5
 ```
 
-Evaluation after `epoch_1.pth` appears:
+The built-in full validation completed after training. A dedicated audit eval
+also completed and produced the 4,676-frame Top-16-plus-fallback result file.
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1,2,3,4 MASTER_PORT=28820 \
@@ -189,17 +213,27 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4 MASTER_PORT=28820 \
   5
 ```
 
-Decision after evaluation:
+Decision: retain D2 medium as the formal promoted reference, record D2 full as
+the best global checkpoint, and initialize D2.1 from D2 full. Do not discard
+D2 full: it improves global, Slow, MovingStraight, FrontClear, FrontObstacle,
+and collision; only the strict Turning gate and causal control remain open.
 
-- Promote full if it is at least comparable to D2 medium globally and by
-  bucket, while preserving collision and causal map use.
-- Otherwise retain D2 medium. Full-data degradation would indicate distribution
-  imbalance or overfitting of independent candidate costs, not failure of the
-  entire D route.
+## 7. Next controlled steps: D2.1 then D3
 
-## 7. Next architecture: D3
+D2.1 should unfreeze only:
 
-D3 is the default next implementation after D2 full evaluation:
+- `candidate_encoder`, `source_embed`;
+- `map_attention`, `attention_norm`;
+- `ffn`, `ffn_norm`;
+- `candidate_cost_head`.
+
+This raises trainable parameters from `69,635` to about `666,883` (roughly
+`0.99%` of the model). Keep the LiDAR/tracking/motion/occupancy stack, base
+planning trajectory, map candidate generator, and residual head frozen. Use a
+smaller learning rate and one controlled epoch from D2 full. If D2.1 does not
+beat D2 full without bucket regression, stop the D2 series.
+
+D3 then remains the default architecture replacement:
 
 1. Use D2 to shortlist approximately 8-16 map candidates.
 2. Append the exact C2.3 fallback unconditionally.
@@ -231,10 +265,14 @@ baseline. Promotion requires scene-specific gain over both D2 and an equal-input
 non-LLM graph/set model, especially on Turning and port long-tail cases. See
 [`llm_assisted_map_planning_research.md`](llm_assisted_map_planning_research.md).
 
-The P0 code path is now implemented: a default-off D2 audit payload, exact
-candidate-factor serializer, strict Planning IR validator, local Qwen teacher,
-and offline reselection evaluator. Real audit inference is pending an available
-GPU/checkpoint window. The exact protocol and commands are in
+The P0 code path and real 200-frame balanced pilot are complete. Raw Qwen
+selection improves balanced-set L2 from D2 `0.5971` and fallback `0.5927` to
+`0.5824` with unchanged 3s collision, but it over-selects map (`84%`) and hurts
+Slow. An online D2 predicted-cost-delta gate at an exploratory `+0.125 m`
+reduces map use to `49.5%`, retains `0.5826` L2, and limits every motion-bucket
+regression to below `0.01 m` on this same pilot. This threshold is diagnostic,
+not promoted; it needs a separate holdout and shuffled/equal-input controls.
+The exact protocol and commands are in
 [`planning_ir_schema.md`](planning_ir_schema.md).
 
 ### 8.2 Diffusion/VLA/world model
@@ -262,4 +300,5 @@ Keep this file short and current:
 - never replace a reference checkpoint until full validation and causal
   ablations pass;
 - label oracle, pilot, medium, full, and deployable results explicitly;
-- after D2 full evaluation, update Sections 1, 4, 6, and 7 in one change.
+- keep exploratory P0 thresholds labeled as same-set diagnostics until a
+  separate holdout confirms them.

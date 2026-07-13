@@ -10,6 +10,12 @@ import os.path as osp
 import sys
 
 
+# The text-only teacher is PyTorch-only. Disabling optional backends avoids
+# importing incompatible user-site TensorFlow/JAX packages through Transformers.
+os.environ.setdefault('USE_TF', '0')
+os.environ.setdefault('USE_FLAX', '0')
+
+
 REPO_ROOT = osp.abspath(osp.join(osp.dirname(__file__), '../..'))
 if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
@@ -41,7 +47,10 @@ def parse_args():
     parser.add_argument('--output-jsonl', required=True)
     parser.add_argument('--model-path', default=None)
     parser.add_argument('--device', default='cuda:0')
-    parser.add_argument('--max-new-tokens', type=int, default=512)
+    parser.add_argument('--max-new-tokens', type=int, default=256)
+    parser.add_argument('--prompt-max-actors', type=int, default=8)
+    parser.add_argument('--prompt-motion-steps', type=int, default=6)
+    parser.add_argument('--max-input-tokens', type=int, default=5000)
     parser.add_argument('--limit', type=int, default=0)
     parser.add_argument('--resume', action='store_true')
     parser.add_argument('--dry-run', action='store_true',
@@ -55,6 +64,79 @@ def fallback_id(teacher_input):
                 'valid', True):
             return int(candidate['candidate_id'])
     raise ValueError('Teacher input has no valid fallback candidate')
+
+
+def rounded(value, digits=2):
+    if value is None:
+        return None
+    if isinstance(value, float):
+        return round(value, digits)
+    if isinstance(value, list):
+        return [rounded(item, digits) for item in value]
+    if isinstance(value, dict):
+        return {key: rounded(item, digits) for key, item in value.items()}
+    return value
+
+
+def compact_teacher_input(teacher_input, max_actors=8, motion_steps=6):
+    ego = teacher_input.get('ego', {})
+    compact_ego = dict(
+        route_command=ego.get('route_command'),
+        velocity_xy_mps=rounded(ego.get('velocity_xy_mps'), digits=1),
+    )
+    actors = []
+    for actor in teacher_input.get('actors', [])[:max_actors]:
+        actors.append(dict(
+            actor_id=actor.get('actor_id'),
+            class_name=actor.get('class_name'),
+            confidence=rounded(actor.get('confidence'), digits=2),
+            center_xy_m=rounded(actor.get('center_xy_m'), digits=1),
+            size_lwh_m=rounded(actor.get('size_lwh_m'), digits=1),
+            yaw_rad=rounded(actor.get('yaw_rad')),
+            velocity_xy_mps=rounded(
+                actor.get('velocity_xy_mps'), digits=1),
+            predicted_displacements_xy_m=rounded(
+                (actor.get('predicted_displacements_xy_m') or [])[
+                    :motion_steps], digits=1),
+        ))
+    candidates = []
+    map_paths = {}
+    for candidate in teacher_input['candidates']:
+        path_index = candidate.get('path_index')
+        if path_index is not None and path_index not in map_paths:
+            map_paths[path_index] = [
+                f'{lane.get("lane_id")}:'
+                f'{"R" if lane.get("reverse") else "F"}'
+                for lane in candidate.get('lane_sequence', [])
+            ]
+        candidates.append(dict(
+            candidate_id=candidate['candidate_id'],
+            source=candidate.get('source'),
+            valid=candidate.get('valid', True),
+            trajectory_xy_m=rounded(
+                candidate.get('refined_trajectory_xy_m'), digits=1),
+            predicted_horizon_costs_m=rounded(
+                candidate.get('predicted_horizon_costs_m'), digits=2),
+            predicted_mean_cost_m=rounded(
+                candidate.get('predicted_mean_cost_m'), digits=2),
+            selection_probability=rounded(
+                candidate.get('selection_probability'), digits=3),
+            path_index=path_index,
+            speed_profile_index=candidate.get('speed_profile_index'),
+            lateral_offset_index=candidate.get('lateral_offset_index'),
+            lateral_offset_m=rounded(
+                candidate.get('lateral_offset_m'), digits=1),
+        ))
+    return dict(
+        ego=compact_ego,
+        actors=actors,
+        map_paths=[
+            dict(path_index=path_index, lane_sequence=lane_sequence)
+            for path_index, lane_sequence in sorted(map_paths.items())
+        ],
+        candidates=candidates,
+        semantic_rules=rounded(teacher_input.get('semantic_rules', [])),
+    )
 
 
 def build_prompt(teacher_input):
@@ -111,7 +193,8 @@ def load_model(model_path, device):
     return tokenizer, model
 
 
-def generate(tokenizer, model, device, prompt, max_new_tokens):
+def generate(tokenizer, model, device, prompt, max_new_tokens,
+             max_input_tokens):
     import torch
 
     rendered = apply_chat_template(tokenizer, [
@@ -119,6 +202,11 @@ def generate(tokenizer, model, device, prompt, max_new_tokens):
         {'role': 'user', 'content': prompt},
     ])
     inputs = tokenizer(rendered, return_tensors='pt').to(device)
+    input_tokens = int(inputs['input_ids'].shape[1])
+    if input_tokens > max_input_tokens:
+        raise ValueError(
+            f'compact prompt has {input_tokens} tokens, exceeding '
+            f'--max-input-tokens={max_input_tokens}')
     with torch.inference_mode():
         output = model.generate(
             **inputs,
@@ -159,9 +247,11 @@ def main():
     if not records:
         raise ValueError('Input JSONL contains no records')
     first_input = validate_input(records[0])
+    first_prompt_input = compact_teacher_input(
+        first_input, args.prompt_max_actors, args.prompt_motion_steps)
     if args.dry_run:
         print(SYSTEM_PROMPT)
-        print(build_prompt(first_input))
+        print(build_prompt(first_prompt_input))
         print(f'Validated {len(records)} input records; model was not loaded.')
         return
 
@@ -186,9 +276,12 @@ def main():
             error = None
             valid = False
             try:
+                prompt_input = compact_teacher_input(
+                    teacher_input, args.prompt_max_actors,
+                    args.prompt_motion_steps)
                 raw_output = generate(
-                    tokenizer, model, args.device, build_prompt(teacher_input),
-                    args.max_new_tokens)
+                    tokenizer, model, args.device, build_prompt(prompt_input),
+                    args.max_new_tokens, args.max_input_tokens)
                 payload = extract_json_object(raw_output)
                 planning_ir = validate_planning_ir(
                     payload, candidates, actor_ids=actor_ids,

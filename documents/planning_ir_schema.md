@@ -1,7 +1,7 @@
 # Planning IR P0 audit protocol
 
-> Implementation status: code complete on 2026-07-13; real D2 audit inference
-> and Qwen selection are pending an available checkpoint/GPU window.
+> Implementation status: code, full D2 audit inference, and the balanced
+> 200-frame Qwen3-4B pilot completed on 2026-07-13.
 
 ## 1. Purpose
 
@@ -122,10 +122,23 @@ lanes. Do not build this file from validation GT.
 
 ### 5.3 Validate the prompt without loading Qwen
 
+First build a deterministic 200-frame pilot with 50 frames from each motion
+bucket and balanced obstacle coverage where available:
+
 ```bash
-/mnt/disk1/conda_envs/uniad_train_qwen3_py39/bin/python \
-  tools/analysis_tools/run_planning_ir_teacher.py \
+python tools/analysis_tools/select_planning_ir_audit_set.py \
   --input-jsonl projects/work_dirs/stage2_e2e_lidar/eval/base_e2e_lidar_plan_mapfuse_v6_d2_planning_ir_audit_eval/planning_ir_inputs.jsonl \
+  --output-jsonl projects/work_dirs/stage2_e2e_lidar/eval/base_e2e_lidar_plan_mapfuse_v6_d2_planning_ir_audit_eval/planning_ir_balanced200.jsonl \
+  --per-motion-bucket 50 --seed 0
+```
+
+Then validate the prompt without loading Qwen:
+
+```bash
+PYTHONNOUSERSITE=1 \
+  /mnt/disk1/conda_envs/uniad_train_qwen3_py39/bin/python \
+  tools/analysis_tools/run_planning_ir_teacher.py \
+  --input-jsonl projects/work_dirs/stage2_e2e_lidar/eval/base_e2e_lidar_plan_mapfuse_v6_d2_planning_ir_audit_eval/planning_ir_balanced200.jsonl \
   --output-jsonl /tmp/planning_ir_teacher_unused.jsonl \
   --dry-run --limit 1
 ```
@@ -135,13 +148,13 @@ lanes. Do not build this file from validation GT.
 Start with a balanced or small `--limit` pilot before labeling all frames.
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 \
+PYTHONNOUSERSITE=1 CUDA_VISIBLE_DEVICES=0 \
   /mnt/disk1/conda_envs/uniad_train_qwen3_py39/bin/python \
   tools/analysis_tools/run_planning_ir_teacher.py \
-  --input-jsonl projects/work_dirs/stage2_e2e_lidar/eval/base_e2e_lidar_plan_mapfuse_v6_d2_planning_ir_audit_eval/planning_ir_inputs.jsonl \
+  --input-jsonl projects/work_dirs/stage2_e2e_lidar/eval/base_e2e_lidar_plan_mapfuse_v6_d2_planning_ir_audit_eval/planning_ir_balanced200.jsonl \
   --output-jsonl projects/work_dirs/stage2_e2e_lidar/eval/base_e2e_lidar_plan_mapfuse_v6_d2_planning_ir_audit_eval/qwen3_4b_planning_ir.jsonl \
   --model-path /mnt/disk1/models/Qwen3-4B-Instruct-2507 \
-  --device cuda:0 --limit 200
+  --device cuda:0
 ```
 
 Use `--resume` to append missing frames to an existing output.
@@ -150,9 +163,10 @@ Use `--resume` to append missing frames to an existing output.
 
 ```bash
 python tools/analysis_tools/eval_planning_ir_selection.py \
-  --audit-jsonl projects/work_dirs/stage2_e2e_lidar/eval/base_e2e_lidar_plan_mapfuse_v6_d2_planning_ir_audit_eval/planning_ir_inputs.jsonl \
+  --audit-jsonl projects/work_dirs/stage2_e2e_lidar/eval/base_e2e_lidar_plan_mapfuse_v6_d2_planning_ir_audit_eval/planning_ir_balanced200.jsonl \
   --teacher-jsonl projects/work_dirs/stage2_e2e_lidar/eval/base_e2e_lidar_plan_mapfuse_v6_d2_planning_ir_audit_eval/qwen3_4b_planning_ir.jsonl \
-  --output-json projects/work_dirs/stage2_e2e_lidar/eval/base_e2e_lidar_plan_mapfuse_v6_d2_planning_ir_audit_eval/qwen3_4b_selection_summary.json
+  --output-json projects/work_dirs/stage2_e2e_lidar/eval/base_e2e_lidar_plan_mapfuse_v6_d2_planning_ir_audit_eval/qwen3_4b_selection_summary.json \
+  --teacher-max-predicted-cost-delta 0.125
 ```
 
 The report compares D2, exact fallback, teacher, and audited-candidate oracle
@@ -166,3 +180,24 @@ split without material global or collision regression. It still does not prove
 that an LLM belongs online. The next controls are shuffled IR and an equal-input
 small graph/set baseline. If that baseline matches Qwen, use Qwen only as an
 offline annotation teacher.
+
+## 7. Balanced-200 result
+
+The deterministic seed-0 set contains exactly 50 frames from each motion
+bucket and, within every bucket, 25 FrontClear and 25 FrontObstacle frames.
+
+| selector | avg.L2 | 3s collision | map rate | useful-map rate |
+|---|---:|---:|---:|---:|
+| D2 | 0.5971 | 7.5% | 17.0% | 8.5% |
+| exact fallback | 0.5927 | 7.5% | 0% | 0% |
+| raw Qwen3-4B | **0.5824** | 7.5% | 84.0% | 47.5% |
+| audited-candidate oracle | 0.4114 | 8.0% | 68.0% | 68.0% |
+
+Raw Qwen is a positive semantic-selection signal, not a promoted controller.
+It improves Static (`0.2488`), MovingStraight (`0.5768`), and Turning
+(`0.8650`) relative to fallback, but hurts Slow (`0.6266` versus `0.5562`). A
+same-set exploratory gate using only online D2 predicted cost delta at
+`+0.125 m` gives `0.5826` overall L2, `49.5%` map use, unchanged collision,
+and no motion-bucket regression above `0.01 m`. The next required evidence is
+a separate holdout, shuffled-selection control, and an equal-input non-LLM
+reranker.

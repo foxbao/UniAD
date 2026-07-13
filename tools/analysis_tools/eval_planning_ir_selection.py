@@ -33,6 +33,15 @@ def parse_args():
     parser.add_argument('--audit-jsonl', required=True)
     parser.add_argument('--teacher-jsonl', required=True)
     parser.add_argument('--output-json', default=None)
+    parser.add_argument('--limit', type=int, default=0,
+                        help='Evaluate only the first N audit frames.')
+    parser.add_argument('--teacher-max-predicted-cost-delta', type=float,
+                        default=None,
+                        help='Optional online gate: accept a teacher map '
+                             'candidate only when its predicted mean cost is '
+                             'within this delta of fallback.')
+    parser.add_argument('--teacher-gate-base', choices=['fallback', 'd2'],
+                        default='fallback')
     return parser.parse_args()
 
 
@@ -124,15 +133,40 @@ def teacher_choice(record, teacher_record):
     return int(normalized['selected_candidate_id']), False
 
 
+def gated_teacher_choice(record, teacher_candidate_id, threshold, base_mode):
+    labels = record['audit_labels']
+    fallback_id = int(labels['fallback_candidate_id'])
+    if teacher_candidate_id == fallback_id:
+        return fallback_id
+    candidates = {
+        int(candidate['candidate_id']): candidate
+        for candidate in record['teacher_input']['candidates']
+    }
+    teacher_cost = candidates[teacher_candidate_id].get(
+        'predicted_mean_cost_m')
+    fallback_cost = candidates[fallback_id].get('predicted_mean_cost_m')
+    if (teacher_cost is not None and fallback_cost is not None
+            and float(teacher_cost) - float(fallback_cost) <= threshold):
+        return teacher_candidate_id
+    if base_mode == 'd2':
+        return int(labels['d2_selected_candidate_id'])
+    return fallback_id
+
+
 def main():
     args = parse_args()
     audits = read_jsonl(args.audit_jsonl)
+    if args.limit > 0:
+        audits = audits[:args.limit]
     teacher_records = {
         int(record['result_index']): record
         for record in read_jsonl(args.teacher_jsonl)
     }
+    strategies = list(STRATEGIES)
+    if args.teacher_max_predicted_cost_delta is not None:
+        strategies.append('teacher_gated')
     groups = defaultdict(lambda: {
-        strategy: new_accumulator() for strategy in STRATEGIES})
+        strategy: new_accumulator() for strategy in strategies})
     invalid_teacher = 0
     evaluated = 0
     for record in audits:
@@ -153,6 +187,11 @@ def main():
         )
         strategy_ids['teacher'], invalid = teacher_choice(
             record, teacher_records.get(result_index))
+        if args.teacher_max_predicted_cost_delta is not None:
+            strategy_ids['teacher_gated'] = gated_teacher_choice(
+                record, strategy_ids['teacher'],
+                args.teacher_max_predicted_cost_delta,
+                args.teacher_gate_base)
         invalid_teacher += int(invalid)
         fallback_metrics = metrics[strategy_ids['fallback']]
         bucket_keys = (
@@ -189,7 +228,7 @@ def main():
         f'Evaluated {evaluated} frames; teacher invalid/missing: '
         f'{invalid_teacher} ({100 * output["teacher_invalid_rate"]:.2f}%)')
     print('strategy       mean_L2      map_rate   useful_map   collision@3s')
-    for strategy in STRATEGIES:
+    for strategy in strategies:
         row = summary['overall'][strategy]
         collision = row['horizon_collision_rate'][-1]
         print(

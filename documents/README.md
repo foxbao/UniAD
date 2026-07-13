@@ -21,11 +21,13 @@ experiment detail. Do not read every document to recover the project state.
 
 ## Current decision order
 
-1. Finish and evaluate D2 full; keep D2 medium as reference until then.
-2. Implement D3 top-K set-aware reranking with exact fallback.
-3. Run the LLM Planning-IR `P0` audit in parallel without modifying D3.
-4. Promote LLM conditioning only after causal gain over an equal-input non-LLM
-   baseline.
+1. Keep D2 medium as the formal reference and D2 full as the global-best
+   initialization; full still misses the strict Turning gate.
+2. Run one D2.1 partial-unfreeze experiment on candidate representation plus
+   cost head, preserving the exact fallback.
+3. Implement D3 top-K set-aware reranking after the D2.1 control.
+4. Validate the positive Planning-IR P0 signal on a holdout with shuffled and
+   equal-input non-LLM controls before any runtime LLM conditioning.
 5. Attempt hybrid diffusion/VLA only if proposal coverage becomes the measured
    bottleneck.
 

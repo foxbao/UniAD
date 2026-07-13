@@ -227,11 +227,29 @@ Do this in parallel with D2 evaluation; it does not modify the planner.
 
 Implementation status on 2026-07-13: schema, default-off top-K audit output,
 online/GT serializer split, local Qwen runner, strict fallback validation, and
-offline D2/fallback/teacher/oracle comparison are complete. Real audit
-inference and Qwen labeling remain pending. The current compact payload uses
+offline D2/fallback/teacher/oracle comparison are complete. The real
+200-frame balanced Qwen3-4B pilot is also complete. The current compact payload uses
 predicted tracked actors/motion rather than occupancy because this LiDAR D2
 evaluation does not retain a deployable occupancy prediction; adding GT
 segmentation to the prompt is explicitly forbidden.
+
+Balanced-pilot result:
+
+| selector | avg.L2 | 3s collision | map rate |
+|---|---:|---:|---:|
+| D2 | 0.5971 | 7.5% | 17.0% |
+| exact fallback | 0.5927 | 7.5% | 0% |
+| raw Qwen | **0.5824** | 7.5% | 84.0% |
+| audited-candidate oracle | 0.4114 | 8.0% | 68.0% |
+
+Raw Qwen improves Static, MovingStraight, and Turning, but regresses Slow from
+`0.5562` to `0.6266`. Its schema validity is `199/200=99.5%`; the one invalid
+response echoed a lateral-offset factor inconsistent with its candidate ID and
+correctly fell back. An exploratory online gate accepting Qwen map choices only
+when their D2 predicted mean cost is at most `0.125 m` above fallback retains
+`0.5826` overall L2 with unchanged collision and removes motion-bucket
+regressions above `0.01 m` on this same pilot. It must be validated on a
+separate holdout before it is evidence for promotion.
 
 1. Define the Planning IR schema and a deterministic serializer for map graph,
    route command, predicted actors, occupancy summaries, and D2 top-K candidate
