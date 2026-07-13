@@ -80,5 +80,56 @@ class MapMultimodalPlannerAuditTest(unittest.TestCase):
         self.assertNotIn('multimodal_audit_indices', output)
 
 
+class MapMultimodalPlannerSetRerankerTest(unittest.TestCase):
+
+    def test_topk_fallback_and_loss_keys(self):
+        planner = MapMultimodalPlanner(
+            embed_dims=8, planning_steps=6, num_heads=2, dropout=0.0,
+            use_candidate_cost=True,
+            use_set_reranker=True,
+            set_topk=2,
+            set_num_layers=1,
+            set_num_heads=2,
+            set_ffn_dims=16,
+            set_dropout=0.0,
+            set_use_raw_candidates=True)
+        plan_query = torch.zeros(1, 1, 8)
+        fallback = torch.zeros(1, 6, 2)
+        outs_map = dict(
+            planning_candidates=torch.randn(1, 3, 6, 2),
+            planning_candidate_valid=torch.tensor([[True, True, False]]),
+        )
+        actor_future = torch.zeros(1, 1, 6, 2)
+        actor_future[..., 0] = 10.0
+        outs_motion = dict(
+            planning_actor_future=actor_future,
+            planning_actor_sizes=torch.tensor([[[4.0, 2.0]]]),
+            planning_actor_yaws=torch.zeros(1, 1),
+            planning_actor_scores=torch.ones(1, 1),
+            planning_actor_valid=torch.ones(1, 1, dtype=torch.bool),
+        )
+
+        planner.train()
+        output = planner(
+            plan_query, fallback, outs_map, outs_motion=outs_motion)
+        self.assertEqual(tuple(output['multimodal_set_indices'].shape), (1, 3))
+        self.assertEqual(output['multimodal_set_indices'][0, -1].item(), 3)
+        self.assertEqual(output['multimodal_selected_index'].item(), 3)
+        self.assertTrue(torch.equal(
+            output['multimodal_selected_traj'], fallback))
+        self.assertTrue(torch.isfinite(
+            output['multimodal_set_safety_features']).all())
+
+        gt = torch.zeros(1, 6, 3)
+        valid = torch.ones(1, 6, dtype=torch.bool)
+        losses = planner.loss(output, gt, valid, future_gt_bbox=None)
+        for key in (
+                'loss_multimodal_set_cost',
+                'loss_multimodal_set_ranking',
+                'loss_multimodal_set_collision'):
+            self.assertIn(key, losses)
+            self.assertTrue(torch.isfinite(losses[key]))
+
+
 if __name__ == '__main__':
     unittest.main()

@@ -34,9 +34,11 @@ improves global L2 further to `0.54019` and fixes the Turning regression, but
 collision rises to `1.003%`. Candidate-off exactly reproduces C2.3, proving the
 accuracy gain is causal map value rather than fallback drift.
 
-Do not run D2.1 full as-is. The next core architecture is **D3**: use the D2.1
-representation for a top-K shortlist, add explicit agent/occupancy/map-risk
-features, and train a set-aware safety reranker around the exact fallback.
+Do not run D2.1 full as-is. **D3-A is now implemented**: it uses D2.1 for a
+Top-16 shortlist, appends the exact fallback, adds explicit online-agent safety
+features, and trains a set-aware collision-aware reranker. The next experiment
+is the scene-complete 10k D3-A medium run. Occupancy features remain D3-B work,
+not part of the current implementation.
 
 ## 2. Evaluation contract
 
@@ -80,7 +82,14 @@ D1.1 candidate representation and bounded map residual
 D2 shared 1s/2s/3s candidate-cost head
         |
         v
-minimum predicted mean cost -> selected trajectory
+Top-16 map shortlist + exact fallback
+        |
+        +---- online MotionFormer vehicle futures
+        |       -> center distance / AABB clearance / risk
+        v
+D3-A set Transformer
+        -> bounded horizon-cost delta + collision logits
+        -> selected raw candidate
 ```
 
 Important invariants:
@@ -91,6 +100,10 @@ Important invariants:
   on one calibrated cost scale.
 - D2 full freezes all inherited modules and trains only the 69,635-parameter
   `candidate_cost_head`.
+- D3-A freezes D2.1 and trains about 1.19M new set-reranker parameters. It uses
+  raw candidates because D2.1 residual refinement added two collision events.
+- D3-A inference safety features use only online MotionFormer predictions;
+  future GT boxes are supervision only.
 - Runtime candidates use only surveyed map topology, ego pose, and
   training-derived speed profiles. They do not use per-sample GT speed.
 
@@ -256,7 +269,7 @@ and use D2 full as the D2.1 initialization. After D2.1, D2 full remains the
 strict collision reference while D2.1 is the better representation and global
 L2 initialization.
 
-## 7. Completed D2.1 and next D3
+## 7. Completed D2.1 and implemented D3-A
 
 D2.1 unfreezes only:
 
@@ -292,16 +305,39 @@ schedule unchanged. The strict collision gate fails, and both residual-off and
 scalar-margin controls show that further D2.1 tuning is unlikely to address the
 missing safety relation.
 
-D3 is now the default architecture replacement:
+D3 is now the default architecture replacement. The implemented D3-A stage:
 
 1. Use D2.1 to shortlist approximately 8-16 map candidates.
 2. Append the exact C2.3 fallback unconditionally.
-3. Encode explicit candidate-to-agent, candidate-to-occupancy, route,
-   boundary, speed-limit, and map-risk features.
-4. Jointly compare the set with a set-aware Transformer and a collision-aware
-   ranking objective.
-5. Start from raw candidates; make residual refinement optional and explicitly
-   safety-gated.
+3. Encodes candidate-to-online-agent center distance, heading-aware AABB
+   clearance, and confidence-weighted risk at 1s/2s/3s plus aggregate values.
+4. Jointly compares the 17-member set with a two-layer Transformer.
+5. Predicts bounded horizon-cost corrections and collision logits, supervised
+   by GT future boxes while keeping inference GT-free.
+6. Selects raw candidates and keeps fallback byte-exact.
+
+Implementation/configs:
+
+- `projects/configs/stage2_e2e_lidar/base_e2e_lidar_plan_mapfuse_v7_d3a_set_reranker_train.py`;
+- `projects/configs/stage2_e2e_lidar/base_e2e_lidar_plan_mapfuse_v7_d3a_set_reranker_medium_train.py`;
+- `projects/configs/stage2_e2e_lidar/eval/base_e2e_lidar_plan_mapfuse_v7_d3a_set_reranker_eval.py`;
+- `projects/configs/stage2_e2e_lidar/eval/base_e2e_lidar_plan_mapfuse_v7_d3a_candidateoff_eval.py`.
+
+Completed engineering gates on 2026-07-13:
+
+- D2.1 checkpoint load: 42 missing keys, all from the new D3-A modules; zero
+  unexpected keys;
+- trainable parameters: `1,193,222`;
+- five-GPU scene-complete smoke: 30/30 iterations, no cross-rank log-key
+  mismatch, finite losses and gradients;
+- smoke inference: 93 evaluated planning frames, set size `17.0`, online actor
+  signal present in `98.9%` of frames;
+- smoke `avg.L2=0.7607`, collision `0%`; this is only an interface check after
+  30 updates and is not model-quality evidence.
+
+The next command is the one-epoch 10k medium run. Promotion is decided only
+after full-validation evaluation of its checkpoint against D2 full, D2.1,
+fallback-only, and candidate-off controls.
 
 D3 addresses two measured D2 limitations:
 
@@ -310,7 +346,9 @@ D3 addresses two measured D2 limitations:
   route constraints.
 
 Required D3 controls are: no-set-reranker, candidate-off, map-off, exact
-fallback-only, top-K recall, and selected-vs-fallback oracle.
+fallback-only, top-K recall, selected-vs-fallback oracle, selected collision
+probability calibration, and actor-signal coverage. Occupancy-conditioned
+features are deferred to D3-B after D3-A establishes a measurable gain.
 
 ## 8. Parallel research routes
 

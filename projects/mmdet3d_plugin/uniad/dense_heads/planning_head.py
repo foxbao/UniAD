@@ -356,6 +356,7 @@ class PlanningHeadSingleMode(nn.Module):
         
         outs_planning = self(bev_embed, occ_mask, bev_pos, sdc_traj_query,
                              sdc_track_query, command, outs_map=outs_map,
+                             outs_motion=outs_motion,
                              sdc_goal=sdc_goal,
                              sdc_planning=sdc_planning,
                              sdc_planning_mask=sdc_planning_mask)
@@ -374,6 +375,7 @@ class PlanningHeadSingleMode(nn.Module):
 
         outs_planning = self(bev_embed, occ_mask, bev_pos, sdc_traj_query,
                              sdc_track_query, command, outs_map=outs_map,
+                             outs_motion=outs_motion,
                              sdc_goal=sdc_goal,
                              sdc_planning=sdc_planning,
                              sdc_planning_mask=sdc_planning_mask)
@@ -828,6 +830,7 @@ class PlanningHeadSingleMode(nn.Module):
                 sdc_track_query,
                 command,
                 outs_map=None,
+                outs_motion=None,
                 sdc_goal=None,
                 sdc_planning=None,
                 sdc_planning_mask=None):
@@ -939,7 +942,8 @@ class PlanningHeadSingleMode(nn.Module):
         multimodal_outputs = None
         if self.map_multimodal_planner is not None:
             multimodal_outputs = self.map_multimodal_planner(
-                plan_query, sdc_traj_all, outs_map=outs_map)
+                plan_query, sdc_traj_all, outs_map=outs_map,
+                outs_motion=outs_motion)
             sdc_traj_all = multimodal_outputs['multimodal_selected_traj']
         if self.use_col_optim and not self.training:
             # post process, only used when testing
@@ -986,7 +990,19 @@ class PlanningHeadSingleMode(nn.Module):
                         'multimodal_audit_refined_candidates',
                         'multimodal_audit_logits',
                         'multimodal_audit_selection_probabilities',
-                        'multimodal_audit_predicted_horizon_costs'):
+                        'multimodal_audit_predicted_horizon_costs',
+                        'multimodal_set_indices',
+                        'multimodal_set_valid',
+                        'multimodal_set_raw_candidates',
+                        'multimodal_set_refined_candidates',
+                        'multimodal_set_safety_features',
+                        'multimodal_set_base_horizon_costs',
+                        'multimodal_set_cost_delta',
+                        'multimodal_set_collision_logits',
+                        'multimodal_set_predicted_horizon_costs',
+                        'multimodal_set_selection_cost',
+                        'multimodal_set_selection_probabilities',
+                        'multimodal_set_selected_position'):
                     if multimodal_outputs.get(key) is not None:
                         ret[key] = multimodal_outputs[key]
         return ret
@@ -1329,11 +1345,16 @@ class PlanningHeadSingleMode(nn.Module):
                                 .mean().detach()
         if (self.training and self.map_multimodal_planner is not None
                 and 'multimodal_logits' in outs_planning):
-            gt_traj = sdc_planning[0, :, :self.planning_steps, :2]
+            gt_traj = sdc_planning[0, :, :self.planning_steps, :3]
             gt_valid = torch.any(
                 sdc_planning_mask[0, :, :self.planning_steps], dim=-1)
+            planner_future_boxes = None
+            if future_gt_bbox is not None:
+                planner_future_boxes = future_gt_bbox[0][
+                    1:self.planning_steps + 1]
             loss_dict.update(self.map_multimodal_planner.loss(
-                outs_planning, gt_traj, gt_valid))
+                outs_planning, gt_traj, gt_valid,
+                future_gt_bbox=planner_future_boxes))
         if planning_bucket is not None:
             loss_dict['motion_bucket_weight'] = planning_weight.detach()
         for key in (

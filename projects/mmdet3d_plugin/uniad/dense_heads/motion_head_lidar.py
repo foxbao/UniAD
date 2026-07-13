@@ -70,6 +70,97 @@ class MotionHeadLidar(MotionHead):
         if self.kmeans_anchors.size(2) != self.predict_steps:
             self.kmeans_anchors = self.kmeans_anchors[:, :, :self.predict_steps]
 
+    def _attach_planning_actor_context(self, outs_motion, track_boxes,
+                                       actor_mask, with_sdc):
+        """Expose detached online actor futures for collision-aware planning."""
+        all_scores = outs_motion.get('all_traj_scores')
+        all_preds = outs_motion.get('all_traj_preds')
+        if all_scores is None or all_preds is None:
+            return
+
+        scores = all_scores[-1]
+        preds = all_preds[-1]
+        batch_size = scores.size(0)
+        if isinstance(actor_mask, (list, tuple)):
+            actor_masks = list(actor_mask)
+        elif batch_size == 1:
+            actor_masks = [actor_mask]
+        else:
+            actor_masks = [actor_mask[index] for index in range(batch_size)]
+
+        future_list = []
+        size_list = []
+        yaw_list = []
+        score_list = []
+        for batch_index in range(batch_size):
+            boxes, track_scores = track_boxes[batch_index][:2]
+            num_objects = scores.size(1) - int(with_sdc)
+            num_objects = min(num_objects, len(boxes.tensor))
+            mask = actor_masks[batch_index].to(
+                device=scores.device, dtype=torch.bool).reshape(-1)
+            num_objects = min(num_objects, mask.numel())
+            mask = mask[:num_objects]
+
+            if num_objects == 0 or not mask.any():
+                future_list.append(preds.new_zeros(
+                    (0, preds.size(-2), 2)))
+                size_list.append(preds.new_zeros((0, 2)))
+                yaw_list.append(preds.new_zeros((0,)))
+                score_list.append(preds.new_zeros((0,)))
+                continue
+
+            object_scores = scores[batch_index, :num_objects]
+            object_preds = preds[batch_index, :num_objects]
+            mode_index = object_scores.argmax(dim=-1)
+            gather_index = mode_index[:, None, None, None].expand(
+                -1, 1, object_preds.size(-2), object_preds.size(-1))
+            selected_preds = object_preds.gather(
+                1, gather_index).squeeze(1)[..., :2]
+
+            centers = boxes.gravity_center[:num_objects, :2].to(
+                device=preds.device, dtype=preds.dtype)
+            box_tensor = boxes.tensor[:num_objects].to(
+                device=preds.device, dtype=preds.dtype)
+            # mmdet3d LiDAR boxes store length/width in tensor columns 3/4.
+            sizes = box_tensor[:, 3:5].abs().clamp_min(0.1)
+            yaws = boxes.yaw[:num_objects].to(
+                device=preds.device, dtype=preds.dtype)
+            detection_scores = track_scores[:num_objects].to(
+                device=preds.device, dtype=preds.dtype).clamp(0.0, 1.0)
+            mode_scores = object_scores.max(dim=-1).values.exp().clamp(
+                0.0, 1.0)
+
+            future_list.append(
+                (centers[:, None] + selected_preds)[mask])
+            size_list.append(sizes[mask])
+            yaw_list.append(yaws[mask])
+            score_list.append((detection_scores * mode_scores)[mask])
+
+        max_actors = max((value.size(0) for value in future_list), default=0)
+        planning_steps = preds.size(-2)
+        actor_future = preds.new_zeros(
+            (batch_size, max_actors, planning_steps, 2))
+        actor_sizes = preds.new_zeros((batch_size, max_actors, 2))
+        actor_yaws = preds.new_zeros((batch_size, max_actors))
+        actor_scores = preds.new_zeros((batch_size, max_actors))
+        actor_valid = torch.zeros(
+            (batch_size, max_actors), device=preds.device, dtype=torch.bool)
+        for batch_index, future in enumerate(future_list):
+            count = future.size(0)
+            if count == 0:
+                continue
+            actor_future[batch_index, :count] = future
+            actor_sizes[batch_index, :count] = size_list[batch_index]
+            actor_yaws[batch_index, :count] = yaw_list[batch_index]
+            actor_scores[batch_index, :count] = score_list[batch_index]
+            actor_valid[batch_index, :count] = True
+
+        outs_motion['planning_actor_future'] = actor_future.detach()
+        outs_motion['planning_actor_sizes'] = actor_sizes.detach()
+        outs_motion['planning_actor_yaws'] = actor_yaws.detach()
+        outs_motion['planning_actor_scores'] = actor_scores.detach()
+        outs_motion['planning_actor_valid'] = actor_valid
+
     def forward_train(self,
                       bev_embed,
                       gt_bboxes_3d,
@@ -196,6 +287,8 @@ class MotionHeadLidar(MotionHead):
                 for veh_id in vehicle_id_list:
                     valid_vehicle_mask |= query_label == veh_id
                 vehicle_mask[valid_match] = valid_vehicle_mask
+            self._attach_planning_actor_context(
+                outs_motion, track_boxes, vehicle_mask, with_sdc)
             outs_motion['traj_query'] = outs_motion['traj_query'][:, :,
                                                                   vehicle_mask]
             outs_motion['track_query'] = outs_motion['track_query'][:,
@@ -283,10 +376,13 @@ class MotionHeadLidar(MotionHead):
             outs_motion['track_scores'] = outs_motion['track_scores'][:, :-1]
             labels = labels[:-1]
 
+        vehicle_mask = torch.zeros_like(labels, dtype=torch.bool)
         if labels.numel() > 0:
-            vehicle_mask = torch.zeros_like(labels, dtype=torch.bool)
             for veh_id in self.vehicle_id_list:
                 vehicle_mask |= labels == veh_id
+        self._attach_planning_actor_context(
+            outs_motion, track_boxes, vehicle_mask, with_sdc)
+        if labels.numel() > 0:
             outs_motion['traj_query'] = outs_motion['traj_query'][:, :,
                                                                   vehicle_mask]
             outs_motion['track_query'] = outs_motion['track_query'][:,

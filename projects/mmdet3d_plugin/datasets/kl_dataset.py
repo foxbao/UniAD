@@ -1524,6 +1524,10 @@ class KlDataset(Custom3DDataset):
             name: new_selector_stats() for name in bucket_names
         }
         multimodal_stats = dict(n=0, map_selected=0, candidate_sum=0.0)
+        set_reranker_stats = dict(
+            n=0, set_size_sum=0.0, actor_signal=0,
+            selected_collision_probability_sum=0.0,
+            selected_cost_sum=0.0)
         per_bucket_multimodal = {
             name: dict(n=0, map_selected=0, candidate_sum=0.0)
             for name in bucket_names
@@ -1593,6 +1597,43 @@ class KlDataset(Custom3DDataset):
             agg['n'] += 1
             agg['map_selected'] += int(int(selected) != int(fallback))
             agg['candidate_sum'] += float(count)
+
+        def add_set_reranker_stats(agg, blob):
+            selected = selector_scalar(
+                blob, 'multimodal_set_selected_position')
+            valid = blob.get('multimodal_set_valid')
+            collision_logits = blob.get('multimodal_set_collision_logits')
+            selection_cost = blob.get('multimodal_set_selection_cost')
+            safety = blob.get('multimodal_set_safety_features')
+            if any(value is None for value in (
+                    selected, valid, collision_logits, selection_cost,
+                    safety)):
+                return
+            valid = np.asarray(self._planning_to_numpy(valid)).reshape(-1)
+            collision_logits = np.asarray(
+                self._planning_to_numpy(collision_logits))
+            selection_cost = np.asarray(
+                self._planning_to_numpy(selection_cost)).reshape(-1)
+            safety = np.asarray(self._planning_to_numpy(safety))
+            selected = int(selected)
+            if (selected < 0 or selected >= len(selection_cost)
+                    or collision_logits.size == 0):
+                return
+            collision_logits = collision_logits.reshape(
+                -1, collision_logits.shape[-1])
+            safety = safety.reshape(-1, safety.shape[-1])
+            agg['n'] += 1
+            agg['set_size_sum'] += float(valid.sum())
+            agg['selected_collision_probability_sum'] += float(
+                (1.0 / (1.0 + np.exp(-collision_logits[selected]))).mean())
+            agg['selected_cost_sum'] += float(selection_cost[selected])
+            distance_columns = [
+                index for index in (0, 1, 3, 4, 6, 7, 9, 10)
+                if index < safety.shape[-1]
+            ]
+            if (distance_columns and
+                    np.any(safety[:, distance_columns] < 19.99)):
+                agg['actor_signal'] += 1
 
         def wrap_pi(angle):
             return (angle + math.pi) % (2.0 * math.pi) - math.pi
@@ -1742,6 +1783,7 @@ class KlDataset(Custom3DDataset):
             add_selector_stats(
                 selector_stats, pred_blob, gt_xy, mask, T)
             add_multimodal_stats(multimodal_stats, pred_blob)
+            add_set_reranker_stats(set_reranker_stats, pred_blob)
             if bucket_name in per_bucket_selector:
                 add_selector_stats(
                     per_bucket_selector[bucket_name], pred_blob,
@@ -1938,7 +1980,7 @@ class KlDataset(Custom3DDataset):
         if len(per_obstacle_lines) > 2:
             lines.extend(per_obstacle_lines)
 
-        multimodal_lines = ['', 'D1 multimodal selection diagnostics:']
+        multimodal_lines = ['', 'Multimodal selection diagnostics:']
         for name, agg in [('Overall', multimodal_stats)] + [
                 (bucket_title[bucket], per_bucket_multimodal[bucket])
                 for bucket in bucket_names]:
@@ -1957,6 +1999,29 @@ class KlDataset(Custom3DDataset):
                 f'candidates {candidate_mean:.1f}')
         if len(multimodal_lines) > 2:
             lines.extend(multimodal_lines)
+
+        if set_reranker_stats['n'] > 0:
+            n = set_reranker_stats['n']
+            set_size = set_reranker_stats['set_size_sum'] / n
+            actor_signal_rate = set_reranker_stats['actor_signal'] / n
+            collision_probability = (
+                set_reranker_stats['selected_collision_probability_sum'] / n)
+            selected_cost = set_reranker_stats['selected_cost_sum'] / n
+            ret_dict['planning/set_reranker/set_size'] = set_size
+            ret_dict['planning/set_reranker/actor_signal_rate'] = \
+                actor_signal_rate
+            ret_dict[
+                'planning/set_reranker/selected_collision_probability'] = \
+                collision_probability
+            ret_dict['planning/set_reranker/selected_cost'] = selected_cost
+            lines.extend([
+                '',
+                'D3-A set-reranker diagnostics:',
+                f'  N={n:5d}  set size {set_size:.1f}  '
+                f'online actor signal {100.0 * actor_signal_rate:.1f}%  '
+                f'selected collision p {collision_probability:.3f}  '
+                f'selected cost {selected_cost:.3f}',
+            ])
 
         def emit_selector_metrics(prefix, agg, title):
             n = agg['n']
