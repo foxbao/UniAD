@@ -40,6 +40,7 @@ class MapMultimodalPlanner(nn.Module):
                  candidate_cost_hard_count=16,
                  candidate_cost_near_margin=0.1,
                  candidate_cost_fallback_tiebreak=1e-4,
+                 audit_topk=0,
                  ablate_map=False):
         super().__init__()
         self.planning_steps = int(planning_steps)
@@ -84,6 +85,7 @@ class MapMultimodalPlanner(nn.Module):
         self.candidate_cost_near_margin = float(candidate_cost_near_margin)
         self.candidate_cost_fallback_tiebreak = float(
             candidate_cost_fallback_tiebreak)
+        self.audit_topk = int(audit_topk)
         self.ablate_map = bool(ablate_map)
         assert self.coordinate_scale > 0.0
         assert self.residual_scale >= 0.0
@@ -98,6 +100,7 @@ class MapMultimodalPlanner(nn.Module):
         assert self.candidate_cost_hard_count >= 0
         assert self.candidate_cost_near_margin >= 0.0
         assert self.candidate_cost_fallback_tiebreak >= 0.0
+        assert self.audit_topk >= 0
 
         trajectory_dims = self.planning_steps * 2
         self.candidate_encoder = nn.Sequential(
@@ -220,6 +223,59 @@ class MapMultimodalPlanner(nn.Module):
             memory[empty, 0] = 0.0
             valid[empty, 0] = True
         return memory, valid
+
+    @staticmethod
+    def _gather_candidates(tensor, indices):
+        if tensor is None:
+            return None
+        gather_index = indices
+        for _ in range(tensor.dim() - 2):
+            gather_index = gather_index.unsqueeze(-1)
+        gather_index = gather_index.expand(
+            *indices.shape, *tensor.shape[2:])
+        return tensor.gather(1, gather_index)
+
+    def _build_audit_payload(self, raw_candidates, refined_candidates, valid,
+                             logits, probabilities,
+                             predicted_horizon_costs, fallback_index):
+        if self.training or self.audit_topk <= 0:
+            return {}
+
+        batch_size, num_candidates = valid.shape
+        map_count = max(0, num_candidates - 1)
+        topk = min(self.audit_topk, map_count)
+        if topk > 0:
+            if predicted_horizon_costs is not None:
+                rank_cost = predicted_horizon_costs.mean(dim=-1)
+            else:
+                rank_cost = -logits
+            map_rank_cost = rank_cost[:, :map_count].masked_fill(
+                ~valid[:, :map_count], 1e4)
+            map_indices = map_rank_cost.topk(
+                topk, dim=1, largest=False).indices
+        else:
+            map_indices = torch.empty(
+                (batch_size, 0), device=valid.device, dtype=torch.long)
+
+        fallback_indices = torch.full(
+            (batch_size, 1), fallback_index,
+            device=valid.device, dtype=torch.long)
+        indices = torch.cat([map_indices, fallback_indices], dim=1)
+        payload = dict(
+            multimodal_audit_indices=indices,
+            multimodal_audit_valid=self._gather_candidates(valid, indices),
+            multimodal_audit_raw_candidates=self._gather_candidates(
+                raw_candidates, indices),
+            multimodal_audit_refined_candidates=self._gather_candidates(
+                refined_candidates, indices),
+            multimodal_audit_logits=self._gather_candidates(logits, indices),
+            multimodal_audit_selection_probabilities=
+                self._gather_candidates(probabilities, indices),
+        )
+        if predicted_horizon_costs is not None:
+            payload['multimodal_audit_predicted_horizon_costs'] = \
+                self._gather_candidates(predicted_horizon_costs, indices)
+        return payload
 
     def forward(self, plan_query, fallback, outs_map=None):
         raw_candidates, valid, source = self._candidate_inputs(
@@ -362,6 +418,9 @@ class MapMultimodalPlanner(nn.Module):
             selected = torch.sum(
                 refined_candidates * selection_weights[..., None, None],
                 dim=1)
+        audit_payload = self._build_audit_payload(
+            raw_candidates, refined_candidates, valid, logits, probabilities,
+            predicted_horizon_costs, fallback_index)
         return dict(
             multimodal_raw_candidates=raw_candidates,
             multimodal_refined_candidates=refined_candidates,
@@ -382,6 +441,7 @@ class MapMultimodalPlanner(nn.Module):
             multimodal_selected_map_traj=selected_map,
             multimodal_fallback_traj=fallback_traj,
             multimodal_selected_traj=selected,
+            **audit_payload,
         )
 
     def _metric_cost(self, candidates, gt, valid):

@@ -124,25 +124,29 @@ distillation, and fast/slow execution**.
 
 ### 4.1 Planning IR instead of free-form text
 
-The LLM should emit a constrained intermediate representation such as:
+The implemented P0 schema makes the LLM point to one supplied candidate:
 
 ```json
 {
+  "schema_version": "planning-ir/v1",
+  "selected_candidate_id": 317,
   "maneuver": "YIELD",
-  "motion_direction": "FORWARD",
-  "route_branch": "successor:lane_184",
-  "yield_to": ["track_37"],
-  "speed_cap_mps": [1.5, 1.5, 1.0, 0.5, 0.0, 0.0],
-  "forbidden_zones": ["crane_work_zone_2"],
-  "preferred_lateral_side": "RIGHT",
+  "lane_path_index": 4,
+  "speed_profile_index": 3,
+  "lateral_offset_index": 2,
+  "yield_actor_id": "track_37",
+  "risk_flags": ["FRONT_CONFLICT"],
+  "rule_ids": ["crane_work_zone_2"],
   "ttl_frames": 4,
-  "confidence": 0.86
+  "confidence": 0.86,
+  "reason": "Yield before entering the shared work lane."
 }
 ```
 
-All fields must come from a fixed schema. Lane, actor, and zone IDs must be
-validated against online inputs. Unknown or invalid fields close the semantic
-gate and preserve the current fallback.
+All fields come from a fixed schema. Candidate factors, actor IDs, and rule IDs
+are validated against online inputs. Unknown or invalid fields select the exact
+fallback. See [`planning_ir_schema.md`](planning_ir_schema.md) for the precise
+contract and executable P0 workflow.
 
 The initial maneuver vocabulary can remain small:
 
@@ -220,6 +224,14 @@ The initial maneuver vocabulary can remain small:
 ### P0: no-training semantic-value audit
 
 Do this in parallel with D2 evaluation; it does not modify the planner.
+
+Implementation status on 2026-07-13: schema, default-off top-K audit output,
+online/GT serializer split, local Qwen runner, strict fallback validation, and
+offline D2/fallback/teacher/oracle comparison are complete. Real audit
+inference and Qwen labeling remain pending. The current compact payload uses
+predicted tracked actors/motion rather than occupancy because this LiDAR D2
+evaluation does not retain a deployable occupancy prediction; adding GT
+segmentation to the prompt is explicitly forbidden.
 
 1. Define the Planning IR schema and a deterministic serializer for map graph,
    route command, predicted actors, occupancy summaries, and D2 top-K candidate

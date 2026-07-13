@@ -231,6 +231,12 @@ baseline. Promotion requires scene-specific gain over both D2 and an equal-input
 non-LLM graph/set model, especially on Turning and port long-tail cases. See
 [`llm_assisted_map_planning_research.md`](llm_assisted_map_planning_research.md).
 
+The P0 code path is now implemented: a default-off D2 audit payload, exact
+candidate-factor serializer, strict Planning IR validator, local Qwen teacher,
+and offline reselection evaluator. Real audit inference is pending an available
+GPU/checkpoint window. The exact protocol and commands are in
+[`planning_ir_schema.md`](planning_ir_schema.md).
+
 ### 8.2 Diffusion/VLA/world model
 
 The preferred radical variant is hybrid:

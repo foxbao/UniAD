@@ -979,7 +979,14 @@ class PlanningHeadSingleMode(nn.Module):
                         'multimodal_selected_predicted_cost',
                         'multimodal_fallback_predicted_cost',
                         'multimodal_selected_map_traj',
-                        'multimodal_fallback_traj'):
+                        'multimodal_fallback_traj',
+                        'multimodal_audit_indices',
+                        'multimodal_audit_valid',
+                        'multimodal_audit_raw_candidates',
+                        'multimodal_audit_refined_candidates',
+                        'multimodal_audit_logits',
+                        'multimodal_audit_selection_probabilities',
+                        'multimodal_audit_predicted_horizon_costs'):
                     if multimodal_outputs.get(key) is not None:
                         ret[key] = multimodal_outputs[key]
         return ret

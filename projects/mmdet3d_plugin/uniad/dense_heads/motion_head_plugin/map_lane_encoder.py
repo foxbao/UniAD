@@ -426,6 +426,34 @@ class MapPlanningCandidateGenerator:
                 break
         return unique
 
+    def build_candidate_metadata(self, ego2global):
+        """Describe candidates in the exact order produced by ``__call__``."""
+        if isinstance(ego2global, torch.Tensor):
+            ego2global = ego2global.detach().cpu().numpy()
+        ego2global = np.asarray(ego2global, dtype=np.float64)
+        paths = self._build_route_paths(ego2global)
+        metadata = []
+        candidate_index = 0
+        for path_index, (path_score, sequence, _points) in enumerate(paths):
+            lane_sequence = [
+                dict(lane_id=str(lane_id), reverse=bool(reverse))
+                for lane_id, reverse in sequence
+            ]
+            for profile_index, profile in enumerate(self.profiles):
+                for offset_index, offset in enumerate(self.lateral_offsets):
+                    metadata.append(dict(
+                        candidate_id=candidate_index,
+                        path_index=path_index,
+                        path_score=float(path_score),
+                        lane_sequence=lane_sequence,
+                        speed_profile_index=profile_index,
+                        speed_profile_m=[float(value) for value in profile],
+                        lateral_offset_index=offset_index,
+                        lateral_offset_m=float(offset),
+                    ))
+                    candidate_index += 1
+        return metadata
+
     @staticmethod
     def _interpolate_polyline(points, distances):
         segment = np.linalg.norm(np.diff(points, axis=0), axis=1)

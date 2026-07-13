@@ -219,6 +219,13 @@ def _compact_planning_for_eval(planning):
             'multimodal_fallback_predicted_cost': torch.float32,
             'multimodal_selected_map_traj': torch.float32,
             'multimodal_fallback_traj': torch.float32,
+            'multimodal_audit_indices': torch.long,
+            'multimodal_audit_valid': torch.bool,
+            'multimodal_audit_raw_candidates': torch.float32,
+            'multimodal_audit_refined_candidates': torch.float32,
+            'multimodal_audit_logits': torch.float32,
+            'multimodal_audit_selection_probabilities': torch.float32,
+            'multimodal_audit_predicted_horizon_costs': torch.float32,
         }
         for key, dtype in selector_field_dtypes.items():
             if key in result_planning:

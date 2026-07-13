@@ -9,6 +9,8 @@ experiment detail. Do not read every document to recover the project state.
    promoted checkpoint, active experiment, evaluation contract, and next route.
 2. [`llm_assisted_map_planning_research.md`](llm_assisted_map_planning_research.md)
    - LLM/VLA literature, proposed Planning IR, and phased promotion gates.
+3. [`planning_ir_schema.md`](planning_ir_schema.md) - implemented P0 schema,
+   GT-leak boundary, audit workflow, and executable commands.
 
 ## Historical evidence
 
