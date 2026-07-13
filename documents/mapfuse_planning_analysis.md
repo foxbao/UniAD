@@ -1297,6 +1297,39 @@ representation. If D2.0 cannot separate fallback from map candidates even on a
 larger scene-complete subset, further scalar post-hoc calibration should not be
 continued.
 
+### D2.0 balanced pilot result
+
+The 2,010-frame balanced pilot completed one epoch and was evaluated on all
+4,676 validation frames. It does not pass promotion:
+
+| full validation | C2.3 fallback | D2.0 pilot |
+|---|---:|---:|
+| avg.L2 | **0.5901** | 0.5952 |
+| avg.Collision | 0.96% | 0.96% |
+| Static | 0.2803 | 0.2803 |
+| Slow | 0.4838 | 0.4838 |
+| MovingStraight | **0.7023** | 0.7111 |
+| Turning | 0.8782 | 0.8782 |
+| FrontClear | 0.6006 | **0.5979** |
+| FrontObstacle | **0.5854** | 0.5937 |
+
+D2 selects map on `10.37%` overall, entirely in MovingStraight (`18.39%` in
+that bucket and `0%` in Static/Slow/Turning). Offline comparison against the
+retained exact fallback confirms fallback-only `avg.L2=0.59011`. Among 474
+valid map selections, 315 (`66.5%`) improve per-sample L2, but the bad 33.5%
+have enough tail cost that selected map frames regress by `0.0537 m` on
+average. The median selected-map delta is an improvement of `0.1209 m`, so a
+minority of large mistakes dominates the mean.
+
+The failure is specifically miscalibration: on selected-map frames the head
+predicts map to beat fallback by `0.385 m` on average, while map actually loses
+by `0.054 m`. A GT oracle restricted to D2's selected trajectory versus the
+fallback reaches `avg.L2=0.5709`. Therefore D2.0 is not deployable, but unlike
+D1.2 it demonstrates a useful majority of real map selections and meaningful
+headroom. The next experiment should train the same frozen-representation cost
+head on a deterministic scene-complete medium subset before considering full
+data; it should not add another threshold or gate.
+
 D1 first freezes the UniAD perception, motion, and map encoder and trains only
 the new candidate scorer/residual head. Promotion requires a meaningful gap to
 the D0 oracle, `avg.L2 < 0.5901`, no Slow/Turning regression, and a map-off
