@@ -1244,6 +1244,55 @@ and select minimum predicted cost. This removes the separate utility gate while
 retaining the demonstrated map-top1/fallback oracle of `0.4864` as the target
 upper bound.
 
+### D2 unified calibrated candidate cost
+
+D2 implements that structural change without modifying the D1.1 candidate
+generator, candidate representation, map-only scorer, or residual refinement.
+For every refined map candidate and the exact C2.3 fallback, one shared head
+predicts three non-negative costs corresponding to evaluator horizons
+`1s/2s/3s`. Inference selects the minimum mean predicted cost directly. There
+is no map/fallback utility threshold and no separately calibrated gate.
+
+The fallback residual remains hard-zero, so selecting fallback is exactly C2.3.
+The new head is zero-initialized at its output and a `1e-4` fallback tie-break
+only resolves the all-equal untrained state. Once any cost difference is
+learned, selection is driven by predicted cost. Selection is hard in both train
+and eval; the cost head learns from explicit cost supervision rather than from
+a soft trajectory mixture.
+
+Direct Smooth-L1 cost regression is balanced to prevent roughly 1,000 ordinary
+candidates from overwhelming the useful decisions. Every batch emphasizes the
+fallback, oracle/near-oracle modes, the model's current low-cost hard modes, and
+a low-weight background of all valid candidates. A listwise loss over negative
+predicted cost additionally trains candidate ordering. Logged diagnostics
+include per-horizon MAE, selected predicted/actual cost, fallback
+predicted/actual cost, oracle cost, regret, near-oracle rate, and fallback
+decision accuracy.
+
+D2.0 loads the D1.1 pilot checkpoint and freezes everything except the new
+69,635-parameter cost head. Real checkpoint construction reports exactly four
+expected missing tensors, all from that head. A 10-iteration real-data CUDA
+smoke passed with about `1,067` candidates/sample, finite cost/ranking losses,
+finite `grad_norm=2.13`, and no OOM or NaN. This proves implementation and
+training-path viability only; it is not evidence of validation improvement.
+
+Run the balanced D2.0 pilot with:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3,4 MASTER_PORT=28812 \
+  ./tools/uniad_dist_train.sh \
+  projects/configs/stage2_e2e_lidar/base_e2e_lidar_plan_mapfuse_v6_d2_calibrated_cost_pilot_train.py \
+  5
+```
+
+Promotion still requires full validation below C2.3 (`avg.L2 < 0.5901`), no
+motion-bucket regression above `0.01`, non-zero map selection, a causal
+candidate-off degradation, and collision near or below `1%`. If D2.0 shows
+calibrated selection but insufficient ranking, D2.1 may unfreeze candidate
+representation. If D2.0 cannot separate fallback from map candidates even on a
+larger scene-complete subset, further scalar post-hoc calibration should not be
+continued.
+
 D1 first freezes the UniAD perception, motion, and map encoder and trains only
 the new candidate scorer/residual head. Promotion requires a meaningful gap to
 the D0 oracle, `avg.L2 < 0.5901`, no Slow/Turning regression, and a map-off

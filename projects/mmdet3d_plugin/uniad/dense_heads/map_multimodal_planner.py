@@ -28,6 +28,18 @@ class MapMultimodalPlanner(nn.Module):
                  utility_threshold=0.5,
                  utility_target_mode='binary',
                  utility_regression_clip=2.0,
+                 use_candidate_cost=False,
+                 candidate_cost_loss_weight=1.0,
+                 candidate_cost_ranking_weight=0.2,
+                 candidate_cost_temperature=0.25,
+                 candidate_cost_target_clip=10.0,
+                 candidate_cost_background_weight=0.05,
+                 candidate_cost_oracle_weight=2.0,
+                 candidate_cost_fallback_weight=2.0,
+                 candidate_cost_hard_weight=1.0,
+                 candidate_cost_hard_count=16,
+                 candidate_cost_near_margin=0.1,
+                 candidate_cost_fallback_tiebreak=1e-4,
                  ablate_map=False):
         super().__init__()
         self.planning_steps = int(planning_steps)
@@ -55,11 +67,37 @@ class MapMultimodalPlanner(nn.Module):
                 f'got {utility_target_mode}')
         self.utility_target_mode = utility_target_mode
         self.utility_regression_clip = float(utility_regression_clip)
+        self.use_candidate_cost = bool(use_candidate_cost)
+        self.candidate_cost_loss_weight = float(candidate_cost_loss_weight)
+        self.candidate_cost_ranking_weight = float(
+            candidate_cost_ranking_weight)
+        self.candidate_cost_temperature = float(candidate_cost_temperature)
+        self.candidate_cost_target_clip = float(candidate_cost_target_clip)
+        self.candidate_cost_background_weight = float(
+            candidate_cost_background_weight)
+        self.candidate_cost_oracle_weight = float(
+            candidate_cost_oracle_weight)
+        self.candidate_cost_fallback_weight = float(
+            candidate_cost_fallback_weight)
+        self.candidate_cost_hard_weight = float(candidate_cost_hard_weight)
+        self.candidate_cost_hard_count = int(candidate_cost_hard_count)
+        self.candidate_cost_near_margin = float(candidate_cost_near_margin)
+        self.candidate_cost_fallback_tiebreak = float(
+            candidate_cost_fallback_tiebreak)
         self.ablate_map = bool(ablate_map)
         assert self.coordinate_scale > 0.0
         assert self.residual_scale >= 0.0
         assert self.score_temperature > 0.0
         assert self.positive_cost_margin >= 0.0
+        assert self.candidate_cost_temperature > 0.0
+        assert self.candidate_cost_target_clip > 0.0
+        assert self.candidate_cost_background_weight >= 0.0
+        assert self.candidate_cost_oracle_weight >= 0.0
+        assert self.candidate_cost_fallback_weight >= 0.0
+        assert self.candidate_cost_hard_weight >= 0.0
+        assert self.candidate_cost_hard_count >= 0
+        assert self.candidate_cost_near_margin >= 0.0
+        assert self.candidate_cost_fallback_tiebreak >= 0.0
 
         trajectory_dims = self.planning_steps * 2
         self.candidate_encoder = nn.Sequential(
@@ -84,6 +122,7 @@ class MapMultimodalPlanner(nn.Module):
             nn.Linear(embed_dims, trajectory_dims))
         self.utility_gate_head = None
         self.utility_regression_head = None
+        self.candidate_cost_head = None
         if self.use_utility_gate:
             self.utility_gate_head = nn.Sequential(
                 nn.Linear(embed_dims * 3, embed_dims),
@@ -101,6 +140,14 @@ class MapMultimodalPlanner(nn.Module):
                 nn.init.zeros_(self.utility_regression_head[-1].weight)
                 nn.init.constant_(
                     self.utility_regression_head[-1].bias, -0.1)
+        if self.use_candidate_cost:
+            cost_input_dims = embed_dims + trajectory_dims
+            self.candidate_cost_head = nn.Sequential(
+                nn.Linear(cost_input_dims, embed_dims),
+                nn.ReLU(inplace=True),
+                nn.Linear(embed_dims, len(self.eval_horizon_indices)))
+            nn.init.zeros_(self.candidate_cost_head[-1].weight)
+            nn.init.zeros_(self.candidate_cost_head[-1].bias)
 
         nn.init.zeros_(self.score_head.weight)
         nn.init.zeros_(self.score_head.bias)
@@ -198,7 +245,7 @@ class MapMultimodalPlanner(nn.Module):
         feature = self.ffn_norm(feature + self.ffn(feature))
 
         logits = self.score_head(feature).squeeze(-1)
-        if not self.use_utility_gate:
+        if not self.use_utility_gate and not self.use_candidate_cost:
             fallback_bias = torch.zeros_like(logits)
             fallback_bias[:, -1] = self.fallback_logit_bias
             logits = logits + fallback_bias
@@ -206,7 +253,7 @@ class MapMultimodalPlanner(nn.Module):
         residual = torch.tanh(self.residual_head(feature)).reshape(
             batch_size, num_candidates, self.planning_steps, 2)
         residual = residual * self.residual_scale
-        if self.use_utility_gate:
+        if self.use_utility_gate or self.use_candidate_cost:
             # The safety fallback must remain byte-for-byte C2.3. Residual
             # capacity is reserved for explicit map candidates only.
             residual = residual * (source == 0).to(residual)[..., None, None]
@@ -217,9 +264,36 @@ class MapMultimodalPlanner(nn.Module):
         utility_probability = None
         map_selected_index = None
         selected_map = None
+        predicted_horizon_costs = None
+        selected_predicted_cost = None
+        fallback_predicted_cost = None
         fallback_index = num_candidates - 1
         fallback_traj = refined_candidates[:, -1]
-        if self.use_utility_gate and num_candidates > 1:
+        if self.use_candidate_cost:
+            cost_input = torch.cat([
+                feature,
+                (refined_candidates / self.coordinate_scale).reshape(
+                    batch_size, num_candidates, -1),
+            ], dim=-1)
+            predicted_horizon_costs = F.softplus(
+                self.candidate_cost_head(cost_input))
+            predicted_mean_cost = predicted_horizon_costs.mean(dim=-1)
+            selection_cost = predicted_mean_cost.masked_fill(~valid, 1e4)
+            selection_cost = selection_cost.clone()
+            selection_cost[:, -1] -= self.candidate_cost_fallback_tiebreak
+            probabilities = torch.softmax(
+                -selection_cost / self.candidate_cost_temperature, dim=-1)
+            selected_index = selection_cost.argmin(dim=-1)
+            hard_weights = F.one_hot(
+                selected_index, num_classes=num_candidates).to(probabilities)
+            selected = torch.sum(
+                refined_candidates * hard_weights[..., None, None],
+                dim=1)
+            batch_index = torch.arange(batch_size, device=feature.device)
+            selected_predicted_cost = predicted_mean_cost[
+                batch_index, selected_index]
+            fallback_predicted_cost = predicted_mean_cost[:, -1]
+        elif self.use_utility_gate and num_candidates > 1:
             map_logits = logits[:, :-1]
             map_probabilities = torch.softmax(map_logits, dim=-1)
             map_selected_index = map_logits.argmax(dim=-1)
@@ -302,6 +376,9 @@ class MapMultimodalPlanner(nn.Module):
             multimodal_utility_logit=utility_logit,
             multimodal_utility_score=utility_score,
             multimodal_utility_probability=utility_probability,
+            multimodal_predicted_horizon_costs=predicted_horizon_costs,
+            multimodal_selected_predicted_cost=selected_predicted_cost,
+            multimodal_fallback_predicted_cost=fallback_predicted_cost,
             multimodal_selected_map_traj=selected_map,
             multimodal_fallback_traj=fallback_traj,
             multimodal_selected_traj=selected,
@@ -329,6 +406,21 @@ class MapMultimodalPlanner(nn.Module):
         assert cost.size(0) == batch_size
         return cost, sample_valid
 
+    def _horizon_costs(self, candidates, gt, valid):
+        """Return per-candidate L2 targets at the configured horizons."""
+        horizon_indices = torch.tensor(
+            self.eval_horizon_indices, device=candidates.device,
+            dtype=torch.long)
+        horizon_valid = horizon_indices < candidates.size(2)
+        safe_indices = horizon_indices.clamp(max=candidates.size(2) - 1)
+        candidate_points = candidates.index_select(2, safe_indices)
+        gt_points = gt.index_select(1, safe_indices)
+        costs = torch.linalg.norm(
+            candidate_points - gt_points[:, None], dim=-1)
+        target_valid = valid.index_select(1, safe_indices) & \
+            horizon_valid[None]
+        return costs, target_valid
+
     def loss(self, outputs, gt, valid):
         logits = outputs['multimodal_logits']
         zero = sum(parameter.sum() * 0.0 for parameter in self.parameters())
@@ -336,6 +428,8 @@ class MapMultimodalPlanner(nn.Module):
             loss_multimodal_score=zero,
             loss_multimodal_residual=zero,
             loss_multimodal_utility_gate=zero,
+            loss_multimodal_candidate_cost=zero,
+            loss_multimodal_candidate_cost_ranking=zero,
             multimodal_valid_rate=zero.detach(),
             multimodal_candidate_count=zero.detach(),
             multimodal_top1_oracle_recall=zero.detach(),
@@ -357,6 +451,15 @@ class MapMultimodalPlanner(nn.Module):
             multimodal_map_oracle_l2=zero.detach(),
             multimodal_pred_map_l2=zero.detach(),
             multimodal_fallback_l2=zero.detach(),
+            multimodal_candidate_cost_mae=zero.detach(),
+            multimodal_candidate_cost_selected_pred=zero.detach(),
+            multimodal_candidate_cost_selected_actual=zero.detach(),
+            multimodal_candidate_cost_fallback_pred=zero.detach(),
+            multimodal_candidate_cost_fallback_actual=zero.detach(),
+            multimodal_candidate_cost_oracle_l2=zero.detach(),
+            multimodal_candidate_cost_regret=zero.detach(),
+            multimodal_candidate_cost_near_oracle=zero.detach(),
+            multimodal_candidate_cost_fallback_accuracy=zero.detach(),
         )
         batch_size = min(logits.size(0), gt.size(0), valid.size(0))
         if batch_size == 0:
@@ -374,7 +477,9 @@ class MapMultimodalPlanner(nn.Module):
             return stats
 
         masked_costs = costs.masked_fill(~candidate_valid, 1e4)
-        if self.use_utility_gate and logits.size(1) > 1:
+        separate_map_ranking = (
+            self.use_utility_gate or self.use_candidate_cost)
+        if separate_map_ranking and logits.size(1) > 1:
             score_logits = logits[:, :-1]
             score_costs = masked_costs[:, :-1]
             score_valid = candidate_valid[:, :-1]
@@ -403,7 +508,7 @@ class MapMultimodalPlanner(nn.Module):
             stats['multimodal_positive_probability'] = (
                 probabilities * positive.to(probabilities)
             ).sum(dim=-1)[score_sample_valid].mean().detach()
-            if not self.use_utility_gate:
+            if not separate_map_ranking:
                 stats['multimodal_fallback_target_rate'] = positive[
                     score_sample_valid, -1].to(raw).mean().detach()
         else:
@@ -414,7 +519,7 @@ class MapMultimodalPlanner(nn.Module):
         stats['loss_multimodal_score'] = (
             score_loss[score_sample_valid].mean() * self.score_loss_weight)
 
-        if self.use_utility_gate:
+        if self.use_utility_gate and not self.use_candidate_cost:
             fallback_cost = masked_costs[:, -1]
             map_selected_index = outputs[
                 'multimodal_map_selected_index'][:batch_size]
@@ -466,9 +571,137 @@ class MapMultimodalPlanner(nn.Module):
             stats['multimodal_fallback_target_rate'] = (
                 ~utility_target[sample_valid]).to(raw).mean().detach()
 
+        if self.use_candidate_cost:
+            refined = outputs['multimodal_refined_candidates'][:batch_size]
+            predicted_horizon_costs = outputs[
+                'multimodal_predicted_horizon_costs'][:batch_size]
+            target_horizon_costs, horizon_valid = self._horizon_costs(
+                refined, gt, valid)
+            target_horizon_costs = target_horizon_costs.detach().clamp(
+                max=self.candidate_cost_target_clip)
+            cost_valid = candidate_valid[..., None] & horizon_valid[:, None]
+            horizon_weight = horizon_valid.to(raw)
+            target_mean_cost = (
+                target_horizon_costs * horizon_weight[:, None]
+            ).sum(dim=-1) / horizon_weight.sum(
+                dim=-1, keepdim=True).clamp_min(1.0)
+            target_mean_cost = target_mean_cost.masked_fill(
+                ~candidate_valid, 1e4)
+            predicted_mean_cost = predicted_horizon_costs.mean(dim=-1)
+            predicted_selection_cost = predicted_mean_cost.masked_fill(
+                ~candidate_valid, 1e4)
+
+            target_oracle_cost, target_oracle_index = \
+                target_mean_cost.min(dim=-1)
+            near_oracle = candidate_valid & (
+                target_mean_cost <= target_oracle_cost[:, None]
+                + self.candidate_cost_near_margin)
+            cost_weight = candidate_valid.to(raw) * \
+                self.candidate_cost_background_weight
+            cost_weight = cost_weight + near_oracle.to(raw) * \
+                self.candidate_cost_oracle_weight
+            cost_weight[:, -1] += self.candidate_cost_fallback_weight
+            hard_count = min(
+                self.candidate_cost_hard_count,
+                predicted_selection_cost.size(1))
+            if hard_count > 0:
+                hard_indices = predicted_selection_cost.topk(
+                    hard_count, dim=-1, largest=False).indices
+                hard_weight = torch.zeros_like(cost_weight)
+                hard_weight.scatter_(1, hard_indices, 1.0)
+                hard_weight = hard_weight * candidate_valid.to(raw)
+                cost_weight = cost_weight + hard_weight * \
+                    self.candidate_cost_hard_weight
+            cost_weight = cost_weight[..., None] * cost_valid.to(raw)
+
+            cost_error = F.smooth_l1_loss(
+                predicted_horizon_costs, target_horizon_costs,
+                reduction='none')
+            cost_loss = (cost_error * cost_weight).sum(dim=(1, 2)) / \
+                cost_weight.sum(dim=(1, 2)).clamp_min(1.0)
+            cost_sample_valid = sample_valid & horizon_valid.any(dim=-1)
+            if cost_sample_valid.any():
+                stats['loss_multimodal_candidate_cost'] = (
+                    cost_loss[cost_sample_valid].mean()
+                    * self.candidate_cost_loss_weight)
+
+                target_distribution = torch.softmax(
+                    -target_mean_cost / self.candidate_cost_temperature,
+                    dim=-1).detach()
+                predicted_log_distribution = F.log_softmax(
+                    -predicted_selection_cost
+                    / self.candidate_cost_temperature, dim=-1)
+                ranking_loss = -(
+                    target_distribution
+                    * predicted_log_distribution).sum(dim=-1)
+                stats['loss_multimodal_candidate_cost_ranking'] = (
+                    ranking_loss[cost_sample_valid].mean()
+                    * self.candidate_cost_ranking_weight)
+
+            selected_cost_index = outputs[
+                'multimodal_selected_index'][:batch_size]
+            selected_predicted_cost = predicted_mean_cost[
+                batch_index, selected_cost_index]
+            selected_actual_cost = target_mean_cost[
+                batch_index, selected_cost_index]
+            fallback_predicted_cost = predicted_mean_cost[:, -1]
+            fallback_actual_cost = target_mean_cost[:, -1]
+
+            def cost_sample_mean(value):
+                weight = cost_sample_valid.to(value)
+                return (value * weight).sum() / weight.sum().clamp_min(1.0)
+
+            plain_cost_weight = cost_valid.to(raw)
+            stats['multimodal_candidate_cost_mae'] = (
+                (predicted_horizon_costs - target_horizon_costs).abs()
+                * plain_cost_weight
+            ).sum() / plain_cost_weight.sum().clamp_min(1.0)
+            stats['multimodal_candidate_cost_mae'] = \
+                stats['multimodal_candidate_cost_mae'].detach()
+            stats['multimodal_candidate_cost_selected_pred'] = \
+                cost_sample_mean(selected_predicted_cost).detach()
+            stats['multimodal_candidate_cost_selected_actual'] = \
+                cost_sample_mean(selected_actual_cost).detach()
+            stats['multimodal_candidate_cost_fallback_pred'] = \
+                cost_sample_mean(fallback_predicted_cost).detach()
+            stats['multimodal_candidate_cost_fallback_actual'] = \
+                cost_sample_mean(fallback_actual_cost).detach()
+            stats['multimodal_candidate_cost_oracle_l2'] = \
+                cost_sample_mean(target_oracle_cost).detach()
+            stats['multimodal_candidate_cost_regret'] = cost_sample_mean(
+                selected_actual_cost - target_oracle_cost).detach()
+            near_oracle_selected = (
+                selected_actual_cost <= target_oracle_cost
+                + self.oracle_recall_tolerance).to(raw)
+            stats['multimodal_candidate_cost_near_oracle'] = \
+                cost_sample_mean(near_oracle_selected).detach()
+            selected_fallback = selected_cost_index == \
+                outputs['multimodal_fallback_index'][:batch_size]
+            target_fallback = (
+                target_oracle_index == candidate_valid.size(1) - 1)
+            stats['multimodal_fallback_target_rate'] = cost_sample_mean(
+                target_fallback.to(raw)).detach()
+            fallback_accuracy = (
+                selected_fallback == target_fallback).to(raw)
+            stats['multimodal_candidate_cost_fallback_accuracy'] = \
+                cost_sample_mean(fallback_accuracy).detach()
+            for horizon_offset, horizon_index in enumerate(
+                    self.eval_horizon_indices):
+                valid_at_horizon = cost_valid[..., horizon_offset]
+                if valid_at_horizon.any():
+                    horizon_mae = (
+                        predicted_horizon_costs[..., horizon_offset]
+                        - target_horizon_costs[..., horizon_offset]
+                    ).abs()[valid_at_horizon].mean().detach()
+                else:
+                    horizon_mae = zero.detach()
+                stats[
+                    f'multimodal_candidate_cost_mae_h{horizon_index}'] = \
+                    horizon_mae
+
         selected_index = outputs['multimodal_selected_index'][:batch_size]
         residual_oracle_index = (
-            score_oracle_index if self.use_utility_gate else oracle_index)
+            score_oracle_index if separate_map_ranking else oracle_index)
         oracle_raw = raw[batch_index, residual_oracle_index]
         residual = outputs['multimodal_residual'][:batch_size]
         oracle_residual = residual[batch_index, residual_oracle_index]
@@ -490,9 +723,13 @@ class MapMultimodalPlanner(nn.Module):
         top_k = min(5, score_logits.size(-1))
         top_indices = score_logits.topk(top_k, dim=-1).indices
         top_costs = score_costs.gather(dim=-1, index=top_indices)
-        score_selected_index = (
-            outputs['multimodal_map_selected_index'][:batch_size]
-            if self.use_utility_gate else selected_index)
+        if self.use_utility_gate and not self.use_candidate_cost:
+            score_selected_index = outputs[
+                'multimodal_map_selected_index'][:batch_size]
+        elif self.use_candidate_cost:
+            score_selected_index = score_logits.argmax(dim=-1)
+        else:
+            score_selected_index = selected_index
         score_selected_cost = score_costs[
             batch_index, score_selected_index]
         stats['multimodal_top1_oracle_recall'] = (

@@ -976,6 +976,8 @@ class PlanningHeadSingleMode(nn.Module):
                         'multimodal_map_selected_index',
                         'multimodal_utility_probability',
                         'multimodal_utility_score',
+                        'multimodal_selected_predicted_cost',
+                        'multimodal_fallback_predicted_cost',
                         'multimodal_selected_map_traj',
                         'multimodal_fallback_traj'):
                     if multimodal_outputs.get(key) is not None:
