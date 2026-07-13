@@ -1354,6 +1354,44 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4 MASTER_PORT=28815 \
   5
 ```
 
+### D2.0 medium result and promotion
+
+The 10,238-frame medium run completed 2,048/2,048 five-GPU iterations and was
+evaluated on the unchanged 4,676-frame full validation set:
+
+| full validation | C2.3 fallback | D2 pilot | D2 medium |
+|---|---:|---:|---:|
+| avg.L2 | 0.5901 | 0.5952 | **0.5727** |
+| avg.Collision | 0.96% | 0.96% | 0.96% |
+| Static | 0.2803 | 0.2803 | **0.2608** |
+| Slow | 0.4838 | 0.4838 | **0.4834** |
+| MovingStraight | 0.7023 | 0.7111 | **0.6774** |
+| Turning | **0.8782** | 0.8782 | 0.8812 |
+| FrontClear | 0.6006 | **0.5979** | 0.5990 |
+| FrontObstacle | 0.5854 | 0.5937 | **0.5615** |
+
+D2 medium improves global L2 by `0.01737 m` (`2.94%`) over C2.3 with exactly
+flat collision. Turning regresses by only `0.0031 m`, below the declared
+`0.01 m` bucket limit; all other motion buckets improve or remain flat. Map is
+selected on `17.88%` of all validation frames: Static `30.96%`, Slow `19.76%`,
+MovingStraight `14.00%`, and Turning `4.23%`.
+
+The retained exact fallback provides a same-frame causal counterfactual of
+`avg.L2=0.59011`. Among 822 valid map selections, 566 (`68.9%`) beat fallback.
+Selected map frames improve by `0.0955 m` on average and `0.0629 m` at the
+median. The predicted mean improvement is `0.0982 m`, leaving only `0.0027 m`
+calibration error, versus the pilot's directionally wrong `0.439 m` error.
+Static selections are useful `86.6%` of the time and MovingStraight `72.6%`;
+Slow is only `43.5%` but retains a small mean gain, while Turning has just six
+valid map selections and a small regression.
+
+An oracle restricted to D2 medium's selected trajectory versus fallback is
+`avg.L2=0.56385`, only `0.00889 m` beyond the deployed result. D2 medium
+therefore passes promotion and becomes the current best map-planning
+checkpoint. The next controlled experiment is the same D2.0 head-only training
+on all 43,981 frames; D3 shortlist/set-aware reranking remains the successor if
+full-data scaling loses the medium calibration.
+
 D1 first freezes the UniAD perception, motion, and map encoder and trains only
 the new candidate scorer/residual head. Promotion requires a meaningful gap to
 the D0 oracle, `avg.L2 < 0.5901`, no Slow/Turning regression, and a map-off
