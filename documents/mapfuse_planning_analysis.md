@@ -455,7 +455,7 @@ This is not a threshold-tuning problem. Even zero relative margin suppresses
 most map variants but misses three of the four false-safe collision events.
 Do not run the 43,981-frame D3-A.1 schedule.
 
-The next control is D3-A.2, trained from D3-A.1 medium:
+The next model control is D3-A.2, trained from D3-A.1 medium:
 
 1. Pass the already generated `gt_segmentation` into planning loss and build
    collision targets with the same `0.8 m` raster, future-frame indexing, ego
@@ -467,6 +467,21 @@ The next control is D3-A.2, trained from D3-A.1 medium:
 4. Repeat a scene-complete 10k control and require at most the D2 full
    collision rate while retaining D3-A.1's L2 gain before considering full
    data.
+
+Before running that control, complete the planning-dataset validity gate. The
+train and validation sets were collected primarily for 3D detection and
+contain deliberate static-target inspection, orbit, and repositioning. The ego
+IGV also mixes slow manual joystick operation, commonly used for deliberate
+collection, with faster automatic operation. The info files contain no true
+control-mode field.
+
+The scene audit now covers 649 scenes / 49,172 frames. Automatic triage marks
+33 scenes as likely `DetectionProbe`, 207 as `Uncertain`, and only 409 as
+`NaturalRun`; all 65 validation scenes require human review. This is a data
+validity warning, not an automatic deletion decision. Re-evaluate frozen D2 and
+D3 checkpoints on the reviewed planning validation split before attributing
+small metric differences to architecture. The protocol and exact commands are
+in [`planning_dataset_audit.md`](planning_dataset_audit.md).
 
 D3 addresses two measured D2 limitations:
 
