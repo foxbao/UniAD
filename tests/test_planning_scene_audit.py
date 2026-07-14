@@ -8,6 +8,7 @@ from tools.analysis_tools.build_planning_scene_audit import (
     auto_classify,
     infer_control_mode_proxy,
 )
+from tools.analysis_tools.serve_planning_scene_review import ManifestStore
 
 
 class PlanningSceneAuditTest(unittest.TestCase):
@@ -105,6 +106,62 @@ class PlanningManifestSplitTest(unittest.TestCase):
         self.assertFalse(decisions[('val', 'probe')]['usable'])
         self.assertEqual(
             decisions[('val', 'probe')]['control_mode'], 'Manual')
+
+
+class PlanningSceneReviewStoreTest(unittest.TestCase):
+
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.fieldnames = (
+            'split', 'scene_token', 'auto_label', 'auto_confidence',
+            'control_mode_proxy', 'human_label', 'human_control_mode',
+            'planning_usable', 'review_status', 'reviewer', 'notes',
+        )
+        self.rows = [
+            dict(split='val', scene_token='scene-1',
+                 auto_label='NaturalRun', auto_confidence='0.8',
+                 control_mode_proxy='LikelyAuto', human_label='',
+                 human_control_mode='', planning_usable='',
+                 review_status='', reviewer='', notes=''),
+            dict(split='val', scene_token='scene-2',
+                 auto_label='Uncertain', auto_confidence='0.2',
+                 control_mode_proxy='MixedOrUnknown', human_label='',
+                 human_control_mode='', planning_usable='',
+                 review_status='', reviewer='', notes=''),
+        ]
+        for name in ('scene_manifest.csv', 'review_queue.csv'):
+            path = os.path.join(self.directory.name, name)
+            with open(path, 'w', newline='', encoding='utf-8') as handle:
+                writer = csv.DictWriter(handle, fieldnames=self.fieldnames)
+                writer.writeheader()
+                writer.writerows(self.rows)
+        self.store = ManifestStore(self.directory.name)
+
+    def test_review_is_atomic_and_updates_pending_queue(self):
+        scenes, summary = self.store.list_scenes()
+        self.assertEqual(len(scenes), 2)
+        self.assertEqual(summary, dict(total=2, reviewed=0))
+
+        saved, summary = self.store.review(dict(
+            split='val', scene_token='scene-1', human_label='NaturalRun',
+            human_control_mode='Auto', planning_usable='1',
+            reviewer='tester', notes='normal route'))
+
+        self.assertEqual(saved['review_status'], 'reviewed')
+        self.assertEqual(summary, dict(total=2, reviewed=1))
+        pending, _ = self.store.list_scenes(status='pending')
+        self.assertEqual([row['scene_token'] for row in pending], ['scene-2'])
+        temporary = [name for name in os.listdir(self.directory.name)
+                     if name.startswith('.scene_manifest.')]
+        self.assertEqual(temporary, [])
+
+    def test_review_rejects_invalid_control_mode(self):
+        with self.assertRaisesRegex(ValueError, 'human_control_mode'):
+            self.store.review(dict(
+                split='val', scene_token='scene-1',
+                human_label='NaturalRun', human_control_mode='LikelyAuto',
+                planning_usable='1'))
 
 
 if __name__ == '__main__':

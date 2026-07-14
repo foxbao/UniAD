@@ -51,6 +51,18 @@ object density, and ego orbit around tracked static targets. It produces:
 
 Rerunning the tool preserves all human columns in `scene_manifest.csv`.
 
+Start the local click-through reviewer with:
+
+```bash
+python tools/analysis_tools/serve_planning_scene_review.py \
+  --audit-dir \
+    projects/work_dirs/stage2_e2e_lidar/planning_scene_audit \
+  --port 8765
+```
+
+Open `http://127.0.0.1:8765`. Each save atomically updates
+`scene_manifest.csv`; the default queue is the unreviewed validation split.
+
 ## 3. Current automatic triage
 
 The first full audit covers 649 scenes and 49,172 frames:
