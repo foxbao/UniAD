@@ -341,16 +341,16 @@ Completed engineering gates on 2026-07-13:
 The one-epoch 10k medium run and full-validation candidate-off control are now
 complete:
 
-| split | C2.3 candidate-off | D2 full | D2.1 | D3-A |
-|---|---:|---:|---:|---:|
-| Global | 0.59011 | 0.56905 | **0.54019** | 0.55540 |
-| Static | 0.28027 | 0.26848 | 0.19888 | **0.19736** |
-| Slow | 0.48378 | **0.46428** | 0.46687 | 0.46873 |
-| MovingStraight | 0.70230 | 0.67588 | **0.64487** | 0.66925 |
-| Turning | **0.87816** | 0.89471 | 0.87864 | 0.90827 |
-| FrontClear | 0.60060 | 0.59772 | **0.56650** | 0.57485 |
-| FrontObstacle | 0.58542 | 0.55674 | **0.52894** | 0.54697 |
-| Collision | 0.9637% | **0.9563%** | 1.0032% | 0.9720% |
+| split | C2.3 candidate-off | D2 full | D2.1 | D3-A | D3-A.1 |
+|---|---:|---:|---:|---:|---:|
+| Global | 0.59011 | 0.56905 | **0.54019** | 0.55540 | 0.54281 |
+| Static | 0.28027 | 0.26848 | 0.19888 | **0.19736** | 0.20278 |
+| Slow | 0.48378 | **0.46428** | 0.46687 | 0.46873 | 0.46625 |
+| MovingStraight | 0.70230 | 0.67588 | **0.64487** | 0.66925 | 0.64776 |
+| Turning | **0.87816** | 0.89471 | 0.87864 | 0.90827 | 0.89178 |
+| FrontClear | 0.60060 | 0.59772 | **0.56650** | 0.57485 | 0.57047 |
+| FrontObstacle | 0.58542 | 0.55674 | **0.52894** | 0.54697 | 0.53094 |
+| Collision | 0.9637% | **0.9563%** | 1.0032% | 0.9720% | 0.9955% |
 
 D3-A selects a map candidate on `34.86%` of 4,676 validation frames. Online
 actor safety features are active on `92.86%` of frames. Relative to its exact
@@ -366,7 +366,7 @@ highest-priority hypothesis for the Turning and dynamic-bucket accuracy loss.
 Collision positives are also sparse, so a soft collision-cost term alone did
 not guarantee the strict safety reference.
 
-### 7.1 D3-A.1 dual-variant control ready
+### 7.1 Completed D3-A.1 dual-variant control
 
 D3-A.1 implements the representation/output correction directly:
 
@@ -404,7 +404,7 @@ Engineering validation on 2026-07-14:
   `72.38%` of variants, which is why the formal control uses a `0.05` margin.
 
 These smoke numbers verify data flow and diagnostics only. They are not model
-quality evidence. The next experiment is the scene-complete 10k control:
+quality evidence. The scene-complete 10k control was launched with:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1,2,3,4 MASTER_PORT=28843 \
@@ -413,9 +413,60 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4 MASTER_PORT=28843 \
   5
 ```
 
-After its full validation, compare against D3-A, D2 full, D2.1, and the exact
-candidate-off result. Do not launch the 43,981-frame schedule unless D3-A.1
-recovers D2.1's L2 advantage without regressing D2 full's collision reference.
+The run completed `2048/2048` five-GPU iterations and automatic full
+validation. A second formal full eval reproduced the result and retained the
+4676-frame set payload at:
+
+```text
+projects/work_dirs/stage2_e2e_lidar/eval/
+  base_e2e_lidar_plan_mapfuse_v7_d3a1_dual_variant_guard_eval/results.pkl
+```
+
+D3-A.1 reaches `avg.L2=0.54281`: `0.01259 m` better than D3-A and only
+`0.00262 m` behind D2.1. It improves D3-A by `0.02149 m` on MovingStraight,
+`0.01649 m` on Turning, and `0.01603 m` on FrontObstacle. The representation
+hypothesis is therefore confirmed. Refined variants account for `35.41%` of
+frames, raw variants `6.24%`, and exact fallback `58.34%`; actor features are
+active on `92.94%` of frames.
+
+The strict safety gate still fails. D3-A.1 has `129` valid-horizon collision
+events (`0.9955%`) versus exact fallback's `125` (`0.9637%`) and D2 full's
+`0.9563%`. Relative to fallback it adds four events and removes none.
+
+The saved result was replayed offline with
+`tools/analysis_tools/analyze_d3a1_guard_sweep.py`. Replay at the configured
+`0.05` margin matches all online selected positions and trajectories exactly:
+
+```bash
+python tools/analysis_tools/analyze_d3a1_guard_sweep.py \
+  projects/work_dirs/stage2_e2e_lidar/eval/base_e2e_lidar_plan_mapfuse_v7_d3a1_dual_variant_guard_eval/results.pkl \
+  --output-json projects/work_dirs/stage2_e2e_lidar/eval/base_e2e_lidar_plan_mapfuse_v7_d3a1_dual_variant_guard_eval/guard_sweep.json
+```
+
+| relative guard | avg.L2 | collision | events | map rate | guarded variants |
+|---|---:|---:|---:|---:|---:|
+| no guard | 0.54276 | 0.9955% | 129 | 41.79% | 0% |
+| 0.05 | 0.54281 | 0.9955% | 129 | 41.77% | 1.23% |
+| 0.01 | 0.54329 | 0.9875% | 128 | 41.31% | 3.52% |
+| 0.00 | 0.57342 | 0.9875% | 128 | 13.28% | 79.42% |
+| fallback only | 0.59011 | 0.9637% | 125 | 0% | 0% |
+
+This is not a threshold-tuning problem. Even zero relative margin suppresses
+most map variants but misses three of the four false-safe collision events.
+Do not run the 43,981-frame D3-A.1 schedule.
+
+The next control is D3-A.2, trained from D3-A.1 medium:
+
+1. Pass the already generated `gt_segmentation` into planning loss and build
+   collision targets with the same `0.8 m` raster, future-frame indexing, ego
+   footprint, and vehicle filtering used by validation.
+2. Add an explicit candidate-versus-fallback pairwise safety loss, especially
+   for `candidate collision=1, fallback collision=0`; independent candidate
+   BCE does not train the relation required by the guard.
+3. Keep the dual raw/refined set, exact fallback, and frozen upstream modules.
+4. Repeat a scene-complete 10k control and require at most the D2 full
+   collision rate while retaining D3-A.1's L2 gain before considering full
+   data.
 
 D3 addresses two measured D2 limitations:
 
