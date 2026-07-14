@@ -34,11 +34,13 @@ improves global L2 further to `0.54019` and fixes the Turning regression, but
 collision rises to `1.003%`. Candidate-off exactly reproduces C2.3, proving the
 accuracy gain is causal map value rather than fallback drift.
 
-Do not run D2.1 full as-is. **D3-A is now implemented**: it uses D2.1 for a
-Top-16 shortlist, appends the exact fallback, adds explicit online-agent safety
-features, and trains a set-aware collision-aware reranker. The next experiment
-is the scene-complete 10k D3-A medium run. Occupancy features remain D3-B work,
-not part of the current implementation.
+Do not run D2.1 full as-is. The completed 10k **D3-A** control reaches
+`avg.L2=0.55540` and `avg.Collision=0.972%`. Candidate-off is exactly C2.3 at
+`0.59011 / 0.9637%`, so D3-A contributes a causal `0.03471 m` map gain and
+recovers most of D2.1's safety regression. It is not promoted: collision is
+still slightly above the strict D2 full reference and Turning regresses by
+`0.01356 m` versus D2 full. Do not start D3-A full unchanged. The next step is
+a small D3-A.1 control that makes raw/refined candidate use safety-consistent.
 
 ## 2. Evaluation contract
 
@@ -121,6 +123,7 @@ Important invariants:
 | **D2 10,238-frame medium** | **`0.57274`** | **`0.9637%`** | **promoted** |
 | D2 43,981-frame full | **`0.56905`** | **`0.9563%`** | safety best; Turning gate fails |
 | D2.1 10,238-frame joint representation | **`0.54019`** | `1.003%` | accuracy best; collision gate fails |
+| D3-A 10,238-frame set reranker | **`0.55540`** | `0.9720%` | causal gain; safety/Turning gate fails |
 
 ### 4.2 D2 medium buckets
 
@@ -335,9 +338,43 @@ Completed engineering gates on 2026-07-13:
 - smoke `avg.L2=0.7607`, collision `0%`; this is only an interface check after
   30 updates and is not model-quality evidence.
 
-The next command is the one-epoch 10k medium run. Promotion is decided only
-after full-validation evaluation of its checkpoint against D2 full, D2.1,
-fallback-only, and candidate-off controls.
+The one-epoch 10k medium run and full-validation candidate-off control are now
+complete:
+
+| split | C2.3 candidate-off | D2 full | D2.1 | D3-A |
+|---|---:|---:|---:|---:|
+| Global | 0.59011 | 0.56905 | **0.54019** | 0.55540 |
+| Static | 0.28027 | 0.26848 | 0.19888 | **0.19736** |
+| Slow | 0.48378 | **0.46428** | 0.46687 | 0.46873 |
+| MovingStraight | 0.70230 | 0.67588 | **0.64487** | 0.66925 |
+| Turning | **0.87816** | 0.89471 | 0.87864 | 0.90827 |
+| FrontClear | 0.60060 | 0.59772 | **0.56650** | 0.57485 |
+| FrontObstacle | 0.58542 | 0.55674 | **0.52894** | 0.54697 |
+| Collision | 0.9637% | **0.9563%** | 1.0032% | 0.9720% |
+
+D3-A selects a map candidate on `34.86%` of 4,676 validation frames. Online
+actor safety features are active on `92.86%` of frames. Relative to its exact
+fallback it improves every L2 bucket except Turning, including Static by
+`0.08291 m` and FrontObstacle by `0.03845 m`. Relative to D2 full it improves
+global L2 by `0.01365 m`, but misses the promotion gates by roughly `0.016`
+collision percentage points and `0.01356 m` on Turning.
+
+Diagnosis: D3-A shortlists and inherits base horizon costs from D2.1's refined
+candidates but deliberately emits raw candidates to avoid the measured
+residual collision regression. That representation/output mismatch is now the
+highest-priority hypothesis for the Turning and dynamic-bucket accuracy loss.
+Collision positives are also sparse, so a soft collision-cost term alone did
+not guarantee the strict safety reference.
+
+Next D3-A.1 control:
+
+1. Put both raw and refined variants of each Top-K path into the set, or predict
+   a safety-gated residual-use decision per candidate.
+2. Recompute the base cost for the actual emitted variant instead of reusing a
+   refined-candidate cost for a raw trajectory.
+3. Add a constrained unsafe mask or fallback guard on top of calibrated
+   collision probability; keep fallback exact and always admissible.
+4. Repeat the 10k control before any 43,981-frame run.
 
 D3 addresses two measured D2 limitations:
 
