@@ -227,7 +227,9 @@ def _compact_planning_for_eval(planning):
             'multimodal_audit_selection_probabilities': torch.float32,
             'multimodal_audit_predicted_horizon_costs': torch.float32,
             'multimodal_set_indices': torch.long,
+            'multimodal_set_variant': torch.long,
             'multimodal_set_valid': torch.bool,
+            'multimodal_set_candidates': torch.float32,
             'multimodal_set_raw_candidates': torch.float32,
             'multimodal_set_refined_candidates': torch.float32,
             'multimodal_set_safety_features': torch.float32,
@@ -238,6 +240,7 @@ def _compact_planning_for_eval(planning):
             'multimodal_set_selection_cost': torch.float32,
             'multimodal_set_selection_probabilities': torch.float32,
             'multimodal_set_selected_position': torch.long,
+            'multimodal_set_guarded': torch.bool,
         }
         for key, dtype in selector_field_dtypes.items():
             if key in result_planning:

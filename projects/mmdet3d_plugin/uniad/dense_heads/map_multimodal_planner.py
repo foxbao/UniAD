@@ -47,6 +47,7 @@ class MapMultimodalPlanner(nn.Module):
                  set_ffn_dims=512,
                  set_dropout=0.1,
                  set_use_raw_candidates=True,
+                 set_candidate_variant_mode='single',
                  set_cost_delta_scale=2.0,
                  set_collision_cost_weight=2.0,
                  set_cost_loss_weight=1.0,
@@ -58,6 +59,9 @@ class MapMultimodalPlanner(nn.Module):
                  set_clearance_temperature=1.0,
                  set_ego_width=3.0,
                  set_ego_length=14.6,
+                 set_use_fallback_guard=False,
+                 set_fallback_guard_margin=0.0,
+                 set_fallback_guard_penalty=1000.0,
                  audit_topk=0,
                  ablate_map=False):
         super().__init__()
@@ -106,6 +110,11 @@ class MapMultimodalPlanner(nn.Module):
         self.use_set_reranker = bool(use_set_reranker)
         self.set_topk = int(set_topk)
         self.set_use_raw_candidates = bool(set_use_raw_candidates)
+        if set_candidate_variant_mode not in ('single', 'raw_refined'):
+            raise ValueError(
+                'set_candidate_variant_mode must be single/raw_refined, got '
+                f'{set_candidate_variant_mode}')
+        self.set_candidate_variant_mode = set_candidate_variant_mode
         self.set_cost_delta_scale = float(set_cost_delta_scale)
         self.set_collision_cost_weight = float(set_collision_cost_weight)
         self.set_cost_loss_weight = float(set_cost_loss_weight)
@@ -120,6 +129,10 @@ class MapMultimodalPlanner(nn.Module):
             set_clearance_temperature)
         self.set_ego_width = float(set_ego_width)
         self.set_ego_length = float(set_ego_length)
+        self.set_use_fallback_guard = bool(set_use_fallback_guard)
+        self.set_fallback_guard_margin = float(set_fallback_guard_margin)
+        self.set_fallback_guard_penalty = float(
+            set_fallback_guard_penalty)
         self.audit_topk = int(audit_topk)
         self.ablate_map = bool(ablate_map)
         assert self.coordinate_scale > 0.0
@@ -150,6 +163,8 @@ class MapMultimodalPlanner(nn.Module):
         assert self.set_clearance_temperature > 0.0
         assert self.set_ego_width > 0.0
         assert self.set_ego_length > 0.0
+        assert self.set_fallback_guard_margin >= 0.0
+        assert self.set_fallback_guard_penalty >= 0.0
         assert self.audit_topk >= 0
         if self.use_set_reranker and not self.use_candidate_cost:
             raise ValueError('use_set_reranker requires use_candidate_cost.')
@@ -184,6 +199,7 @@ class MapMultimodalPlanner(nn.Module):
         self.set_norm = None
         self.set_cost_delta_head = None
         self.set_collision_head = None
+        self.set_variant_embed = None
         if self.use_utility_gate:
             self.utility_gate_head = nn.Sequential(
                 nn.Linear(embed_dims * 3, embed_dims),
@@ -230,6 +246,9 @@ class MapMultimodalPlanner(nn.Module):
             self.set_norm = nn.LayerNorm(embed_dims)
             self.set_cost_delta_head = nn.Linear(embed_dims, horizon_dims)
             self.set_collision_head = nn.Linear(embed_dims, horizon_dims)
+            if self.set_candidate_variant_mode == 'raw_refined':
+                self.set_variant_embed = nn.Embedding(3, embed_dims)
+                nn.init.zeros_(self.set_variant_embed.weight)
             nn.init.zeros_(self.set_cost_delta_head.weight)
             nn.init.zeros_(self.set_cost_delta_head.bias)
             nn.init.zeros_(self.set_collision_head.weight)
@@ -450,7 +469,8 @@ class MapMultimodalPlanner(nn.Module):
         return torch.cat(horizon_features + aggregate, dim=-1)
 
     def _set_rerank(self, feature, raw_candidates, refined_candidates, valid,
-                    predicted_horizon_costs, outs_motion):
+                    predicted_horizon_costs, raw_predicted_horizon_costs,
+                    outs_motion):
         batch_size, num_candidates = valid.shape
         fallback_index = num_candidates - 1
         map_count = max(0, fallback_index)
@@ -466,19 +486,84 @@ class MapMultimodalPlanner(nn.Module):
         fallback_indices = torch.full(
             (batch_size, 1), fallback_index,
             device=valid.device, dtype=torch.long)
-        set_indices = torch.cat([map_indices, fallback_indices], dim=-1)
-        set_valid = self._gather_candidates(valid, set_indices)
-        set_raw = self._gather_candidates(raw_candidates, set_indices)
-        set_refined = self._gather_candidates(
-            refined_candidates, set_indices)
-        set_base_costs = self._gather_candidates(
-            predicted_horizon_costs, set_indices)
-        set_feature = self._gather_candidates(feature, set_indices)
-        set_candidates = set_raw if self.set_use_raw_candidates else set_refined
+        if self.set_candidate_variant_mode == 'raw_refined':
+            if raw_predicted_horizon_costs is None:
+                raise RuntimeError(
+                    'raw_refined set requires raw candidate costs.')
+            top_raw = self._gather_candidates(raw_candidates, map_indices)
+            top_refined = self._gather_candidates(
+                refined_candidates, map_indices)
+            top_valid = self._gather_candidates(valid, map_indices)
+            top_feature = self._gather_candidates(feature, map_indices)
+            top_raw_costs = self._gather_candidates(
+                raw_predicted_horizon_costs, map_indices)
+            top_refined_costs = self._gather_candidates(
+                predicted_horizon_costs, map_indices)
+
+            set_indices = torch.cat([
+                torch.stack([map_indices, map_indices], dim=2).flatten(1, 2),
+                fallback_indices,
+            ], dim=1)
+            set_valid = torch.cat([
+                torch.stack([top_valid, top_valid], dim=2).flatten(1, 2),
+                valid[:, -1:],
+            ], dim=1)
+            set_raw = torch.cat([
+                torch.stack([top_raw, top_raw], dim=2).flatten(1, 2),
+                raw_candidates[:, -1:],
+            ], dim=1)
+            set_refined = torch.cat([
+                torch.stack(
+                    [top_refined, top_refined], dim=2).flatten(1, 2),
+                refined_candidates[:, -1:],
+            ], dim=1)
+            set_candidates = torch.cat([
+                torch.stack([top_raw, top_refined], dim=2).flatten(1, 2),
+                raw_candidates[:, -1:],
+            ], dim=1)
+            set_base_costs = torch.cat([
+                torch.stack(
+                    [top_raw_costs, top_refined_costs], dim=2
+                ).flatten(1, 2),
+                predicted_horizon_costs[:, -1:],
+            ], dim=1)
+            set_feature = torch.cat([
+                torch.stack(
+                    [top_feature, top_feature], dim=2).flatten(1, 2),
+                feature[:, -1:],
+            ], dim=1)
+            map_variants = torch.tensor(
+                [0, 1], device=valid.device, dtype=torch.long
+            ).view(1, 1, 2).expand(batch_size, topk, 2).flatten(1, 2)
+            set_variant = torch.cat([
+                map_variants,
+                torch.full(
+                    (batch_size, 1), 2, device=valid.device,
+                    dtype=torch.long),
+            ], dim=1)
+        else:
+            set_indices = torch.cat([map_indices, fallback_indices], dim=-1)
+            set_valid = self._gather_candidates(valid, set_indices)
+            set_raw = self._gather_candidates(raw_candidates, set_indices)
+            set_refined = self._gather_candidates(
+                refined_candidates, set_indices)
+            set_base_costs = self._gather_candidates(
+                predicted_horizon_costs, set_indices)
+            set_feature = self._gather_candidates(feature, set_indices)
+            if self.set_use_raw_candidates:
+                set_candidates = set_raw
+                map_variant_id = 0
+            else:
+                set_candidates = set_refined
+                map_variant_id = 1
+            set_variant = torch.full_like(set_indices, map_variant_id)
+            set_variant[:, -1] = 2
         safety_features = self._safety_features(set_candidates, outs_motion)
 
         encoded = set_feature + self.set_cost_encoder(set_base_costs) \
             + self.set_safety_encoder(safety_features)
+        if self.set_variant_embed is not None:
+            encoded = encoded + self.set_variant_embed(set_variant)
         encoded = self.set_encoder(
             encoded, src_key_padding_mask=~set_valid)
         encoded = self.set_norm(encoded)
@@ -491,6 +576,16 @@ class MapMultimodalPlanner(nn.Module):
         set_mean_cost = set_horizon_costs.mean(dim=-1)
         selection_cost = set_mean_cost.masked_fill(~set_valid, 1e4)
         selection_cost = selection_cost.clone()
+        guarded = torch.zeros_like(set_valid)
+        if self.set_use_fallback_guard and selection_cost.size(1) > 1:
+            collision_risk = collision_probability.max(dim=-1).values
+            fallback_risk = collision_risk[:, -1:]
+            guarded = set_valid & (
+                collision_risk
+                > fallback_risk + self.set_fallback_guard_margin)
+            guarded[:, -1] = False
+            selection_cost = selection_cost + guarded.to(selection_cost) \
+                * self.set_fallback_guard_penalty
         selection_cost[:, -1] -= self.candidate_cost_fallback_tiebreak
         set_probabilities = torch.softmax(
             -selection_cost / self.candidate_cost_temperature, dim=-1)
@@ -503,11 +598,13 @@ class MapMultimodalPlanner(nn.Module):
         fallback_predicted_cost = set_mean_cost[:, -1]
         probabilities = set_probabilities.new_zeros(
             (batch_size, num_candidates))
-        probabilities.scatter_(1, set_indices, set_probabilities)
+        probabilities.scatter_add_(1, set_indices, set_probabilities)
 
         payload = dict(
             multimodal_set_indices=set_indices,
+            multimodal_set_variant=set_variant,
             multimodal_set_valid=set_valid,
+            multimodal_set_candidates=set_candidates,
             multimodal_set_raw_candidates=set_raw,
             multimodal_set_refined_candidates=set_refined,
             multimodal_set_safety_features=safety_features,
@@ -518,6 +615,7 @@ class MapMultimodalPlanner(nn.Module):
             multimodal_set_selection_cost=selection_cost,
             multimodal_set_selection_probabilities=set_probabilities,
             multimodal_set_selected_position=selected_position,
+            multimodal_set_guarded=guarded,
         )
         return (selected, selected_index, probabilities,
                 selected_predicted_cost, fallback_predicted_cost, payload)
@@ -608,6 +706,7 @@ class MapMultimodalPlanner(nn.Module):
         map_selected_index = None
         selected_map = None
         predicted_horizon_costs = None
+        raw_predicted_horizon_costs = None
         selected_predicted_cost = None
         fallback_predicted_cost = None
         set_payload = {}
@@ -621,6 +720,14 @@ class MapMultimodalPlanner(nn.Module):
             ], dim=-1)
             predicted_horizon_costs = F.softplus(
                 self.candidate_cost_head(cost_input))
+            if self.set_candidate_variant_mode == 'raw_refined':
+                raw_cost_input = torch.cat([
+                    feature,
+                    (raw_candidates / self.coordinate_scale).reshape(
+                        batch_size, num_candidates, -1),
+                ], dim=-1)
+                raw_predicted_horizon_costs = F.softplus(
+                    self.candidate_cost_head(raw_cost_input))
             predicted_mean_cost = predicted_horizon_costs.mean(dim=-1)
             selection_cost = predicted_mean_cost.masked_fill(~valid, 1e4)
             selection_cost = selection_cost.clone()
@@ -711,7 +818,8 @@ class MapMultimodalPlanner(nn.Module):
              selected_predicted_cost, fallback_predicted_cost,
              set_payload) = self._set_rerank(
                  feature, raw_candidates, refined_candidates, valid,
-                 predicted_horizon_costs, outs_motion)
+                 predicted_horizon_costs, raw_predicted_horizon_costs,
+                 outs_motion)
         audit_payload = self._build_audit_payload(
             raw_candidates, refined_candidates, valid, logits, probabilities,
             predicted_horizon_costs, fallback_index)
@@ -856,11 +964,16 @@ class MapMultimodalPlanner(nn.Module):
             multimodal_set_regret=zero.detach(),
             multimodal_set_near_oracle=zero.detach(),
             multimodal_set_fallback_rate=zero.detach(),
+            multimodal_set_guarded_rate=zero.detach(),
+            multimodal_set_selected_raw_rate=zero.detach(),
+            multimodal_set_selected_refined_rate=zero.detach(),
         )
         if not self.use_set_reranker:
             return stats
 
-        set_raw = outputs['multimodal_set_raw_candidates']
+        set_raw = outputs.get(
+            'multimodal_set_candidates',
+            outputs['multimodal_set_raw_candidates'])
         set_valid = outputs['multimodal_set_valid']
         predicted_costs = outputs['multimodal_set_predicted_horizon_costs']
         collision_logits = outputs['multimodal_set_collision_logits']
@@ -965,6 +1078,24 @@ class MapMultimodalPlanner(nn.Module):
         stats['multimodal_set_fallback_rate'] = (
             selected_position[sample_valid] == set_valid.size(1) - 1
         ).to(set_raw).mean().detach()
+        guarded = outputs.get('multimodal_set_guarded')
+        if guarded is not None and guarded.numel() > 0:
+            guarded = guarded[:batch_size]
+            guard_valid = set_valid.clone()
+            guard_valid[:, -1] = False
+            if guard_valid.any():
+                stats['multimodal_set_guarded_rate'] = guarded[
+                    guard_valid].to(set_raw).mean().detach()
+        set_variant = outputs.get('multimodal_set_variant')
+        if set_variant is not None:
+            selected_variant = set_variant[:batch_size][
+                batch_index, selected_position]
+            stats['multimodal_set_selected_raw_rate'] = (
+                selected_variant[sample_valid] == 0
+            ).to(set_raw).mean().detach()
+            stats['multimodal_set_selected_refined_rate'] = (
+                selected_variant[sample_valid] == 1
+            ).to(set_raw).mean().detach()
         if collision_valid.any():
             stats['multimodal_set_collision_target_rate'] = \
                 collision_target[collision_valid].mean().detach()

@@ -130,6 +130,47 @@ class MapMultimodalPlannerSetRerankerTest(unittest.TestCase):
             self.assertIn(key, losses)
             self.assertTrue(torch.isfinite(losses[key]))
 
+    def test_dual_raw_refined_variants_keep_exact_fallback(self):
+        planner = MapMultimodalPlanner(
+            embed_dims=8, planning_steps=6, num_heads=2, dropout=0.0,
+            use_candidate_cost=True,
+            use_set_reranker=True,
+            set_topk=2,
+            set_num_layers=1,
+            set_num_heads=2,
+            set_ffn_dims=16,
+            set_dropout=0.0,
+            set_candidate_variant_mode='raw_refined',
+            set_use_fallback_guard=True)
+        with torch.no_grad():
+            planner.residual_head[-1].bias.fill_(0.2)
+
+        plan_query = torch.zeros(1, 1, 8)
+        fallback = torch.zeros(1, 6, 2)
+        outs_map = dict(
+            planning_candidates=torch.randn(1, 3, 6, 2),
+            planning_candidate_valid=torch.tensor([[True, True, False]]),
+        )
+        planner.eval()
+        output = planner(plan_query, fallback, outs_map)
+
+        self.assertEqual(tuple(output['multimodal_set_indices'].shape), (1, 5))
+        self.assertTrue(torch.equal(
+            output['multimodal_set_variant'][0],
+            torch.tensor([0, 1, 0, 1, 2])))
+        self.assertTrue(torch.equal(
+            output['multimodal_set_indices'][0, 0::2][:-1],
+            output['multimodal_set_indices'][0, 1::2]))
+        self.assertFalse(torch.equal(
+            output['multimodal_set_candidates'][0, 0],
+            output['multimodal_set_candidates'][0, 1]))
+        self.assertFalse(output['multimodal_set_guarded'][0, -1])
+        self.assertTrue(torch.equal(
+            output['multimodal_selected_traj'], fallback))
+        self.assertAlmostEqual(
+            output['multimodal_selection_probabilities'].sum().item(),
+            1.0, places=5)
+
 
 if __name__ == '__main__':
     unittest.main()

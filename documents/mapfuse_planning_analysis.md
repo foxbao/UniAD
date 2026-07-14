@@ -366,15 +366,56 @@ highest-priority hypothesis for the Turning and dynamic-bucket accuracy loss.
 Collision positives are also sparse, so a soft collision-cost term alone did
 not guarantee the strict safety reference.
 
-Next D3-A.1 control:
+### 7.1 D3-A.1 dual-variant control ready
 
-1. Put both raw and refined variants of each Top-K path into the set, or predict
-   a safety-gated residual-use decision per candidate.
-2. Recompute the base cost for the actual emitted variant instead of reusing a
-   refined-candidate cost for a raw trajectory.
-3. Add a constrained unsafe mask or fallback guard on top of calibrated
-   collision probability; keep fallback exact and always admissible.
-4. Repeat the 10k control before any 43,981-frame run.
+D3-A.1 implements the representation/output correction directly:
+
+1. Each of the Top-16 paths contributes an interleaved raw and refined
+   trajectory, followed by the exact fallback: `16 * 2 + 1 = 33` set members.
+2. The shared D2.1 horizon-cost head is evaluated again on each raw trajectory;
+   the reranker therefore receives the cost of the trajectory it can emit.
+3. A learned raw/refined/fallback variant embedding lets the set encoder model
+   systematic residual-refinement effects.
+4. A relative safety guard rejects a variant only when its predicted maximum
+   collision probability exceeds fallback by at least `0.05`. Fallback is
+   never guarded and remains byte-exact.
+5. Collision-positive weight rises from `20` to `100` for the sparse online
+   actor collision labels. Only the D3 set modules and new variant embedding
+   train; the rest of UniAD remains frozen.
+
+Implementation/configs:
+
+- `projects/configs/stage2_e2e_lidar/base_e2e_lidar_plan_mapfuse_v7_d3a1_dual_variant_guard_train.py`;
+- `projects/configs/stage2_e2e_lidar/base_e2e_lidar_plan_mapfuse_v7_d3a1_dual_variant_guard_medium_train.py`;
+- `projects/configs/stage2_e2e_lidar/eval/base_e2e_lidar_plan_mapfuse_v7_d3a1_dual_variant_guard_eval.py`;
+- `projects/configs/stage2_e2e_lidar/eval/base_e2e_lidar_plan_mapfuse_v7_d3a1_candidateoff_eval.py`.
+
+Engineering validation on 2026-07-14:
+
+- D3-A medium checkpoint load has only the expected new
+  `set_variant_embed.weight` missing key and no unexpected keys;
+- five focused planner tests pass;
+- a five-GPU 30-iteration smoke completes with finite losses and gradients at
+  about `727 MiB/GPU` reported model memory;
+- a 93-frame five-GPU inference completes with set size `33`, actor signal on
+  `98.9%` of frames, and raw/refined/fallback selection
+  `7.53%/0%/92.47%`;
+- the guard rate is `0%` in this tiny run. A zero-margin prototype guarded
+  `72.38%` of variants, which is why the formal control uses a `0.05` margin.
+
+These smoke numbers verify data flow and diagnostics only. They are not model
+quality evidence. The next experiment is the scene-complete 10k control:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3,4 MASTER_PORT=28843 \
+  ./tools/uniad_dist_train.sh \
+  projects/configs/stage2_e2e_lidar/base_e2e_lidar_plan_mapfuse_v7_d3a1_dual_variant_guard_medium_train.py \
+  5
+```
+
+After its full validation, compare against D3-A, D2 full, D2.1, and the exact
+candidate-off result. Do not launch the 43,981-frame schedule unless D3-A.1
+recovers D2.1's L2 advantage without regressing D2 full's collision reference.
 
 D3 addresses two measured D2 limitations:
 

@@ -1527,7 +1527,8 @@ class KlDataset(Custom3DDataset):
         set_reranker_stats = dict(
             n=0, set_size_sum=0.0, actor_signal=0,
             selected_collision_probability_sum=0.0,
-            selected_cost_sum=0.0)
+            selected_cost_sum=0.0, raw_selected=0, refined_selected=0,
+            fallback_selected=0, guarded_sum=0.0, guard_valid_sum=0.0)
         per_bucket_multimodal = {
             name: dict(n=0, map_selected=0, candidate_sum=0.0)
             for name in bucket_names
@@ -1627,6 +1628,26 @@ class KlDataset(Custom3DDataset):
             agg['selected_collision_probability_sum'] += float(
                 (1.0 / (1.0 + np.exp(-collision_logits[selected]))).mean())
             agg['selected_cost_sum'] += float(selection_cost[selected])
+            variants = blob.get('multimodal_set_variant')
+            if variants is not None:
+                variants = np.asarray(
+                    self._planning_to_numpy(variants)).reshape(-1)
+                if selected < len(variants):
+                    selected_variant = int(variants[selected])
+                    agg['raw_selected'] += int(selected_variant == 0)
+                    agg['refined_selected'] += int(selected_variant == 1)
+                    agg['fallback_selected'] += int(selected_variant == 2)
+            guarded = blob.get('multimodal_set_guarded')
+            if guarded is not None:
+                guarded = np.asarray(
+                    self._planning_to_numpy(guarded)).reshape(-1).astype(bool)
+                guard_valid = valid.astype(bool)
+                if variants is not None and len(variants) == len(guard_valid):
+                    guard_valid &= variants != 2
+                elif len(guard_valid) > 0:
+                    guard_valid[-1] = False
+                agg['guarded_sum'] += float(guarded[guard_valid].sum())
+                agg['guard_valid_sum'] += float(guard_valid.sum())
             distance_columns = [
                 index for index in (0, 1, 3, 4, 6, 7, 9, 10)
                 if index < safety.shape[-1]
@@ -2007,6 +2028,12 @@ class KlDataset(Custom3DDataset):
             collision_probability = (
                 set_reranker_stats['selected_collision_probability_sum'] / n)
             selected_cost = set_reranker_stats['selected_cost_sum'] / n
+            raw_rate = set_reranker_stats['raw_selected'] / n
+            refined_rate = set_reranker_stats['refined_selected'] / n
+            fallback_rate = set_reranker_stats['fallback_selected'] / n
+            guard_rate = (
+                set_reranker_stats['guarded_sum']
+                / max(set_reranker_stats['guard_valid_sum'], 1.0))
             ret_dict['planning/set_reranker/set_size'] = set_size
             ret_dict['planning/set_reranker/actor_signal_rate'] = \
                 actor_signal_rate
@@ -2014,6 +2041,12 @@ class KlDataset(Custom3DDataset):
                 'planning/set_reranker/selected_collision_probability'] = \
                 collision_probability
             ret_dict['planning/set_reranker/selected_cost'] = selected_cost
+            ret_dict['planning/set_reranker/raw_selection_rate'] = raw_rate
+            ret_dict['planning/set_reranker/refined_selection_rate'] = \
+                refined_rate
+            ret_dict['planning/set_reranker/fallback_selection_rate'] = \
+                fallback_rate
+            ret_dict['planning/set_reranker/guarded_rate'] = guard_rate
             lines.extend([
                 '',
                 'D3-A set-reranker diagnostics:',
@@ -2021,6 +2054,10 @@ class KlDataset(Custom3DDataset):
                 f'online actor signal {100.0 * actor_signal_rate:.1f}%  '
                 f'selected collision p {collision_probability:.3f}  '
                 f'selected cost {selected_cost:.3f}',
+                f'  selected raw/refined/fallback '
+                f'{100.0 * raw_rate:.1f}%/{100.0 * refined_rate:.1f}%/'
+                f'{100.0 * fallback_rate:.1f}%  '
+                f'guarded variants {100.0 * guard_rate:.1f}%',
             ])
 
         def emit_selector_metrics(prefix, agg, title):

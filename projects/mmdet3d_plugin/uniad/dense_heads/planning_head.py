@@ -992,7 +992,9 @@ class PlanningHeadSingleMode(nn.Module):
                         'multimodal_audit_selection_probabilities',
                         'multimodal_audit_predicted_horizon_costs',
                         'multimodal_set_indices',
+                        'multimodal_set_variant',
                         'multimodal_set_valid',
+                        'multimodal_set_candidates',
                         'multimodal_set_raw_candidates',
                         'multimodal_set_refined_candidates',
                         'multimodal_set_safety_features',
@@ -1002,7 +1004,8 @@ class PlanningHeadSingleMode(nn.Module):
                         'multimodal_set_predicted_horizon_costs',
                         'multimodal_set_selection_cost',
                         'multimodal_set_selection_probabilities',
-                        'multimodal_set_selected_position'):
+                        'multimodal_set_selected_position',
+                        'multimodal_set_guarded'):
                     if multimodal_outputs.get(key) is not None:
                         ret[key] = multimodal_outputs[key]
         return ret
