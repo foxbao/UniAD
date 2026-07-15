@@ -23,6 +23,12 @@ The current info files do not contain a control-mode field. Speed can only
 provide a review hint, not control-mode ground truth. Normal automatic driving
 can stop, and deliberate target collection can still be fast.
 
+Extracted origin-data context can now recover the true mode by aligning each
+kl_8 frame timestamp to `chassis.driving_mode.name`. The project convention is
+`COMPLETE_AUTO_DRIVE -> Auto` and both `COMPLETE_MANUAL` and
+`COMPLETE_MEDIAN -> Manual`. A scene containing both normalized modes remains
+`Mixed`; it is never assigned by majority vote.
+
 ## 2. Implemented audit
 
 Run from the `UniAD` directory:
@@ -63,6 +69,27 @@ python tools/analysis_tools/serve_planning_scene_review.py \
 Open `http://127.0.0.1:8765`. Each save atomically updates
 `scene_manifest.csv`; the default queue is the unreviewed validation split.
 
+Enrich the manifest incrementally as `PACKAGE_out` directories become
+available:
+
+```bash
+python tools/analysis_tools/enrich_planning_scene_review.py \
+  --infos \
+    train=data/kl_8/kl_infos_train_with_cam.pkl \
+    val=data/kl_8/kl_infos_val_with_cam.pkl \
+  --origin-root /path/to/origin_data \
+  --audit-dir \
+    projects/work_dirs/stage2_e2e_lidar/planning_scene_audit \
+  --data-root "$(pwd)" \
+  --contact-sheet-mode matched \
+  --camera-frames 3
+```
+
+This writes `scene_origin_context.csv`, updates the scene manifest, and creates
+six-camera start/middle/end evidence under `camera_contact_sheets/`. Camera
+paths come directly from `sync_info.cameras`; within each time period the tool
+chooses the frame with the most camera files actually present.
+
 ## 3. Current automatic triage
 
 The first full audit covers 649 scenes and 49,172 frames:
@@ -99,10 +126,11 @@ a behavior the deployed planner should imitate. A scene can be semantically
 normal yet remain unusable due to manual-control dynamics, bad localization,
 trajectory discontinuity, or invalid future labels.
 
-The missing information that needs human or source-system input is the true
-control mode and collection intent. If the original vehicle log contains a
-manual/automatic state, joining it by timestamp should replace the speed proxy
-before final split generation.
+The remaining human input is collection intent and planning usability. True
+control mode is populated automatically wherever extracted origin context is
+available; scenes without a matched `PACKAGE_out` remain `Unknown`. Mixed
+scenes retain their ordered mode segments and must be segmented or rejected
+for an Auto-only planning training split.
 
 ## 5. Generate reviewed planning splits
 

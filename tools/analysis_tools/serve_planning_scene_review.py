@@ -71,15 +71,26 @@ select, input { height: 34px; padding: 0 9px; }
 }
 .visual {
   min-width: 0;
-  display: grid;
-  place-items: center;
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
   padding: 18px;
   background: #e8eaec;
 }
-.visual img {
+.visual-tabs { display: flex; gap: 6px; margin-bottom: 8px; }
+.visual-tab {
+  height: 34px;
+  padding: 0 13px;
+  border: 1px solid #aeb5ba;
+  border-radius: 4px;
+  background: #fff;
+}
+.visual-tab.active { border-color: var(--accent); background: var(--accent); color: #fff; }
+.visual-content { flex: 1; min-height: 0; display: grid; place-items: center; }
+.visual-content img {
   display: block;
   width: 100%;
-  height: calc(100vh - 94px);
+  height: calc(100vh - 136px);
   object-fit: contain;
   background: #fff;
   border: 1px solid var(--line);
@@ -142,7 +153,7 @@ textarea { width: 100%; min-height: 72px; resize: vertical; padding: 8px; }
   .progress { width: 100%; margin-left: 0; }
   .workspace { grid-template-columns: 1fr; }
   .visual { padding: 8px; }
-  .visual img { height: auto; max-height: 65vh; }
+  .visual-content img { height: auto; max-height: 65vh; }
   .panel { border-left: 0; border-top: 1px solid var(--line); }
 }
 </style>
@@ -171,7 +182,13 @@ textarea { width: 100%; min-height: 72px; resize: vertical; padding: 8px; }
   <div class="progress" id="progress">Loading...</div>
 </header>
 <main class="workspace">
-  <section class="visual" id="visual"><div class="empty">Loading...</div></section>
+  <section class="visual">
+    <div class="visual-tabs">
+      <button class="visual-tab active" id="cameraTab">Camera</button>
+      <button class="visual-tab" id="trajectoryTab">Trajectory</button>
+    </div>
+    <div class="visual-content" id="visual"><div class="empty">Loading...</div></div>
+  </section>
   <aside class="panel">
     <div class="scene-head">
       <div class="scene-token" id="sceneToken">-</div>
@@ -180,7 +197,9 @@ textarea { width: 100%; min-height: 72px; resize: vertical; padding: 8px; }
     <div class="auto-summary">
       <div><span>Suggestion</span><br><strong id="autoValue">-</strong></div>
       <div><span>Confidence</span><br><strong id="confidence">-</strong></div>
-      <div><span>Mode proxy</span><br><strong id="proxy">-</strong></div>
+      <div><span>Parsed mode</span><br><strong id="parsedMode">-</strong></div>
+      <div><span>Speed proxy</span><br><strong id="proxy">-</strong></div>
+      <div class="reasons"><span>Mode sequence</span><br><strong id="modeSequence">-</strong></div>
       <div><span>Target</span><br><strong id="target">-</strong></div>
       <div class="reasons"><span>Signals</span><br><strong id="reasons">-</strong></div>
     </div>
@@ -217,7 +236,7 @@ textarea { width: 100%; min-height: 72px; resize: vertical; padding: 8px; }
 <script>
 const labels = ['NaturalRun', 'OperationalStop', 'DetectionProbe', 'Uncertain'];
 const modes = ['Auto', 'Manual', 'Mixed', 'Unknown'];
-const state = { scenes: [], index: 0, draft: {} };
+const state = { scenes: [], index: 0, draft: {}, visualMode: 'camera' };
 
 function el(id) { return document.getElementById(id); }
 function selectedScene() { return state.scenes[state.index] || null; }
@@ -257,17 +276,18 @@ function proxyMode(proxy) {
 }
 
 function loadDraft(scene) {
+  const parsedMode = modes.includes(scene.parsed_control_mode) && scene.parsed_control_mode !== 'Unknown'
+    ? scene.parsed_control_mode : '';
   state.draft = {
     human_label: scene.human_label || '',
-    human_control_mode: scene.human_control_mode || '',
+    human_control_mode: scene.human_control_mode || parsedMode,
     planning_usable: scene.planning_usable || '',
   };
   el('reviewer').value = scene.reviewer || localStorage.getItem('planningReviewer') || '';
   el('notes').value = scene.notes || '';
 }
 
-function render() {
-  const scene = selectedScene();
+function renderMedia(scene) {
   const visual = el('visual');
   visual.replaceChildren();
   if (!scene) {
@@ -275,14 +295,14 @@ function render() {
     empty.className = 'empty';
     empty.textContent = 'No scenes in this queue.';
     visual.appendChild(empty);
-    el('sceneToken').textContent = '-';
-    el('sceneIndex').textContent = '-';
-    el('save').disabled = true;
     return;
   }
-  if (scene.plot_path) {
+  let mediaPath = state.visualMode === 'camera'
+    ? scene.camera_contact_sheet : scene.plot_path;
+  if (!mediaPath && state.visualMode === 'camera') mediaPath = scene.plot_path;
+  if (mediaPath) {
     const image = document.createElement('img');
-    image.src = '/asset/' + scene.plot_path.split('/').map(encodeURIComponent).join('/');
+    image.src = '/asset/' + mediaPath.split('/').map(encodeURIComponent).join('/');
     image.alt = scene.scene_token;
     visual.appendChild(image);
   } else {
@@ -291,11 +311,26 @@ function render() {
     empty.textContent = 'No plot generated for this scene.';
     visual.appendChild(empty);
   }
+  el('cameraTab').classList.toggle('active', state.visualMode === 'camera');
+  el('trajectoryTab').classList.toggle('active', state.visualMode === 'trajectory');
+}
+
+function render() {
+  const scene = selectedScene();
+  renderMedia(scene);
+  if (!scene) {
+    el('sceneToken').textContent = '-';
+    el('sceneIndex').textContent = '-';
+    el('save').disabled = true;
+    return;
+  }
   el('sceneToken').textContent = scene.split + ' / ' + scene.scene_token;
   el('sceneIndex').textContent = `${state.index + 1} of ${state.scenes.length} - ${scene.frame_count} frames`;
   el('autoValue').textContent = scene.auto_label || '-';
   el('confidence').textContent = Number(scene.auto_confidence || 0).toFixed(2);
+  el('parsedMode').textContent = scene.parsed_control_mode || '-';
   el('proxy').textContent = scene.control_mode_proxy || '-';
+  el('modeSequence').textContent = scene.control_mode_sequence || '-';
   el('target').textContent = scene.dominant_target_class || 'none';
   el('reasons').textContent = (scene.reason_codes || 'none').replaceAll(';', '; ');
   el('savedStatus').value = scene.review_status || 'pending';
@@ -326,7 +361,8 @@ function useSuggestion() {
   const scene = selectedScene();
   if (!scene) return;
   state.draft.human_label = scene.auto_label || 'Uncertain';
-  state.draft.human_control_mode = proxyMode(scene.control_mode_proxy);
+  state.draft.human_control_mode = modes.includes(scene.parsed_control_mode)
+    ? scene.parsed_control_mode : proxyMode(scene.control_mode_proxy);
   state.draft.planning_usable = scene.auto_label === 'NaturalRun' ? '1' : '0';
   renderChoices();
 }
@@ -381,6 +417,8 @@ el('previous').addEventListener('click', () => { if (state.index > 0) { state.in
 el('next').addEventListener('click', () => { if (state.index + 1 < state.scenes.length) { state.index += 1; render(); } });
 el('suggest').addEventListener('click', useSuggestion);
 el('save').addEventListener('click', save);
+el('cameraTab').addEventListener('click', () => { state.visualMode = 'camera'; renderMedia(selectedScene()); });
+el('trajectoryTab').addEventListener('click', () => { state.visualMode = 'trajectory'; renderMedia(selectedScene()); });
 refresh().catch(error => {
   el('message').textContent = error.message;
   el('message').className = 'message error';

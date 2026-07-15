@@ -2,6 +2,7 @@ import csv
 import os
 import tempfile
 import unittest
+from types import SimpleNamespace
 
 from tools.analysis_tools.build_planning_manifest_splits import load_manifest
 from tools.analysis_tools.build_planning_scene_audit import (
@@ -9,6 +10,14 @@ from tools.analysis_tools.build_planning_scene_audit import (
     infer_control_mode_proxy,
 )
 from tools.analysis_tools.serve_planning_scene_review import ManifestStore
+from tools.analysis_tools.enrich_planning_scene_review import (
+    nearest_timestamped_file,
+    normalize_control_mode,
+    representative_camera_indices,
+    representative_indices,
+    run_length_encode,
+    summarize_origin_context,
+)
 
 
 class PlanningSceneAuditTest(unittest.TestCase):
@@ -30,6 +39,41 @@ class PlanningSceneAuditTest(unittest.TestCase):
             infer_control_mode_proxy(manual, 0.8)[0], 'LikelyManual')
         self.assertEqual(
             infer_control_mode_proxy(automatic, 0.8)[0], 'LikelyAuto')
+
+    def test_origin_control_mode_mapping(self):
+        self.assertEqual(
+            normalize_control_mode('COMPLETE_AUTO_DRIVE'), 'Auto')
+        self.assertEqual(
+            normalize_control_mode('COMPLETE_MANUAL'), 'Manual')
+        self.assertEqual(
+            normalize_control_mode('COMPLETE_MEDIAN'), 'Manual')
+        self.assertEqual(normalize_control_mode('OTHER'), 'Unknown')
+
+    def test_timestamp_matching_and_representative_indices(self):
+        files = [(1.0, 'a'), (2.0, 'b'), (3.0, 'c')]
+        path, delta = nearest_timestamped_file(files, 2.1)
+        self.assertEqual(path, 'b')
+        self.assertAlmostEqual(delta, 0.1)
+        self.assertEqual(representative_indices(10, 3), [0, 4, 9])
+        self.assertEqual(
+            run_length_encode(['Auto', 'Auto', 'Manual']),
+            'Auto:2|Manual:1')
+
+    def test_camera_evidence_prefers_existing_files_in_each_period(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        existing = os.path.join(directory.name, 'existing.jpg')
+        with open(existing, 'wb') as handle:
+            handle.write(b'image')
+        frames = [
+            dict(cameras={'CAM_FRONT': {'path': 'missing.jpg'}}),
+            dict(cameras={'CAM_FRONT': {'path': 'existing.jpg'}}),
+            dict(cameras={'CAM_FRONT': {'path': 'missing-2.jpg'}}),
+            dict(cameras={'CAM_FRONT': {'path': 'existing.jpg'}}),
+        ]
+        self.assertEqual(
+            representative_camera_indices(frames, 2, directory.name),
+            [1, 3])
 
     def test_uncertain_confidence_is_low_when_scores_are_close(self):
         row = dict(
@@ -61,7 +105,8 @@ class PlanningManifestSplitTest(unittest.TestCase):
         directory = tempfile.TemporaryDirectory()
         path = os.path.join(directory.name, 'manifest.csv')
         fieldnames = ('split', 'scene_token', 'auto_label', 'human_label',
-                      'control_mode_proxy', 'human_control_mode',
+                      'control_mode_proxy', 'parsed_control_mode',
+                      'human_control_mode',
                       'planning_usable')
         with open(path, 'w', newline='', encoding='utf-8') as handle:
             writer = csv.DictWriter(handle, fieldnames=fieldnames)
@@ -73,6 +118,7 @@ class PlanningManifestSplitTest(unittest.TestCase):
         directory, path = self.write_manifest([dict(
             split='val', scene_token='scene-1', auto_label='NaturalRun',
             human_label='NaturalRun', control_mode_proxy='LikelyAuto',
+            parsed_control_mode='',
             human_control_mode='Auto', planning_usable='')])
         self.addCleanup(directory.cleanup)
         with self.assertRaisesRegex(ValueError, 'planning_usable'):
@@ -82,6 +128,7 @@ class PlanningManifestSplitTest(unittest.TestCase):
         directory, path = self.write_manifest([dict(
             split='val', scene_token='scene-1', auto_label='NaturalRun',
             human_label='NaturalRun', control_mode_proxy='LikelyAuto',
+            parsed_control_mode='',
             human_control_mode='', planning_usable='1')])
         self.addCleanup(directory.cleanup)
         with self.assertRaisesRegex(ValueError, 'human_control_mode'):
@@ -91,11 +138,13 @@ class PlanningManifestSplitTest(unittest.TestCase):
         directory, path = self.write_manifest([
             dict(split='val', scene_token='natural',
                  auto_label='NaturalRun', human_label='',
-                 control_mode_proxy='LikelyAuto', human_control_mode='',
+                 control_mode_proxy='LikelyManual',
+                 parsed_control_mode='Auto', human_control_mode='',
                  planning_usable=''),
             dict(split='val', scene_token='probe',
                  auto_label='DetectionProbe', human_label='',
-                 control_mode_proxy='LikelyManual', human_control_mode='',
+                 control_mode_proxy='LikelyAuto',
+                 parsed_control_mode='Manual', human_control_mode='',
                  planning_usable=''),
         ])
         self.addCleanup(directory.cleanup)
@@ -162,6 +211,36 @@ class PlanningSceneReviewStoreTest(unittest.TestCase):
                 split='val', scene_token='scene-1',
                 human_label='NaturalRun', human_control_mode='LikelyAuto',
                 planning_usable='1'))
+
+
+class PlanningOriginContextTest(unittest.TestCase):
+
+    def test_median_and_manual_frames_aggregate_to_manual_scene(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        scene_dir = os.path.join(directory.name, 'package_out', 'scene')
+        chassis_dir = os.path.join(scene_dir, 'chassis')
+        os.makedirs(chassis_dir)
+        samples = (
+            ('10.01.json', 'COMPLETE_MEDIAN'),
+            ('11.01.json', 'COMPLETE_MANUAL'),
+        )
+        for name, mode in samples:
+            with open(os.path.join(chassis_dir, name), 'w',
+                      encoding='utf-8') as handle:
+                handle.write(
+                    '{"driving_mode":{"name":"' + mode + '"}}')
+        frames = [dict(timestamp=10.0), dict(timestamp=11.0)]
+        args = SimpleNamespace(max_chassis_dt=0.1, max_planning_dt=0.2)
+
+        context = summarize_origin_context(frames, scene_dir, args)
+
+        self.assertEqual(context['parsed_control_mode'], 'Manual')
+        self.assertEqual(context['control_mode_match_count'], 2)
+        self.assertEqual(context['origin_context_status'], 'ok')
+        self.assertIn('COMPLETE_MEDIAN:1', context['control_mode_values'])
+        self.assertEqual(context['control_mode_switch_count'], 0)
+        self.assertEqual(context['control_mode_sequence'], 'Manual:2')
 
 
 if __name__ == '__main__':

@@ -31,6 +31,15 @@ HUMAN_FIELDS = (
     'human_label', 'human_control_mode', 'planning_usable', 'review_status',
     'reviewer', 'notes',
 )
+ENRICHMENT_FIELDS = (
+    'parsed_control_mode', 'control_mode_values',
+    'control_mode_switch_count', 'control_mode_sequence',
+    'control_mode_match_count', 'control_mode_coverage',
+    'control_mode_max_dt_ms', 'control_mode_source',
+    'origin_context_status', 'planning_match_count', 'planning_max_dt_ms',
+    'planning_scenarios', 'planning_main_tasks', 'planning_stop_reasons',
+    'camera_contact_sheet', 'camera_evidence_frames',
+)
 MANIFEST_LABELS = ('NaturalRun', 'OperationalStop', 'DetectionProbe',
                    'Uncertain')
 CONTROL_MODES = ('Auto', 'Manual', 'Mixed', 'Unknown')
@@ -711,7 +720,7 @@ def main():
     existing = read_existing_manifest(manifest_path)
     for row in rows:
         previous = existing.get((row['split'], row['scene_token']), {})
-        for field in HUMAN_FIELDS:
+        for field in (*ENRICHMENT_FIELDS, *HUMAN_FIELDS):
             row[field] = previous.get(field, '')
 
     review_rows = sorted(rows, key=lambda row: (
@@ -748,7 +757,8 @@ def main():
         'auto_confidence', 'probe_score', 'natural_score', 'reason_codes',
         'control_mode_proxy', 'control_mode_proxy_score',
         'dominant_target_class', 'focus_target_orbit_deg',
-        'manual_review_required', 'plot_path', *HUMAN_FIELDS,
+        'manual_review_required', 'plot_path', *ENRICHMENT_FIELDS,
+        *HUMAN_FIELDS,
     ]
     write_csv(manifest_path, rows, manifest_fields)
     write_csv(osp.join(args.out_dir, 'review_queue.csv'), review_rows,

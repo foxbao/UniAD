@@ -88,8 +88,11 @@ def load_manifest(path, label_source, allow_unreviewed):
                 raise ValueError(f'Unknown label {label} for {key}')
             if label_source == 'auto':
                 usable = label in ('NaturalRun', 'OperationalStop')
-                control_mode = PROXY_TO_CONTROL_MODE.get(
-                    row.get('control_mode_proxy', '').strip(), 'Unknown')
+                parsed_mode = row.get('parsed_control_mode', '').strip()
+                control_mode = parsed_mode if parsed_mode in CONTROL_MODES \
+                    and parsed_mode != 'Unknown' else \
+                    PROXY_TO_CONTROL_MODE.get(
+                        row.get('control_mode_proxy', '').strip(), 'Unknown')
             else:
                 raw_usable = row.get('planning_usable', '').strip().lower()
                 if raw_usable in ('1', 'true', 'yes'):
