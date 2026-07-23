@@ -627,8 +627,17 @@ class RaycastDrivableBuilder:
             mask[fill_x[:, None], fill_y[:, None], z_idx[None, :]] = True
         return mask
 
-    def raycast_free_voxels(self, hit_voxels: np.ndarray) -> np.ndarray:
-        """Voxels traversed by rays from the origin to each hit voxel.
+    def raycast_free_voxels(self, hit_voxels: np.ndarray,
+                            ray_origin: Optional[np.ndarray] = None
+                            ) -> np.ndarray:
+        """Voxels traversed by rays from an origin to each hit voxel.
+
+        Args:
+            hit_voxels: Integer ``[N, 3]`` endpoint voxel indices.
+            ray_origin: Optional XYZ origin in the builder coordinate frame.
+                Existing callers omit it and retain the historical ego-origin
+                behaviour.  Multi-LiDAR occupancy labels pass each sensor's
+                calibrated origin before fusing the resulting free evidence.
 
         Vectorised replacement for the original per-hit Python loop (which
         called ``np.unique`` once per ray -- tens of thousands of calls per
@@ -655,10 +664,17 @@ class RaycastDrivableBuilder:
         if hit_voxels.shape[0] == 0:
             return np.empty((0, 3), dtype=np.int64)
 
+        if ray_origin is None:
+            ray_origin = self.ray_origin
+        ray_origin = np.asarray(ray_origin, dtype=np.float32)
+        if ray_origin.shape != (3, ):
+            raise ValueError(
+                f'ray_origin must have shape (3,), got {ray_origin.shape}')
+
         hit_centers = (
             self.pc_range[:3] +
             (hit_voxels.astype(np.float32) + 0.5) * self.voxel_size)
-        deltas = hit_centers - self.ray_origin[None, :]
+        deltas = hit_centers - ray_origin[None, :]
         max_grid_dist = np.max(np.abs(deltas / self.voxel_size[None, :]),
                                axis=1)
         num_steps = np.ceil(max_grid_dist).astype(np.int64)
@@ -686,7 +702,8 @@ class RaycastDrivableBuilder:
                                       side='right'))
             end = max(end, start + 1)
             uniq = self._raycast_chunk(
-                hit_voxels[start:end], deltas[start:end], num_steps[start:end])
+                hit_voxels[start:end], deltas[start:end],
+                num_steps[start:end], ray_origin)
             if uniq.shape[0] > 0:
                 chunk_unique.append(uniq)
             start = end
@@ -695,7 +712,7 @@ class RaycastDrivableBuilder:
             return np.empty((0, 3), dtype=np.int64)
         return np.unique(np.concatenate(chunk_unique, axis=0), axis=0)
 
-    def _raycast_chunk(self, hit_voxels, deltas, num_steps):
+    def _raycast_chunk(self, hit_voxels, deltas, num_steps, ray_origin):
         """Vectorised free-voxel sampling for one ray chunk (see caller)."""
         total = int(num_steps.sum())
         if total == 0:
@@ -704,7 +721,7 @@ class RaycastDrivableBuilder:
         ray_start = np.repeat(np.cumsum(num_steps) - num_steps, num_steps)
         step = np.arange(total, dtype=np.int64) - ray_start
         t = (step / num_steps[ray]).astype(np.float32)
-        samples = self.ray_origin[None, :] + t[:, None] * deltas[ray]
+        samples = ray_origin[None, :] + t[:, None] * deltas[ray]
         voxels = self.coord_to_index_floor(samples)
 
         in_range = np.all((voxels >= 0) & (voxels < self.occ_size), axis=1)
@@ -968,7 +985,20 @@ class RaycastDrivableBuilder:
         mask[rows[valid], cols[valid]] = 1
         return mask
 
-    def build(self, points: np.ndarray, boxes: np.ndarray) -> dict:
+    def build(self, points: np.ndarray, boxes: np.ndarray,
+              free_voxels: Optional[np.ndarray] = None,
+              ray_origin: Optional[np.ndarray] = None,
+              return_voxels: bool = False) -> dict:
+        """Build BEV ground/obstacle/free evidence.
+
+        ``free_voxels`` allows a caller to fuse free-space rays from several
+        calibrated LiDAR origins once, then reuse the existing ground and
+        obstacle classification without performing an incorrect second
+        raycast from the ego origin.  Both new arguments are optional, so the
+        established drivable-label pipeline remains byte-for-byte equivalent.
+        ``return_voxels`` exposes the filtered 3D evidence to offline label
+        generators without changing the default BEV-only return contract.
+        """
         pts = np.asarray(points[:, :3], dtype=np.float32)
         point_voxels = self.coord_to_index_floor(pts)
         valid = np.all((point_voxels >= 0) & (point_voxels < self.occ_size),
@@ -977,11 +1007,29 @@ class RaycastDrivableBuilder:
         point_voxels = point_voxels[valid]
         if point_voxels.shape[0] == 0:
             empty = np.zeros((self.bev_h, self.bev_w), dtype=np.uint8)
-            return dict(ground=empty, obstacle=empty, free=empty,
-                        blocked=empty)
+            result = dict(ground=empty, obstacle=empty, free=empty,
+                          blocked=empty)
+            if return_voxels:
+                empty_voxels = np.empty((0, 3), dtype=np.int64)
+                result.update(
+                    ground_voxels=empty_voxels,
+                    obstacle_voxels=empty_voxels,
+                    raw_obstacle_voxels=empty_voxels,
+                    semantic_voxels=empty_voxels,
+                    free_voxels=empty_voxels,
+                )
+            return result
 
         hit_voxels = np.unique(point_voxels, axis=0)
-        free_voxels = self.raycast_free_voxels(hit_voxels)
+        if free_voxels is None:
+            free_voxels = self.raycast_free_voxels(
+                hit_voxels, ray_origin=ray_origin)
+        else:
+            free_voxels = np.asarray(free_voxels, dtype=np.int64)
+            if free_voxels.ndim != 2 or free_voxels.shape[1] != 3:
+                raise ValueError(
+                    'free_voxels must have shape [N, 3], got '
+                    f'{free_voxels.shape}')
         box_mask = self.box_interior_mask(boxes)
         point_in_box = box_mask[
             point_voxels[:, 0], point_voxels[:, 1], point_voxels[:, 2]]
@@ -992,9 +1040,10 @@ class RaycastDrivableBuilder:
         scene_hit_voxels = hit_voxels[~hit_in_box]
         semantic_voxels = hit_voxels[hit_in_box]
 
-        ground_voxels, obstacle_voxels, _ = self.split_scene_ground_obstacle(
-            scene_points, scene_point_voxels, scene_hit_voxels,
-            semantic_voxels)
+        (ground_voxels, obstacle_voxels,
+         raw_obstacle_voxels) = self.split_scene_ground_obstacle(
+             scene_points, scene_point_voxels, scene_hit_voxels,
+             semantic_voxels)
         if obstacle_voxels.shape[0] > 0:
             near_box = self.obstacle_near_box_mask(obstacle_voxels, boxes)
             obstacle_voxels = obstacle_voxels[~near_box]
@@ -1015,11 +1064,20 @@ class RaycastDrivableBuilder:
             free_mask[ego_ignore_mask > 0] = 0
             blocked_mask[ego_ignore_mask > 0] = 0
 
-        return dict(
+        result = dict(
             ground=ground_mask,
             obstacle=obstacle_mask,
             free=free_mask,
             blocked=blocked_mask)
+        if return_voxels:
+            result.update(
+                ground_voxels=ground_voxels,
+                obstacle_voxels=obstacle_voxels,
+                raw_obstacle_voxels=raw_obstacle_voxels,
+                semantic_voxels=semantic_voxels,
+                free_voxels=free_voxels,
+            )
+        return result
 
 
 @PIPELINES.register_module()

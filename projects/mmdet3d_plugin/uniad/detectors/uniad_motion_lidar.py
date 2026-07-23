@@ -313,6 +313,14 @@ class UniADMotionLidar(UniADTrackLidar):
                       gt_segmentation=None,
                       gt_instance=None,
                       gt_occ_img_is_valid=None,
+                      gt_world_occ=None,
+                      gt_world_valid=None,
+                      current_world_state=None,
+                      current_world_valid=None,
+                      history_world_state=None,
+                      history_world_valid=None,
+                      gt_flow=None,
+                      gt_backward_flow=None,
                       **kwargs):
         losses = dict()
         losses_track, outs_track = self.forward_track_train(
@@ -399,7 +407,14 @@ class UniADMotionLidar(UniADTrackLidar):
                 gt_inds_list=gt_inds,
                 gt_segmentation=gt_segmentation,
                 gt_instance=gt_instance,
-                gt_img_is_valid=gt_occ_img_is_valid)
+                gt_img_is_valid=gt_occ_img_is_valid,
+                gt_world_occ=gt_world_occ,
+                gt_world_valid=gt_world_valid,
+                current_world_state=current_world_state,
+                current_world_valid=current_world_valid,
+                history_world_state=history_world_state,
+                history_world_valid=history_world_valid,
+                gt_flow=gt_flow)
             losses.update(
                 self.loss_weighted_and_prefixed(losses_occ, prefix='occ'))
 
@@ -475,7 +490,11 @@ class UniADMotionLidar(UniADTrackLidar):
                 no_query=occ_no_query,
                 gt_segmentation=gt_segmentation,
                 gt_instance=gt_instance,
-                gt_img_is_valid=gt_occ_img_is_valid)
+                gt_img_is_valid=gt_occ_img_is_valid,
+                current_world_state=kwargs.get('current_world_state'),
+                current_world_valid=kwargs.get('current_world_valid'),
+                history_world_state=kwargs.get('history_world_state'),
+                history_world_valid=kwargs.get('history_world_valid'))
             for key in ('pred_ins_logits', 'pred_ins_sigmoid'):
                 outs_occ.pop(key, None)
             results[0]['occ'] = outs_occ

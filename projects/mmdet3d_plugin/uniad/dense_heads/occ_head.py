@@ -309,6 +309,14 @@ class OccHead(BaseModule):
                     gt_segmentation=None,
                     gt_instance=None,
                     gt_img_is_valid=None,
+                    gt_world_occ=None,
+                    gt_world_valid=None,
+                    current_world_state=None,
+                    current_world_valid=None,
+                    history_world_state=None,
+                    history_world_valid=None,
+                    gt_flow=None,
+                    return_occ_predictions=False,
                 ):
         # Generate warpped gt and related inputs
         gt_segmentation, gt_instance, gt_img_is_valid = self.get_occ_labels(gt_segmentation, gt_instance, gt_img_is_valid)
@@ -431,6 +439,10 @@ class OccHead(BaseModule):
         loss_dict['loss_aux_dice'] = loss_aux_dice / bs
         loss_dict['loss_aux_mask'] = loss_aux_mask / bs
 
+        if return_occ_predictions:
+            return loss_dict, {
+                'pred_ins_logits': ins_seg_preds_batch,
+            }
         return loss_dict
 
     def forward_test(
@@ -441,6 +453,10 @@ class OccHead(BaseModule):
                     gt_segmentation=None,
                     gt_instance=None,
                     gt_img_is_valid=None,
+                    current_world_state=None,
+                    current_world_valid=None,
+                    history_world_state=None,
+                    history_world_valid=None,
                 ):
         gt_segmentation, gt_instance, gt_img_is_valid = self.get_occ_labels(gt_segmentation, gt_instance, gt_img_is_valid)
 
