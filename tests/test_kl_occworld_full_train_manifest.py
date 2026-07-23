@@ -1,0 +1,86 @@
+from tools.analysis_tools.prepare_kl_occworld_full_train_manifest import (
+    partition_scene_records,
+)
+from tools.analysis_tools.run_kl_occworld_full_train_data import (
+    _scene_shards,
+)
+
+
+def _records(start, count):
+    return [{
+        'reference_index': index,
+        'scene_token': f'scene-{index}',
+        'sample_token': f'token-{index}',
+        'timestamp': float(index),
+    } for index in range(start, start + count)]
+
+
+def test_full_train_partition_freezes_fresh_final_holdout():
+    eligible = _records(0, 12)
+    v2 = {
+        'splits': {
+            'train': [eligible[0], eligible[1]],
+            'validation': [eligible[2]],
+            'test': [eligible[3]],
+        },
+    }
+    blind = {'splits': {'blind': [eligible[4]]}}
+
+    result = partition_scene_records(
+        eligible, v2, blind, final_scene_count=2,
+        final_reference_valid=lambda index: index != 6)
+
+    final_indices = [
+        record['reference_index'] for record in result['final_records']
+    ]
+    train_scenes = {
+        record['scene_token'] for record in result['train_scene_records']
+    }
+    assert final_indices == [5, 11]
+    assert train_scenes == {
+        'scene-0', 'scene-1', 'scene-6', 'scene-7',
+        'scene-8', 'scene-9', 'scene-10'}
+    assert all(record['selection_source'] ==
+               'fresh_evenly_spaced_before_b15_label_generation'
+               for record in result['final_records'])
+
+
+def test_full_train_partition_rejects_prior_holdout_overlap():
+    eligible = _records(0, 6)
+    v2 = {
+        'splits': {
+            'train': [eligible[0]],
+            'validation': [eligible[1]],
+            'test': [eligible[2]],
+        },
+    }
+    blind = {'splits': {'blind': [eligible[2]]}}
+
+    try:
+        partition_scene_records(
+            eligible, v2, blind, final_scene_count=1,
+            final_reference_valid=lambda _: True)
+    except ValueError as error:
+        assert 'V2 and blind scene overlap' in str(error)
+    else:
+        raise AssertionError('Expected overlap validation to fail')
+
+
+def test_full_train_shards_keep_scenes_together_and_balance_references():
+    records = [
+        {'scene_token': 'a', 'reference_index': 1},
+        {'scene_token': 'a', 'reference_index': 2},
+        {'scene_token': 'a', 'reference_index': 3},
+        {'scene_token': 'b', 'reference_index': 10},
+        {'scene_token': 'b', 'reference_index': 11},
+        {'scene_token': 'c', 'reference_index': 20},
+        {'scene_token': 'd', 'reference_index': 30},
+    ]
+
+    shards = _scene_shards(records, 3)
+
+    assert sorted(value for shard in shards for value in shard) == [
+        1, 2, 3, 10, 11, 20, 30]
+    assert max(map(len, shards)) - min(map(len, shards)) <= 1
+    assert sum(any(value in shard for value in (1, 2, 3))
+               for shard in shards) == 1
