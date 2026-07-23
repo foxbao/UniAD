@@ -39,7 +39,7 @@ import json
 import pickle
 import sys
 from pathlib import Path
-from typing import Dict, List, Sequence, Tuple
+from typing import Dict, List, Mapping, Sequence, Tuple
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -431,8 +431,19 @@ class MultiLidarOccLabelBuilder:
                 (z_centers <= self.collision_z[1]))
         return voxels[keep]
 
-    def build(self, info: dict, diagnostics: bool = False,
-              return_points: bool = False) -> dict:
+    def build(self, info: dict = None, diagnostics: bool = False,
+              return_points: bool = False,
+              sensor_inputs: Mapping[str, dict] = None,
+              boxes: np.ndarray = None,
+              instances: Sequence[dict] = None) -> dict:
+        """Build occupancy evidence from files or in-memory sensor data.
+
+        ``sensor_inputs`` maps each sensor name to target-frame ``points``
+        and its target-frame ``origin``.  This is the online entry point;
+        callers may also provide tracker ``boxes`` and matching instance
+        metadata instead of relying on annotations stored in ``info``.
+        """
+        info = {} if info is None else info
         all_points = []
         free_voxels = []
         collision_free_voxels = []
@@ -449,19 +460,43 @@ class MultiLidarOccLabelBuilder:
             (self.builder.bev_h, self.builder.bev_w), dtype=np.uint8)
         collision_free_sensor_count = np.zeros_like(free_sensor_count)
 
-        lidar_entries = info.get('sync_info', {}).get('lidars', {})
-        for sensor_name, entry in sorted(lidar_entries.items()):
-            if not entry.get('valid', False) or not entry.get('path'):
-                continue
-            point_path = _resolve_path(entry['path'])
-            transforms = self._extrinsics_for(point_path)
-            if sensor_name not in transforms:
-                raise KeyError(
-                    f'{sensor_name} missing from extrinsics near {point_path}')
+        prepared_sensors = []
+        if sensor_inputs is None:
+            lidar_entries = info.get('sync_info', {}).get('lidars', {})
+            for sensor_name, entry in sorted(lidar_entries.items()):
+                if not entry.get('valid', False) or not entry.get('path'):
+                    continue
+                point_path = _resolve_path(entry['path'])
+                transforms = self._extrinsics_for(point_path)
+                if sensor_name not in transforms:
+                    raise KeyError(
+                        f'{sensor_name} missing from extrinsics near '
+                        f'{point_path}')
+                raw_points = read_pc(point_path)
+                points, origin = _transform_sensor_points(
+                    raw_points, transforms[sensor_name], self.target_frame)
+                prepared_sensors.append((sensor_name, points, origin))
+        else:
+            for sensor_name, entry in sorted(sensor_inputs.items()):
+                if 'points' not in entry or 'origin' not in entry:
+                    raise KeyError(
+                        f'{sensor_name} requires points and origin')
+                points = np.asarray(entry['points'], dtype=np.float32)
+                origin = np.asarray(entry['origin'], dtype=np.float32)
+                if points.ndim != 2 or points.shape[1] < 3:
+                    raise ValueError(
+                        f'{sensor_name} points must be [N,>=3], got '
+                        f'{points.shape}')
+                if origin.shape != (3, ) or not np.isfinite(origin).all():
+                    raise ValueError(
+                        f'{sensor_name} origin must be finite [3], got '
+                        f'{origin}')
+                if not np.isfinite(points[:, :3]).all():
+                    raise ValueError(
+                        f'{sensor_name} points contain non-finite XYZ')
+                prepared_sensors.append((sensor_name, points, origin))
 
-            raw_points = read_pc(point_path)
-            points, origin = _transform_sensor_points(
-                raw_points, transforms[sensor_name], self.target_frame)
+        for sensor_name, points, origin in prepared_sensors:
             point_voxels = _valid_point_voxels(self.builder, points)
             hits = np.unique(point_voxels, axis=0)
             if hits.shape[0] == 0:
@@ -504,7 +539,22 @@ class MultiLidarOccLabelBuilder:
         else:
             collision_free_voxels = np.empty((0, 3), dtype=np.int64)
 
-        boxes, instances = _collect_boxes(info)
+        if boxes is None:
+            boxes, instances = _collect_boxes(info)
+        else:
+            boxes = np.asarray(boxes, dtype=np.float32)
+            if boxes.size == 0:
+                boxes = np.empty((0, 7), dtype=np.float32)
+            if boxes.ndim != 2 or boxes.shape[1] < 7:
+                raise ValueError(f'boxes must be [N,>=7], got {boxes.shape}')
+            boxes = boxes[:, :7]
+            if not np.isfinite(boxes).all() or np.any(boxes[:, 3:6] <= 0):
+                raise ValueError('boxes must be finite with positive sizes')
+            if instances is None:
+                instances = [{} for _ in range(boxes.shape[0])]
+            elif len(instances) != boxes.shape[0]:
+                raise ValueError(
+                    'instances and boxes must contain the same count')
         evidence = self.builder.build(
             points, boxes, free_voxels=free_voxels, return_voxels=True)
         instance_occupied, instance_map, class_map = _instance_bev_maps(

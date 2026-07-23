@@ -475,7 +475,10 @@ class UniADMotionLidar(UniADTrackLidar):
             bev_embed, outs_track=result, outs_map=outs_map)
         result.update(result_motion[0])
 
-        if self.with_occ_head and kwargs.get('gt_segmentation') is not None:
+        has_occ_inputs = (
+            kwargs.get('gt_segmentation') is not None or
+            kwargs.get('current_world_state') is not None)
+        if self.with_occ_head and has_occ_inputs:
             outs_motion['bev_pos'] = result.get('bev_pos')
             occ_no_query = outs_motion['track_query'].shape[1] == 0
             gt_segmentation = self._wrap_occ_eval_tensor(

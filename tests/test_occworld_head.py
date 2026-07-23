@@ -1,3 +1,5 @@
+from types import SimpleNamespace
+
 import torch
 import torch.nn as nn
 
@@ -23,6 +25,20 @@ from projects.mmdet3d_plugin.uniad.dense_heads.occworld_head import (
     selected_world_cross_entropy,
     world_visibility_binary_cross_entropy,
 )
+from projects.mmdet3d_plugin.uniad.dense_heads.occ_head import OccHead
+
+
+def test_occ_head_test_without_gt_returns_zero_shape_for_empty_queries():
+    head = SimpleNamespace(n_future=4, bev_size=(3, 5))
+    bev_feat = torch.zeros((15, 2, 8))
+
+    output = OccHead.forward_test(
+        head, bev_feat, outs_dict={}, no_query=True)
+
+    assert output['seg_gt'] is None
+    assert output['ins_seg_gt'] is None
+    assert tuple(output['seg_out'].shape) == (2, 5, 1, 3, 5)
+    assert tuple(output['ins_seg_out'].shape) == (2, 5, 3, 5)
 
 
 def test_compose_incremental_flow_follows_moving_source():
