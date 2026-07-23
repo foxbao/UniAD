@@ -23,6 +23,9 @@ from third_party.uniad_mmdet3d.datasets.builder import (
     build_dataset,
 )
 from third_party.uniad_mmdet3d.models.builder import build_model
+from tools.data_converter.kl_occworld_track_adapter import (
+    track_result_to_occworld_instances,
+)
 
 
 def _checkpoint_epoch(path: Path) -> int:
@@ -58,6 +61,36 @@ def _prediction_filename(label_path: Path) -> str:
     return label_path.name[:-len(suffix)] + '__occworld_prediction.npz'
 
 
+def _load_current_anchor(root: Path, reference_index: int):
+    path = root / f'{reference_index:06d}' / 'occworld_current_anchor.npz'
+    if not path.exists():
+        raise FileNotFoundError(
+            f'Missing current-anchor override for {reference_index}: {path}')
+    with np.load(path, allow_pickle=False) as anchor:
+        if int(anchor['reference_index']) != reference_index:
+            raise ValueError(f'Wrong reference index in {path}')
+        state = np.asarray(anchor['current_world_state_3d'], dtype=np.int64)
+        valid = np.asarray(anchor['current_world_valid_3d'], dtype=np.bool_)
+    if state.shape != (10, 120, 160) or valid.shape != state.shape:
+        raise ValueError(f'Unexpected current-anchor shape in {path}')
+    return state, valid, path
+
+
+def _override_current_anchor(batch: dict, state: np.ndarray,
+                             valid: np.ndarray):
+    for key, value in (
+            ('current_world_state', state),
+            ('current_world_valid', valid)):
+        if key not in batch:
+            raise KeyError(f'Batch lacks {key}')
+        target = batch[key].data[0]
+        if target.ndim != 4 or target.shape[0] != 1:
+            raise ValueError(
+                f'Unexpected {key} batch shape {tuple(target.shape)}')
+        tensor = torch.from_numpy(value).to(dtype=target.dtype)
+        target[0].copy_(tensor)
+
+
 def _load_checkpoint(model, path: Path):
     checkpoint = torch.load(path, map_location='cpu')
     state_dict = checkpoint.get('state_dict', checkpoint)
@@ -79,7 +112,10 @@ def _reset_test_state(model):
 
 def export_checkpoint(model, wrapped_model, loader, dataset,
                       checkpoint_path: Path, split: str,
-                      output_root: Path):
+                      output_root: Path,
+                      save_track_boxes: bool = False,
+                      track_score_threshold: float = 0.1,
+                      current_anchor_root: Path = None):
     _load_checkpoint(model, checkpoint_path)
     model.eval()
     _reset_test_state(model)
@@ -91,6 +127,11 @@ def export_checkpoint(model, wrapped_model, loader, dataset,
     output_paths = []
     for position, batch in enumerate(loader):
         reference_index = references[position]
+        anchor_path = None
+        if current_anchor_root is not None:
+            state, valid, anchor_path = _load_current_anchor(
+                current_anchor_root, reference_index)
+            _override_current_anchor(batch, state, valid)
         with torch.no_grad():
             results = wrapped_model(
                 return_loss=False, rescale=True, **batch)
@@ -197,6 +238,41 @@ def export_checkpoint(model, wrapped_model, loader, dataset,
             checkpoint_epoch=np.int64(epoch),
             world_pred_class_3d=prediction,
             world_valid_probability_3d=valid_probability)
+        if anchor_path is not None:
+            payload['current_anchor_override'] = np.asarray(True)
+            payload['current_anchor_path'] = np.asarray(str(anchor_path))
+        if save_track_boxes:
+            track_result = results[0].get('pts_bbox', {})
+            track_boxes, track_instances, track_summary = (
+                track_result_to_occworld_instances(
+                    track_result,
+                    score_threshold=track_score_threshold,
+                    track_score_threshold=track_score_threshold,
+                    class_count=len(dataset.CLASSES)))
+            payload.update(
+                track_boxes_3d=track_boxes,
+                track_scores_3d=np.asarray([
+                    instance['score_3d']
+                    for instance in track_instances
+                ], dtype=np.float32),
+                track_runtime_scores=np.asarray([
+                    instance['track_score']
+                    for instance in track_instances
+                ], dtype=np.float32),
+                track_labels_3d=np.asarray([
+                    instance['bbox_label_3d']
+                    for instance in track_instances
+                ], dtype=np.int64),
+                track_ids=np.asarray([
+                    instance['track_id']
+                    for instance in track_instances
+                ], dtype=np.int64),
+                track_box_z_origin=np.asarray(
+                    track_summary['output_z_origin']),
+                track_input_count=np.int64(
+                    track_summary['input_count']),
+                track_score_threshold=np.float32(
+                    track_score_threshold))
         if future_change_probability is not None:
             payload['future_change_probability_3d'] = (
                 future_change_probability)
@@ -246,6 +322,14 @@ def parse_args():
             'outputs/patent_2026_occ/'
             'occworld_predictions_world_only_v1'))
     parser.add_argument('--workers-per-gpu', type=int, default=0)
+    parser.add_argument(
+        '--save-track-boxes', action='store_true',
+        help='Save filtered current TrackFormer boxes in each prediction.')
+    parser.add_argument(
+        '--track-score-threshold', type=float, default=0.1)
+    parser.add_argument(
+        '--current-anchor-root', type=Path,
+        help='Override B15 current-world input from saved online anchors.')
     return parser.parse_args()
 
 
@@ -274,7 +358,10 @@ def main():
             dataset=dataset,
             checkpoint_path=checkpoint_path,
             split=args.split,
-            output_root=args.output_root)
+            output_root=args.output_root,
+            save_track_boxes=args.save_track_boxes,
+            track_score_threshold=args.track_score_threshold,
+            current_anchor_root=args.current_anchor_root)
         summaries.append(summary)
         print(json.dumps(summary, ensure_ascii=False))
     print(json.dumps({

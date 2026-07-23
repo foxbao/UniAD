@@ -312,7 +312,14 @@ class MotionHeadLidar(MotionHead):
         """LiDAR-only motion prediction for online tracking results."""
         outs_track = outs_track or {}
         track_query = outs_track['track_query_embeddings'][None, None, ...]
-        track_boxes = outs_track['track_bbox_results']
+        # Appending the SDC slot below must not mutate the tracker result:
+        # ``boxes_3d`` and ``track_bbox_results`` share the same box object.
+        # Keep the exported TrackFormer boxes and scores aligned for other
+        # consumers such as online OccWorld instance anchoring.
+        track_boxes = [[
+            value.clone() if hasattr(value, 'clone') else value
+            for value in row
+        ] for row in outs_track['track_bbox_results']]
 
         with_sdc = (
             'sdc_embedding' in outs_track
