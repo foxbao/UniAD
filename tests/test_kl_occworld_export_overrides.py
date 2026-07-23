@@ -5,6 +5,7 @@ import torch
 
 from tools.analysis_tools.export_kl_occworld_predictions import (
     _override_current_anchor,
+    _shard_dataset_by_scene,
 )
 
 
@@ -25,3 +26,25 @@ def test_exporter_overrides_current_anchor_without_touching_history():
     assert torch.equal(current_state[0], torch.from_numpy(state))
     assert torch.equal(current_valid[0], torch.from_numpy(valid))
     assert torch.all(history == 7)
+
+
+def test_exporter_shards_complete_scenes_deterministically():
+    dataset = SimpleNamespace(
+        valid_data_indices=list(range(7)),
+        data_infos=[
+            {'scene_token': scene}
+            for scene in ('a', 'a', 'a', 'b', 'b', 'c', 'd')
+        ],
+        flag=np.arange(7, dtype=np.uint8),
+    )
+
+    summary = _shard_dataset_by_scene(dataset, shard_count=2, shard_index=1)
+
+    selected_scenes = {
+        dataset.data_infos[index]['scene_token']
+        for index in dataset.valid_data_indices
+    }
+    assert summary['all_shard_reference_counts'] == [4, 3]
+    assert summary['reference_count'] == 3
+    assert selected_scenes == {'b', 'c'}
+    assert dataset.flag.tolist() == dataset.valid_data_indices

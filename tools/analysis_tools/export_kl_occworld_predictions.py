@@ -54,6 +54,48 @@ def _reference_indices(dataset):
     ]
 
 
+def _shard_dataset_by_scene(dataset, shard_count: int,
+                            shard_index: int) -> dict:
+    """Select a deterministic, scene-disjoint subset of dataset references."""
+    if shard_count < 1:
+        raise ValueError('shard_count must be positive')
+    if not 0 <= shard_index < shard_count:
+        raise ValueError(
+            f'shard_index must be in [0, {shard_count}), got {shard_index}')
+    raw_indices = list(dataset.valid_data_indices)
+    groups = {}
+    for raw_index in raw_indices:
+        scene_token = str(dataset.data_infos[raw_index].get('scene_token', ''))
+        groups.setdefault(scene_token, []).append(raw_index)
+    shards = [[] for _ in range(shard_count)]
+    loads = [0] * shard_count
+    for scene_token, values in sorted(
+            groups.items(), key=lambda item: (-len(item[1]), item[0])):
+        target = min(range(shard_count), key=lambda i: (loads[i], i))
+        shards[target].extend(values)
+        loads[target] += len(values)
+    selected = set(shards[shard_index])
+    positions = [
+        position for position, raw_index in enumerate(raw_indices)
+        if raw_index in selected
+    ]
+    dataset.valid_data_indices = [raw_indices[position] for position in positions]
+    if hasattr(dataset, 'flag'):
+        dataset.flag = dataset.flag[np.asarray(positions, dtype=np.int64)]
+    selected_scenes = sorted({
+        str(dataset.data_infos[raw_index].get('scene_token', ''))
+        for raw_index in dataset.valid_data_indices
+    })
+    return {
+        'shard_count': int(shard_count),
+        'shard_index': int(shard_index),
+        'reference_count': len(dataset.valid_data_indices),
+        'scene_count': len(selected_scenes),
+        'scene_tokens': selected_scenes,
+        'all_shard_reference_counts': loads,
+    }
+
+
 def _prediction_filename(label_path: Path) -> str:
     suffix = '__occworld_sequence.npz'
     if not label_path.name.endswith(suffix):
@@ -314,7 +356,7 @@ def parse_args():
     parser.add_argument('--checkpoint-glob', default='epoch_*.pth')
     parser.add_argument(
         '--split', choices=(
-            'validation', 'test', 'blind', 'final_holdout'),
+            'train', 'validation', 'test', 'blind', 'final_holdout'),
         default='validation')
     parser.add_argument(
         '--output-root', type=Path,
@@ -330,6 +372,8 @@ def parse_args():
     parser.add_argument(
         '--current-anchor-root', type=Path,
         help='Override B15 current-world input from saved online anchors.')
+    parser.add_argument('--shard-count', type=int, default=1)
+    parser.add_argument('--shard-index', type=int, default=0)
     return parser.parse_args()
 
 
@@ -339,6 +383,8 @@ def main():
     dataset_key = 'test' if args.split == 'test' else 'val'
     dataset_cfg = cfg.data[dataset_key]
     dataset = build_dataset(dataset_cfg)
+    shard_summary = _shard_dataset_by_scene(
+        dataset, args.shard_count, args.shard_index)
     loader = build_dataloader(
         dataset,
         samples_per_gpu=1,
@@ -369,6 +415,7 @@ def main():
         'split': args.split,
         'checkpoint_count': len(summaries),
         'dataset_length': len(dataset),
+        'shard': shard_summary,
         'output_root': str(args.output_root),
     }, ensure_ascii=False, indent=2))
 

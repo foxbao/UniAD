@@ -227,6 +227,16 @@ def _aggregate(rows: list) -> dict:
     }
 
 
+def _select_reference_shard(references: list, shard_count: int,
+                            shard_index: int) -> list:
+    if shard_count < 1:
+        raise ValueError('shard_count must be positive')
+    if not 0 <= shard_index < shard_count:
+        raise ValueError(
+            f'shard_index must be in [0, {shard_count}), got {shard_index}')
+    return list(references[shard_index::shard_count])
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -263,6 +273,8 @@ def parse_args():
         '--occ-size', type=int, nargs=3, default=[160, 120, 10])
     parser.add_argument(
         '--collision-z', type=float, nargs=2, default=[0.3, 2.5])
+    parser.add_argument('--shard-count', type=int, default=1)
+    parser.add_argument('--shard-index', type=int, default=0)
     return parser.parse_args()
 
 
@@ -275,6 +287,12 @@ def main():
     missing = sorted(set(selected).difference(prediction_map))
     if missing:
         raise KeyError(f'Missing track-box predictions for {missing}')
+    selected = _select_reference_shard(
+        selected, args.shard_count, args.shard_index)
+    if not selected:
+        raise ValueError(
+            f'Anchor-audit shard {args.shard_index}/{args.shard_count} '
+            'contains no references')
     infos, metainfo = _load_infos(_resolve_path(args.ann_file))
     rows = [
         audit_reference(
@@ -289,6 +307,8 @@ def main():
             'Current-frame box-source substitution audit. This is not a '
             'full historical predicted-box or final-holdout evaluation.'),
         'box_source': args.box_source,
+        'shard_count': int(args.shard_count),
+        'shard_index': int(args.shard_index),
         'reference_count': len(rows),
         'aggregate': _aggregate(rows),
         'rows': rows,

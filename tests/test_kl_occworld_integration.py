@@ -5,7 +5,9 @@ import numpy as np
 import torch
 
 from projects.mmdet3d_plugin.datasets.kl_occworld_dataset import (
+    discover_occworld_current_anchors,
     discover_occworld_labels,
+    load_occworld_current_anchor,
     load_occworld_current_observation,
     load_occworld_history,
     load_occworld_split_references,
@@ -74,6 +76,44 @@ def test_current_observation_loader_masks_invalid_state_without_future(
 
     assert current_state.flatten().tolist() == [1, 0, 3]
     assert current_valid.flatten().tolist() == [True, False, True]
+
+
+def test_current_anchor_discovery_and_loader_validate_reference(tmp_path):
+    anchor_dir = tmp_path / '000005'
+    anchor_dir.mkdir(parents=True)
+    anchor_path = anchor_dir / 'occworld_current_anchor.npz'
+    np.savez_compressed(
+        anchor_path,
+        reference_index=np.int64(5),
+        current_world_state_3d=np.asarray([[[1, 3, 2]]], dtype=np.uint8),
+        current_world_valid_3d=np.asarray([[[1, 0, 1]]], dtype=np.uint8))
+
+    mapping = discover_occworld_current_anchors(str(tmp_path))
+    state, valid = load_occworld_current_anchor(
+        anchor_path, expected_shape=(1, 1, 3),
+        expected_reference_index=5)
+
+    assert mapping == {5: anchor_path}
+    assert state.flatten().tolist() == [1, 0, 2]
+    assert valid.flatten().tolist() == [True, False, True]
+
+
+def test_current_anchor_loader_rejects_wrong_reference(tmp_path):
+    anchor_path = tmp_path / 'occworld_current_anchor.npz'
+    np.savez_compressed(
+        anchor_path,
+        reference_index=np.int64(6),
+        current_world_state_3d=np.ones((1, 1, 1), dtype=np.uint8),
+        current_world_valid_3d=np.ones((1, 1, 1), dtype=np.uint8))
+
+    try:
+        load_occworld_current_anchor(
+            anchor_path, expected_shape=(1, 1, 1),
+            expected_reference_index=5)
+    except ValueError as error:
+        assert 'expected 5' in str(error)
+    else:
+        raise AssertionError('Expected reference mismatch to fail')
 
 
 def test_history_loader_keeps_order_and_ends_at_current(tmp_path):

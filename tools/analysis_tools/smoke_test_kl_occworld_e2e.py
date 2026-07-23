@@ -31,7 +31,18 @@ def parse_args():
             'projects/configs/stage2_e2e_lidar/'
             'base_e2e_lidar_occworld.py'))
     parser.add_argument('--checkpoint')
+    parser.add_argument(
+        '--backward', action='store_true',
+        help='Backpropagate the summed training losses for one batch.')
     return parser.parse_args()
+
+
+def _mean_loss(value):
+    if torch.is_tensor(value):
+        return value.mean()
+    if isinstance(value, (list, tuple)):
+        return sum(_mean_loss(item) for item in value)
+    raise TypeError(f'Unsupported loss value: {type(value).__name__}')
 
 
 def main():
@@ -62,8 +73,27 @@ def main():
     wrapped = MMDataParallel(model.cuda(), device_ids=[0])
     batch = next(iter(loader))
     torch.cuda.reset_peak_memory_stats()
-    with torch.no_grad():
+    context = torch.enable_grad() if args.backward else torch.no_grad()
+    with context:
         losses = wrapped(return_loss=True, **batch)
+    backward_result = None
+    if args.backward:
+        total_loss = sum(
+            _mean_loss(value) for key, value in losses.items()
+            if 'loss' in key)
+        if not torch.isfinite(total_loss):
+            raise FloatingPointError(f'Non-finite total loss: {total_loss}')
+        total_loss.backward()
+        trainable = [
+            parameter for parameter in model.parameters()
+            if parameter.requires_grad
+        ]
+        backward_result = {
+            'total_loss': float(total_loss.detach().cpu()),
+            'trainable_parameter_tensors': len(trainable),
+            'parameter_tensors_with_gradient': sum(
+                parameter.grad is not None for parameter in trainable),
+        }
     occ_losses = {
         key: float(value.detach().mean().cpu())
         for key, value in losses.items()
@@ -106,6 +136,8 @@ def main():
         'peak_gpu_memory_mb': (
             torch.cuda.max_memory_allocated() / (1024 ** 2)),
     }
+    if backward_result is not None:
+        result['backward'] = backward_result
     print(json.dumps(result, ensure_ascii=False, indent=2))
 
 

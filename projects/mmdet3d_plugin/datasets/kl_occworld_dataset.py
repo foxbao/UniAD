@@ -50,6 +50,25 @@ def discover_occworld_histories(history_root: str) -> Dict[int, Path]:
     return mapping
 
 
+def discover_occworld_current_anchors(anchor_root: str) -> Dict[int, Path]:
+    """Map reference indices to precomputed online current anchors."""
+    root = Path(anchor_root)
+    mapping = {}
+    for path in sorted(root.glob('*/occworld_current_anchor.npz')):
+        with np.load(path, allow_pickle=False) as anchor:
+            if 'reference_index' not in anchor.files:
+                raise ValueError(f'{path} has no reference_index')
+            reference_index = int(anchor['reference_index'])
+        if reference_index in mapping:
+            raise ValueError(
+                f'Duplicate OccWorld current anchor for {reference_index}')
+        mapping[reference_index] = path
+    if not mapping:
+        raise FileNotFoundError(
+            f'No OccWorld current anchors found below {root}')
+    return mapping
+
+
 def load_occworld_split_references(
         manifest_path: str,
         split: str) -> Tuple[int, ...]:
@@ -107,6 +126,35 @@ def load_occworld_current_observation(
     if np.any((state < 0) | (state > 3)):
         raise ValueError(
             f'Invalid current observation state in {label_path}')
+    known = valid & (state != 0)
+    state = np.array(state, copy=True)
+    state[~known] = 0
+    return torch.from_numpy(state), torch.from_numpy(known)
+
+
+def load_occworld_current_anchor(
+        anchor_path: Path,
+        expected_shape: Sequence[int],
+        expected_reference_index: int = None):
+    """Load a causal online-anchor override without reading world targets."""
+    with np.load(anchor_path, allow_pickle=False) as anchor:
+        reference_index = int(anchor['reference_index'])
+        state = np.asarray(
+            anchor['current_world_state_3d'], dtype=np.int64)
+        valid = np.asarray(
+            anchor['current_world_valid_3d'], dtype=np.bool_)
+    if (expected_reference_index is not None and
+            reference_index != int(expected_reference_index)):
+        raise ValueError(
+            f'Current anchor {anchor_path} has reference {reference_index}, '
+            f'expected {expected_reference_index}')
+    expected_shape = tuple(int(value) for value in expected_shape)
+    if state.shape != expected_shape or valid.shape != expected_shape:
+        raise ValueError(
+            f'Unexpected current anchor shape in {anchor_path}: '
+            f'{state.shape}, {valid.shape}, expected {expected_shape}')
+    if np.any((state < 0) | (state > 3)):
+        raise ValueError(f'Invalid current anchor state in {anchor_path}')
     known = valid & (state != 0)
     state = np.array(state, copy=True)
     state[~known] = 0
@@ -185,6 +233,7 @@ class KlOccWorldDataset(KlTrackDataset):
                  occworld_split: str = 'train',
                  occworld_history_root: str = None,
                  occworld_history_count: int = 5,
+                 occworld_current_anchor_root: str = None,
                  **kwargs):
         self.occworld_labels = discover_occworld_labels(
             occworld_label_root)
@@ -221,6 +270,20 @@ class KlOccWorldDataset(KlTrackDataset):
                     f'{missing}')
             self.occworld_histories = {
                 reference: histories[reference]
+                for reference in self.occworld_labels
+            }
+        self.occworld_current_anchors = None
+        if occworld_current_anchor_root is not None:
+            anchors = discover_occworld_current_anchors(
+                occworld_current_anchor_root)
+            missing = sorted(
+                set(self.occworld_labels).difference(anchors))
+            if missing:
+                raise ValueError(
+                    'OccWorld split has no current anchors for references '
+                    f'{missing}')
+            self.occworld_current_anchors = {
+                reference: anchors[reference]
                 for reference in self.occworld_labels
             }
         super().__init__(*args, **kwargs)
@@ -269,6 +332,14 @@ class KlOccWorldDataset(KlTrackDataset):
             ignore_index=self.occworld_ignore_index)
         current_state, current_valid = load_occworld_current_observation(
             label_path, self.occworld_expected_shape[1:])
+        current_anchor_path = None
+        if self.occworld_current_anchors is not None:
+            current_anchor_path = self.occworld_current_anchors[
+                reference_index]
+            current_state, current_valid = load_occworld_current_anchor(
+                current_anchor_path,
+                self.occworld_expected_shape[1:],
+                expected_reference_index=reference_index)
         history_path = None
         history_state = None
         history_valid = None
@@ -294,6 +365,9 @@ class KlOccWorldDataset(KlTrackDataset):
             current_state, stack=True, pad_dims=None)
         sample['current_world_valid'] = DC(
             current_valid, stack=True, pad_dims=None)
+        if current_anchor_path is not None:
+            sample['occworld_current_anchor_path'] = DC(
+                str(current_anchor_path), cpu_only=True)
         if history_state is not None:
             sample['history_world_state'] = DC(
                 history_state, stack=True, pad_dims=None)
