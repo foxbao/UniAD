@@ -2,6 +2,9 @@ from tools.analysis_tools.build_kl_occworld_blind_holdout import (
     replace_pre_inference_invalid_record,
     select_blind_records,
 )
+from tools.analysis_tools.prepare_kl_occworld_fresh_holdout import (
+    select_fresh_holdout_records,
+)
 from tools.analysis_tools.select_kl_occworld_expanded_scenes import (
     _evenly_spaced,
     audit_scene_references,
@@ -121,6 +124,54 @@ def test_blind_selection_excludes_every_prior_split_and_is_even():
     assert all(record['selection_source'] ==
                'fresh_evenly_spaced_before_blind_inference'
                for record in selected)
+
+
+def test_fresh_holdout_excludes_all_existing_splits_and_checks_queue():
+    eligible = [{
+        'reference_index': index,
+        'scene_token': f'scene-{index}',
+        'sample_token': f'token-{index}',
+        'timestamp': float(index),
+    } for index in range(8)]
+    existing = {
+        'splits': {
+            'train': [eligible[0]],
+            'validation': [eligible[2]],
+            'test': [eligible[4]],
+            'blind_consumed': [eligible[6]],
+            'final_holdout': [eligible[7]],
+        },
+    }
+
+    selected, diagnostics = select_fresh_holdout_records(
+        eligible, existing, scene_count=2,
+        model_queue_valid=lambda index: index != 3)
+
+    assert [record['reference_index'] for record in selected] == [1, 5]
+    assert diagnostics['fresh_before_model_queue_count'] == 3
+    assert diagnostics['fresh_model_queue_rejected_count'] == 1
+    assert all(record['selection_source'] == (
+        'fresh_evenly_spaced_before_b17_holdout_label_generation')
+        for record in selected)
+
+
+def test_fresh_holdout_rejects_insufficient_unconsumed_scenes():
+    eligible = [{
+        'reference_index': index,
+        'scene_token': f'scene-{index}',
+        'sample_token': f'token-{index}',
+        'timestamp': float(index),
+    } for index in range(3)]
+    existing = {'splits': {'train': eligible}}
+
+    try:
+        select_fresh_holdout_records(
+            eligible, existing, scene_count=1,
+            model_queue_valid=lambda _: True)
+    except ValueError as error:
+        assert 'Only 0 fresh scenes' in str(error)
+    else:
+        raise AssertionError('Expected fresh-holdout selection to fail')
 
 
 def test_blind_replacement_requires_fresh_complete_model_queue():
