@@ -5,6 +5,7 @@ import torch
 
 from tools.analysis_tools.export_kl_occworld_predictions import (
     _override_current_anchor,
+    _override_online_inputs,
     _shard_dataset_by_scene,
 )
 
@@ -48,3 +49,29 @@ def test_exporter_shards_complete_scenes_deterministically():
     assert summary['reference_count'] == 3
     assert selected_scenes == {'b', 'c'}
     assert dataset.flag.tolist() == dataset.valid_data_indices
+
+
+def test_exporter_overrides_complete_online_input_contract():
+    shapes = {
+        'current_world_state': (1, 10, 120, 160),
+        'current_world_valid': (1, 10, 120, 160),
+        'history_world_state': (1, 5, 10, 120, 160),
+        'history_world_valid': (1, 5, 10, 120, 160),
+    }
+    batch = {
+        key: SimpleNamespace(data=[torch.zeros(
+            shape,
+            dtype=torch.bool if 'valid' in key else torch.long)])
+        for key, shape in shapes.items()
+    }
+    payload = {
+        key: np.ones(
+            shape[1:],
+            dtype=np.bool_ if 'valid' in key else np.int64)
+        for key, shape in shapes.items()
+    }
+
+    _override_online_inputs(batch, payload)
+
+    for key in shapes:
+        assert torch.all(batch[key].data[0])

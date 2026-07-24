@@ -453,6 +453,8 @@ class UniADMotionLidar(UniADTrackLidar):
 
     def simple_test(self, points, img_metas, img=None, history_points=None,
                     **kwargs):
+        if kwargs.pop('export_track_queue', False):
+            return self.simple_test_track_queue(points, img_metas)
         results = super().simple_test(
             points,
             img_metas,

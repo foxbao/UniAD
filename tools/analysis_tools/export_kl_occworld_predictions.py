@@ -133,6 +133,68 @@ def _override_current_anchor(batch: dict, state: np.ndarray,
         target[0].copy_(tensor)
 
 
+def _load_online_inputs(root: Path, reference_index: int):
+    path = root / f'{reference_index:06d}' / 'occworld_online_input.npz'
+    if not path.exists():
+        raise FileNotFoundError(
+            f'Missing online-input override for {reference_index}: {path}')
+    with np.load(path, allow_pickle=False) as inputs:
+        if int(inputs['reference_index']) != reference_index:
+            raise ValueError(f'Wrong reference index in {path}')
+        payload = {
+            'current_world_state': np.asarray(
+                inputs['current_world_state_3d'], dtype=np.int64),
+            'current_world_valid': np.asarray(
+                inputs['current_world_valid_3d'], dtype=np.bool_),
+            'history_world_state': np.asarray(
+                inputs['history_world_state_3d'], dtype=np.int64),
+            'history_world_valid': np.asarray(
+                inputs['history_world_valid_3d'], dtype=np.bool_),
+        }
+    current_shape = (10, 120, 160)
+    history_shape = (5, *current_shape)
+    if (payload['current_world_state'].shape != current_shape or
+            payload['current_world_valid'].shape != current_shape):
+        raise ValueError(f'Unexpected current online-input shape in {path}')
+    if (payload['history_world_state'].shape != history_shape or
+            payload['history_world_valid'].shape != history_shape):
+        raise ValueError(f'Unexpected history online-input shape in {path}')
+    for prefix in ('current', 'history'):
+        state = payload[f'{prefix}_world_state']
+        valid = payload[f'{prefix}_world_valid']
+        if np.any((state < 0) | (state > 3)):
+            raise ValueError(f'Invalid {prefix} world state in {path}')
+        if np.any((~valid) & (state != 0)):
+            raise ValueError(
+                f'Invalid {prefix} voxels carry a world state in {path}')
+    return payload, path
+
+
+def _override_online_inputs(batch: dict, payload: dict):
+    expected_ndim = {
+        'current_world_state': 4,
+        'current_world_valid': 4,
+        'history_world_state': 5,
+        'history_world_valid': 5,
+    }
+    for key, ndim in expected_ndim.items():
+        if key not in batch:
+            raise KeyError(f'Batch lacks {key}')
+        if key not in payload:
+            raise KeyError(f'Online input lacks {key}')
+        target = batch[key].data[0]
+        if target.ndim != ndim or target.shape[0] != 1:
+            raise ValueError(
+                f'Unexpected {key} batch shape {tuple(target.shape)}')
+        value = np.asarray(payload[key])
+        if tuple(value.shape) != tuple(target.shape[1:]):
+            raise ValueError(
+                f'{key} override shape {value.shape} does not match '
+                f'{tuple(target.shape[1:])}')
+        tensor = torch.from_numpy(value).to(dtype=target.dtype)
+        target[0].copy_(tensor)
+
+
 def _load_checkpoint(model, path: Path):
     checkpoint = torch.load(path, map_location='cpu')
     state_dict = checkpoint.get('state_dict', checkpoint)
@@ -157,7 +219,12 @@ def export_checkpoint(model, wrapped_model, loader, dataset,
                       output_root: Path,
                       save_track_boxes: bool = False,
                       track_score_threshold: float = 0.1,
-                      current_anchor_root: Path = None):
+                      current_anchor_root: Path = None,
+                      online_input_root: Path = None):
+    if current_anchor_root is not None and online_input_root is not None:
+        raise ValueError(
+            'Current-anchor and complete online-input overrides are '
+            'mutually exclusive')
     _load_checkpoint(model, checkpoint_path)
     model.eval()
     _reset_test_state(model)
@@ -170,10 +237,15 @@ def export_checkpoint(model, wrapped_model, loader, dataset,
     for position, batch in enumerate(loader):
         reference_index = references[position]
         anchor_path = None
+        online_input_path = None
         if current_anchor_root is not None:
             state, valid, anchor_path = _load_current_anchor(
                 current_anchor_root, reference_index)
             _override_current_anchor(batch, state, valid)
+        if online_input_root is not None:
+            online_inputs, online_input_path = _load_online_inputs(
+                online_input_root, reference_index)
+            _override_online_inputs(batch, online_inputs)
         with torch.no_grad():
             results = wrapped_model(
                 return_loss=False, rescale=True, **batch)
@@ -283,6 +355,10 @@ def export_checkpoint(model, wrapped_model, loader, dataset,
         if anchor_path is not None:
             payload['current_anchor_override'] = np.asarray(True)
             payload['current_anchor_path'] = np.asarray(str(anchor_path))
+        if online_input_path is not None:
+            payload['online_input_override'] = np.asarray(True)
+            payload['online_input_path'] = np.asarray(
+                str(online_input_path))
         if save_track_boxes:
             track_result = results[0].get('pts_bbox', {})
             track_boxes, track_instances, track_summary = (
@@ -372,6 +448,9 @@ def parse_args():
     parser.add_argument(
         '--current-anchor-root', type=Path,
         help='Override B15 current-world input from saved online anchors.')
+    parser.add_argument(
+        '--online-input-root', type=Path,
+        help='Override current and five-frame history from online replay.')
     parser.add_argument('--shard-count', type=int, default=1)
     parser.add_argument('--shard-index', type=int, default=0)
     return parser.parse_args()
@@ -379,6 +458,11 @@ def parse_args():
 
 def main():
     args = parse_args()
+    if (args.current_anchor_root is not None and
+            args.online_input_root is not None):
+        raise ValueError(
+            '--current-anchor-root and --online-input-root are mutually '
+            'exclusive')
     cfg = Config.fromfile(str(args.config))
     dataset_key = 'test' if args.split == 'test' else 'val'
     dataset_cfg = cfg.data[dataset_key]
@@ -407,7 +491,8 @@ def main():
             output_root=args.output_root,
             save_track_boxes=args.save_track_boxes,
             track_score_threshold=args.track_score_threshold,
-            current_anchor_root=args.current_anchor_root)
+            current_anchor_root=args.current_anchor_root,
+            online_input_root=args.online_input_root)
         summaries.append(summary)
         print(json.dumps(summary, ensure_ascii=False))
     print(json.dumps({

@@ -1,6 +1,7 @@
 import copy
 import os
 
+import numpy as np
 import torch
 import torch.nn as nn
 from mmcv.runner import auto_fp16
@@ -1291,3 +1292,77 @@ class UniADTrackLidar(MVXTwoStageDetector):
             scores_3d_det=det_results[0]['scores_3d'],
             labels_3d_det=det_results[0]['labels_3d'])
         return [dict(pts_bbox=result)]
+
+    def simple_test_track_queue(self, points, img_metas):
+        """Run TrackFormer sequentially over one complete test queue.
+
+        Normal E2E inference uses history frames only to build temporal BEV
+        and predicts tracks at the current frame. This diagnostic path keeps
+        tracker state across every queued frame so OccWorld can audit a fully
+        predicted five-frame instance history.
+        """
+        points_queue = self._first_batch_queue(points)
+        normalized_metas, has_queue_meta = self._normalize_test_img_metas(
+            img_metas)
+        if len(normalized_metas) != 1 or not has_queue_meta:
+            raise ValueError(
+                'Track-queue export requires batch size one with queue_metas')
+        queue_metas = normalized_metas[0]['queue_metas']
+        ordered_keys = sorted(queue_metas)
+        if len(points_queue) != len(ordered_keys):
+            raise ValueError(
+                'Track-queue points/meta length mismatch: '
+                f'{len(points_queue)} vs {len(ordered_keys)}')
+
+        self.track_base.clear()
+        track_instances = self._generate_empty_tracks()
+        prev_bev = None
+        previous_r = None
+        previous_t = None
+        previous_timestamp = None
+        queue_results = []
+        export_keys = (
+            'boxes_3d', 'scores_3d', 'labels_3d',
+            'track_scores', 'track_ids')
+        for points_frame, meta_key in zip(points_queue, ordered_keys):
+            frame_meta = copy.deepcopy(queue_metas[meta_key])
+            device = (
+                points_frame.device if isinstance(points_frame, torch.Tensor)
+                else next(self.parameters()).device)
+            current_r, current_t, current_timestamp = self._meta_pose(
+                frame_meta, device)
+            time_delta = (
+                None if previous_timestamp is None
+                else current_timestamp - previous_timestamp)
+            frame_res = self._forward_single_frame_inference(
+                points_frame,
+                [frame_meta],
+                track_instances,
+                prev_bev=prev_bev,
+                l2g_r1=previous_r,
+                l2g_t1=previous_t,
+                l2g_r2=current_r,
+                l2g_t2=current_t,
+                time_delta=time_delta)
+            track_instances = self._detach_track_instances(
+                frame_res['track_instances'])
+            prev_bev = frame_res['bev_embed'].detach().clone()
+            result = {
+                key: frame_res[key]
+                for key in export_keys if key in frame_res
+            }
+            result.update(
+                sample_idx=int(frame_meta.get('sample_idx', -1)),
+                scene_token=str(frame_meta.get('scene_token', '')),
+                token=str(frame_meta.get('token', '')),
+                timestamp=float(frame_meta.get('timestamp', 0.0)),
+                ego2global=np.asarray(
+                    frame_meta.get('ego2global', np.eye(4)),
+                    dtype=np.float64))
+            queue_results.append(result)
+            previous_r = current_r
+            previous_t = current_t
+            previous_timestamp = current_timestamp
+
+        self.track_base.clear()
+        return [dict(pts_bbox=dict(track_queue_results=queue_results))]
