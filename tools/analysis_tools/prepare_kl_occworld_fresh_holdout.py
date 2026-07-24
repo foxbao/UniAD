@@ -154,7 +154,9 @@ def main():
     if args.scene_count < 1:
         raise ValueError('--scene-count must be positive')
     existing_manifest = _load_manifest(args.existing_manifest)
-    infos, _ = _load_infos(_resolve_path(str(args.ann_file)))
+    resolved_ann_file = Path(_resolve_path(str(args.ann_file)))
+    annotation_sha256 = _sha256(resolved_ann_file)
+    infos, _ = _load_infos(resolved_ann_file)
     required_offsets = sorted(set(
         int(value) for value in (
             *args.history_offsets, *args.future_offsets)))
@@ -175,6 +177,8 @@ def main():
         'selection_uses_occworld_labels': False,
         'selection_uses_model_predictions': False,
         'annotation_file': str(args.ann_file),
+        'resolved_annotation_file': str(resolved_ann_file),
+        'annotation_sha256': annotation_sha256,
         'existing_manifest': str(args.existing_manifest),
         'existing_manifest_sha256': _sha256(args.existing_manifest),
         'annotation_frame_count': len(infos),
@@ -234,6 +238,8 @@ def main():
         'strategy': (
             'fresh_scene_disjoint_evenly_spaced_after_full_contract_audit'),
         'source_preflight': str(report_path),
+        'source_annotation_file': str(resolved_ann_file),
+        'source_annotation_sha256': annotation_sha256,
         'source_existing_manifest': str(args.existing_manifest),
         'source_existing_manifest_sha256': _sha256(args.existing_manifest),
         'selection_uses_occworld_labels': False,
