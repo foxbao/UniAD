@@ -26,6 +26,7 @@ from tools.analysis_tools.export_kl_occworld_predictions import (
     _load_checkpoint,
     _reference_indices,
     _reset_test_state,
+    _shard_dataset_by_scene,
 )
 from tools.data_converter.kl_occworld_track_queue import (
     pack_track_queue_results,
@@ -130,6 +131,8 @@ def parse_args():
     parser.add_argument('--score-threshold', type=float, default=0.1)
     parser.add_argument('--workers-per-gpu', type=int, default=0)
     parser.add_argument('--summary-file', type=Path)
+    parser.add_argument('--shard-count', type=int, default=1)
+    parser.add_argument('--shard-index', type=int, default=0)
     return parser.parse_args()
 
 
@@ -140,6 +143,8 @@ def main():
     cfg = Config.fromfile(str(args.config))
     dataset = build_dataset(cfg.data.val)
     _select_references(dataset, args.reference_indices)
+    shard_summary = _shard_dataset_by_scene(
+        dataset, args.shard_count, args.shard_index)
     loader = build_dataloader(
         dataset,
         samples_per_gpu=1,
@@ -163,6 +168,7 @@ def main():
         'checkpoint': str(args.checkpoint),
         'score_threshold': args.score_threshold,
         'output_root': str(args.output_root),
+        'shard': shard_summary,
     })
     if args.summary_file is not None:
         args.summary_file.parent.mkdir(parents=True, exist_ok=True)

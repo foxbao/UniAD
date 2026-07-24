@@ -69,6 +69,25 @@ def discover_occworld_current_anchors(anchor_root: str) -> Dict[int, Path]:
     return mapping
 
 
+def discover_occworld_online_inputs(input_root: str) -> Dict[int, Path]:
+    """Map references to complete causal current/history input files."""
+    root = Path(input_root)
+    mapping = {}
+    for path in sorted(root.glob('*/occworld_online_input.npz')):
+        with np.load(path, allow_pickle=False) as inputs:
+            if 'reference_index' not in inputs.files:
+                raise ValueError(f'{path} has no reference_index')
+            reference_index = int(inputs['reference_index'])
+        if reference_index in mapping:
+            raise ValueError(
+                f'Duplicate OccWorld online input for {reference_index}')
+        mapping[reference_index] = path
+    if not mapping:
+        raise FileNotFoundError(
+            f'No OccWorld online inputs found below {root}')
+    return mapping
+
+
 def load_occworld_split_references(
         manifest_path: str,
         split: str) -> Tuple[int, ...]:
@@ -161,6 +180,62 @@ def load_occworld_current_anchor(
     return torch.from_numpy(state), torch.from_numpy(known)
 
 
+def load_occworld_online_input(
+        input_path: Path,
+        current_shape: Sequence[int],
+        history_shape: Sequence[int],
+        expected_reference_index: int = None):
+    """Load one complete causal input produced by online replay."""
+    with np.load(input_path, allow_pickle=False) as inputs:
+        reference_index = int(inputs['reference_index'])
+        current_state = np.asarray(
+            inputs['current_world_state_3d'], dtype=np.int64)
+        current_valid = np.asarray(
+            inputs['current_world_valid_3d'], dtype=np.bool_)
+        history_state = np.asarray(
+            inputs['history_world_state_3d'], dtype=np.int64)
+        history_valid = np.asarray(
+            inputs['history_world_valid_3d'], dtype=np.bool_)
+    if (expected_reference_index is not None and
+            reference_index != int(expected_reference_index)):
+        raise ValueError(
+            f'Online input {input_path} has reference {reference_index}, '
+            f'expected {expected_reference_index}')
+    current_shape = tuple(int(value) for value in current_shape)
+    history_shape = tuple(int(value) for value in history_shape)
+    if (current_state.shape != current_shape or
+            current_valid.shape != current_shape):
+        raise ValueError(
+            f'Unexpected current online-input shape in {input_path}: '
+            f'{current_state.shape}, {current_valid.shape}, expected '
+            f'{current_shape}')
+    if (history_state.shape != history_shape or
+            history_valid.shape != history_shape):
+        raise ValueError(
+            f'Unexpected history online-input shape in {input_path}: '
+            f'{history_state.shape}, {history_valid.shape}, expected '
+            f'{history_shape}')
+    for name, state, valid in (
+            ('current', current_state, current_valid),
+            ('history', history_state, history_valid)):
+        if np.any((state < 0) | (state > 3)):
+            raise ValueError(
+                f'Invalid {name} world state in {input_path}')
+        known = valid & (state != 0)
+        state = np.array(state, copy=True)
+        state[~known] = 0
+        if name == 'current':
+            current_state, current_valid = state, known
+        else:
+            history_state, history_valid = state, known
+    return (
+        torch.from_numpy(current_state),
+        torch.from_numpy(current_valid),
+        torch.from_numpy(history_state),
+        torch.from_numpy(history_valid),
+    )
+
+
 def load_occworld_direct_current_observation(
         label_path: Path,
         expected_shape: Sequence[int]):
@@ -234,6 +309,7 @@ class KlOccWorldDataset(KlTrackDataset):
                  occworld_history_root: str = None,
                  occworld_history_count: int = 5,
                  occworld_current_anchor_root: str = None,
+                 occworld_online_input_root: str = None,
                  **kwargs):
         self.occworld_labels = discover_occworld_labels(
             occworld_label_root)
@@ -258,8 +334,28 @@ class KlOccWorldDataset(KlTrackDataset):
         self.occworld_history_count = int(occworld_history_count)
         if self.occworld_history_count < 1:
             raise ValueError('occworld_history_count must be positive')
+        if (occworld_current_anchor_root is not None and
+                occworld_online_input_root is not None):
+            raise ValueError(
+                'Current anchors and complete online inputs are mutually '
+                'exclusive')
+        self.occworld_online_inputs = None
+        if occworld_online_input_root is not None:
+            online_inputs = discover_occworld_online_inputs(
+                occworld_online_input_root)
+            missing = sorted(
+                set(self.occworld_labels).difference(online_inputs))
+            if missing:
+                raise ValueError(
+                    'OccWorld split has no online inputs for references '
+                    f'{missing}')
+            self.occworld_online_inputs = {
+                reference: online_inputs[reference]
+                for reference in self.occworld_labels
+            }
         self.occworld_histories = None
-        if occworld_history_root is not None:
+        if (occworld_history_root is not None and
+                self.occworld_online_inputs is None):
             histories = discover_occworld_histories(
                 occworld_history_root)
             missing = sorted(
@@ -333,17 +429,28 @@ class KlOccWorldDataset(KlTrackDataset):
         current_state, current_valid = load_occworld_current_observation(
             label_path, self.occworld_expected_shape[1:])
         current_anchor_path = None
-        if self.occworld_current_anchors is not None:
+        online_input_path = None
+        history_path = None
+        history_state = None
+        history_valid = None
+        if self.occworld_online_inputs is not None:
+            online_input_path = self.occworld_online_inputs[reference_index]
+            current_state, current_valid, history_state, history_valid = (
+                load_occworld_online_input(
+                    online_input_path,
+                    self.occworld_expected_shape[1:],
+                    (self.occworld_history_count,
+                     *self.occworld_expected_shape[1:]),
+                    expected_reference_index=reference_index))
+        elif self.occworld_current_anchors is not None:
             current_anchor_path = self.occworld_current_anchors[
                 reference_index]
             current_state, current_valid = load_occworld_current_anchor(
                 current_anchor_path,
                 self.occworld_expected_shape[1:],
                 expected_reference_index=reference_index)
-        history_path = None
-        history_state = None
-        history_valid = None
-        if self.occworld_histories is not None:
+        if (self.occworld_online_inputs is None and
+                self.occworld_histories is not None):
             history_path = self.occworld_histories[reference_index]
             history_state, history_valid = load_occworld_history(
                 history_path,
@@ -368,6 +475,9 @@ class KlOccWorldDataset(KlTrackDataset):
         if current_anchor_path is not None:
             sample['occworld_current_anchor_path'] = DC(
                 str(current_anchor_path), cpu_only=True)
+        if online_input_path is not None:
+            sample['occworld_online_input_path'] = DC(
+                str(online_input_path), cpu_only=True)
         if history_state is not None:
             sample['history_world_state'] = DC(
                 history_state, stack=True, pad_dims=None)

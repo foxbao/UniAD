@@ -7,9 +7,11 @@ import torch
 from projects.mmdet3d_plugin.datasets.kl_occworld_dataset import (
     discover_occworld_current_anchors,
     discover_occworld_labels,
+    discover_occworld_online_inputs,
     load_occworld_current_anchor,
     load_occworld_current_observation,
     load_occworld_history,
+    load_occworld_online_input,
     load_occworld_split_references,
     load_occworld_supervision,
     load_occworld_target,
@@ -114,6 +116,36 @@ def test_current_anchor_loader_rejects_wrong_reference(tmp_path):
         assert 'expected 5' in str(error)
     else:
         raise AssertionError('Expected reference mismatch to fail')
+
+
+def test_complete_online_input_discovery_and_loader(tmp_path):
+    input_dir = tmp_path / '000005'
+    input_dir.mkdir(parents=True)
+    input_path = input_dir / 'occworld_online_input.npz'
+    current_state = np.asarray([[[1, 3, 2]]], dtype=np.uint8)
+    current_valid = np.asarray([[[1, 0, 1]]], dtype=np.uint8)
+    history_state = np.stack([current_state, current_state], axis=0)
+    history_valid = np.stack([current_valid, current_valid], axis=0)
+    np.savez_compressed(
+        input_path,
+        reference_index=np.int64(5),
+        current_world_state_3d=current_state,
+        current_world_valid_3d=current_valid,
+        history_world_state_3d=history_state,
+        history_world_valid_3d=history_valid)
+
+    mapping = discover_occworld_online_inputs(str(tmp_path))
+    loaded = load_occworld_online_input(
+        input_path,
+        current_shape=(1, 1, 3),
+        history_shape=(2, 1, 1, 3),
+        expected_reference_index=5)
+
+    assert mapping == {5: input_path}
+    assert loaded[0].flatten().tolist() == [1, 0, 2]
+    assert loaded[1].flatten().tolist() == [True, False, True]
+    assert loaded[2][:, 0, 0, 1].tolist() == [0, 0]
+    assert loaded[3].dtype == torch.bool
 
 
 def test_history_loader_keeps_order_and_ends_at_current(tmp_path):

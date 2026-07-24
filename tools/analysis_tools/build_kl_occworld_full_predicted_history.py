@@ -279,6 +279,8 @@ def parse_args():
             'outputs/patent_2026_occ/'
             'occworld_online_inputs_full_predicted_history_validation_v1'))
     parser.add_argument('--reference-indices', type=int, nargs='*')
+    parser.add_argument('--shard-count', type=int, default=1)
+    parser.add_argument('--shard-index', type=int, default=0)
     parser.add_argument(
         '--out-file', type=Path,
         default=Path(
@@ -313,6 +315,15 @@ def main():
     if not references:
         raise FileNotFoundError(
             f'No TrackFormer queues below {args.track_queue_root}')
+    if args.shard_count < 1:
+        raise ValueError('shard-count must be positive')
+    if not 0 <= args.shard_index < args.shard_count:
+        raise ValueError(
+            f'shard-index must be in [0,{args.shard_count}), got '
+            f'{args.shard_index}')
+    references = references[args.shard_index::args.shard_count]
+    if not references:
+        raise ValueError('Selected shard contains no references')
     rows = []
     for position, reference_index in enumerate(references, start=1):
         row = build_reference(
@@ -337,6 +348,8 @@ def main():
         'sequence_root': str(args.sequence_root),
         'history_root': str(args.history_root),
         'output_root': str(args.output_root),
+        'shard_count': args.shard_count,
+        'shard_index': args.shard_index,
         'aggregate': _aggregate(rows),
         'rows': rows,
     }
