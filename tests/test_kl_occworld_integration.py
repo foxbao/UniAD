@@ -5,6 +5,7 @@ import numpy as np
 import torch
 
 from projects.mmdet3d_plugin.datasets.kl_occworld_dataset import (
+    KlOccWorldDataset,
     discover_occworld_current_anchors,
     discover_occworld_labels,
     discover_occworld_online_inputs,
@@ -146,6 +147,19 @@ def test_complete_online_input_discovery_and_loader(tmp_path):
     assert loaded[1].flatten().tolist() == [True, False, True]
     assert loaded[2][:, 0, 0, 1].tolist() == [0, 0]
     assert loaded[3].dtype == torch.bool
+
+
+def test_mixed_online_input_sampling_uses_one_sample_level_choice(
+        monkeypatch):
+    dataset = object.__new__(KlOccWorldDataset)
+    dataset.occworld_online_inputs = {5: Path('online.npz')}
+    dataset.occworld_online_input_probability = 0.5
+
+    monkeypatch.setattr(np.random, 'random', lambda: 0.49)
+    assert dataset._sample_online_input()
+
+    monkeypatch.setattr(np.random, 'random', lambda: 0.51)
+    assert not dataset._sample_online_input()
 
 
 def test_history_loader_keeps_order_and_ends_at_current(tmp_path):

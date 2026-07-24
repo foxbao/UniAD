@@ -111,6 +111,8 @@ def build_reference(infos, metainfo: dict, reference_index: int,
         occ_size=args.occ_size,
         target_frame=str(metainfo.get('lidar_coord_frame', 'FLU')),
         collision_z=args.collision_z,
+        expected_step_s=args.expected_step_s,
+        max_time_error_s=args.max_time_error_s,
     )
     per_frame_instance = []
     output = None
@@ -122,15 +124,16 @@ def build_reference(infos, metainfo: dict, reference_index: int,
             diagnostics=True,
             boxes=boxes,
             instances=instances)
-        annotation_evidence = online.label_builder.build(
-            info, diagnostics=True)
-        overlap = _mask_overlap(
-            predicted_evidence['box_occupied_3d'] > 0,
-            annotation_evidence['box_occupied_3d'] > 0)
-        overlap.update({
+        overlap = {
             'frame_index': int(frame_index),
             'track_box_count': int(boxes.shape[0]),
-        })
+        }
+        if not args.skip_instance_overlap_audit:
+            annotation_evidence = online.label_builder.build(
+                info, diagnostics=True)
+            overlap.update(_mask_overlap(
+                predicted_evidence['box_occupied_3d'] > 0,
+                annotation_evidence['box_occupied_3d'] > 0))
         per_frame_instance.append(overlap)
         output = online.push_evidence(
             evidence=predicted_evidence,
@@ -204,17 +207,27 @@ def _aggregate(rows: list) -> dict:
     overlaps = [
         overlap for row in rows
         for overlap in row['per_frame_instance_overlap']
+        if 'intersection_voxels' in overlap
     ]
-    intersection = sum(item['intersection_voxels'] for item in overlaps)
+    intersection = sum(
+        item['intersection_voxels'] for item in overlaps)
     union = sum(item['union_voxels'] for item in overlaps)
     predicted = sum(item['predicted_voxels'] for item in overlaps)
     reference = sum(item['reference_voxels'] for item in overlaps)
     return {
         'reference_count': len(rows),
-        'frame_count': len(overlaps),
-        'instance_iou': intersection / union if union else 1.0,
-        'instance_precision': intersection / predicted if predicted else 0.0,
-        'instance_recall': intersection / reference if reference else 0.0,
+        'frame_count': sum(
+            len(row['per_frame_instance_overlap']) for row in rows),
+        'instance_overlap_audited_frame_count': len(overlaps),
+        'instance_iou': (
+            intersection / union if overlaps and union else
+            (1.0 if overlaps else None)),
+        'instance_precision': (
+            intersection / predicted if overlaps and predicted else
+            (0.0 if overlaps else None)),
+        'instance_recall': (
+            intersection / reference if overlaps and reference else
+            (0.0 if overlaps else None)),
         'mean_current_state_mismatch_ratio': float(np.mean([
             row['comparisons']['current_state_vs_annotation'][
                 'mismatch_ratio'] for row in rows
@@ -239,17 +252,23 @@ def _merge_reports(paths, out_file: Path):
     ]
     if not reports:
         raise ValueError('At least one report is required for merging')
+    metadata_keys = (
+        'protocol', 'ann_file', 'track_queue_root', 'sequence_root',
+        'history_root', 'output_root', 'instance_overlap_audit',
+        'expected_step_s', 'max_time_error_s')
+    baseline_metadata = {
+        key: reports[0].get(key) for key in metadata_keys
+    }
+    for report in reports[1:]:
+        metadata = {key: report.get(key) for key in metadata_keys}
+        if metadata != baseline_metadata:
+            raise ValueError('Shard reports use different input protocols')
     rows = [row for report in reports for row in report['rows']]
     references = [int(row['reference_index']) for row in rows]
     if len(references) != len(set(references)):
         raise ValueError('Merged reports contain duplicate references')
     rows.sort(key=lambda row: int(row['reference_index']))
-    report = {
-        key: reports[0][key]
-        for key in (
-            'protocol', 'ann_file', 'track_queue_root', 'sequence_root',
-            'history_root', 'output_root')
-    }
+    report = baseline_metadata
     report['aggregate'] = _aggregate(rows)
     report['rows'] = rows
     report['merged_from'] = [str(path) for path in paths]
@@ -297,6 +316,13 @@ def parse_args():
         '--occ-size', type=int, nargs=3, default=[160, 120, 10])
     parser.add_argument(
         '--collision-z', type=float, nargs=2, default=[0.3, 2.5])
+    parser.add_argument('--expected-step-s', type=float, default=0.5)
+    parser.add_argument('--max-time-error-s', type=float, default=0.2)
+    parser.add_argument(
+        '--skip-instance-overlap-audit', action='store_true',
+        help=(
+            'Skip the second annotation-box rasterization per frame; frozen '
+            'current/history mismatch metrics are still computed.'))
     return parser.parse_args()
 
 
@@ -341,8 +367,11 @@ def main():
             f"history_mismatch={row['comparisons']['history_state_vs_annotation']['mismatch_ratio']:.6f}")
     report = {
         'protocol': (
-            'five-frame sequential TrackFormer predicted boxes; validation '
-            'only; annotation sequence/history used only for audit metrics'),
+            'five-frame sequential TrackFormer predicted boxes; annotation '
+            'sequence/history used only for offline audit metrics'),
+        'instance_overlap_audit': not args.skip_instance_overlap_audit,
+        'expected_step_s': args.expected_step_s,
+        'max_time_error_s': args.max_time_error_s,
         'ann_file': str(args.ann_file),
         'track_queue_root': str(args.track_queue_root),
         'sequence_root': str(args.sequence_root),

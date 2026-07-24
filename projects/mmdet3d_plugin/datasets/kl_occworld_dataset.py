@@ -310,6 +310,7 @@ class KlOccWorldDataset(KlTrackDataset):
                  occworld_history_count: int = 5,
                  occworld_current_anchor_root: str = None,
                  occworld_online_input_root: str = None,
+                 occworld_online_input_probability: float = 1.0,
                  **kwargs):
         self.occworld_labels = discover_occworld_labels(
             occworld_label_root)
@@ -334,6 +335,11 @@ class KlOccWorldDataset(KlTrackDataset):
         self.occworld_history_count = int(occworld_history_count)
         if self.occworld_history_count < 1:
             raise ValueError('occworld_history_count must be positive')
+        self.occworld_online_input_probability = float(
+            occworld_online_input_probability)
+        if not 0.0 <= self.occworld_online_input_probability <= 1.0:
+            raise ValueError(
+                'occworld_online_input_probability must be within [0,1]')
         if (occworld_current_anchor_root is not None and
                 occworld_online_input_root is not None):
             raise ValueError(
@@ -355,7 +361,8 @@ class KlOccWorldDataset(KlTrackDataset):
             }
         self.occworld_histories = None
         if (occworld_history_root is not None and
-                self.occworld_online_inputs is None):
+                (self.occworld_online_inputs is None or
+                 self.occworld_online_input_probability < 1.0)):
             histories = discover_occworld_histories(
                 occworld_history_root)
             missing = sorted(
@@ -368,6 +375,11 @@ class KlOccWorldDataset(KlTrackDataset):
                 reference: histories[reference]
                 for reference in self.occworld_labels
             }
+        if (self.occworld_online_inputs is not None and
+                self.occworld_online_input_probability < 1.0 and
+                self.occworld_histories is None):
+            raise ValueError(
+                'Mixed online-input sampling requires annotation history')
         self.occworld_current_anchors = None
         if occworld_current_anchor_root is not None:
             anchors = discover_occworld_current_anchors(
@@ -415,6 +427,14 @@ class KlOccWorldDataset(KlTrackDataset):
                 return data
         return None
 
+    def _sample_online_input(self) -> bool:
+        if self.occworld_online_inputs is None:
+            return False
+        if self.occworld_online_input_probability >= 1.0:
+            return True
+        return bool(
+            np.random.random() < self.occworld_online_input_probability)
+
     def _union2one(self, queue, raw_meta):
         sample = super()._union2one(queue, raw_meta)
         reference_index = int(raw_meta[-1]['sample_idx'])
@@ -433,7 +453,8 @@ class KlOccWorldDataset(KlTrackDataset):
         history_path = None
         history_state = None
         history_valid = None
-        if self.occworld_online_inputs is not None:
+        use_online_input = self._sample_online_input()
+        if use_online_input:
             online_input_path = self.occworld_online_inputs[reference_index]
             current_state, current_valid, history_state, history_valid = (
                 load_occworld_online_input(
@@ -449,8 +470,7 @@ class KlOccWorldDataset(KlTrackDataset):
                 current_anchor_path,
                 self.occworld_expected_shape[1:],
                 expected_reference_index=reference_index)
-        if (self.occworld_online_inputs is None and
-                self.occworld_histories is not None):
+        if not use_online_input and self.occworld_histories is not None:
             history_path = self.occworld_histories[reference_index]
             history_state, history_valid = load_occworld_history(
                 history_path,
