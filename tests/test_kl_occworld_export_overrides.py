@@ -113,3 +113,15 @@ def test_exporter_exposes_opt_in_query_dynamic_diagnostic(monkeypatch):
     args = parse_args()
 
     assert args.save_query_dynamic_diagnostic
+
+
+def test_exporter_exposes_opt_in_query_residual_ablation(monkeypatch):
+    monkeypatch.setattr(sys, 'argv', [
+        'export_kl_occworld_predictions.py',
+        '--checkpoint', 'candidate.pth',
+        '--save-query-residual-ablation',
+    ])
+
+    args = parse_args()
+
+    assert args.save_query_residual_ablation

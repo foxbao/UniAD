@@ -862,6 +862,7 @@ class DenseWorldDecoder(nn.Module):
             future_logits = torch.where(
                 observation_known[:, None, None],
                 gated_known_logits, future_logits)
+        future_logits_without_query_adapter = future_logits
         if self.query_occupancy_adapter is not None:
             if dynamic_occupancy_probability is None:
                 raise ValueError(
@@ -902,8 +903,15 @@ class DenseWorldDecoder(nn.Module):
                 physical_confidence_logits = (
                     physical_confidence_logits + signal_residual)
         world_logits = torch.cat([current_logits, future_logits], dim=1)
+        world_logits_without_query_adapter = None
+        if self.query_occupancy_adapter is not None:
+            world_logits_without_query_adapter = torch.cat([
+                current_logits, future_logits_without_query_adapter,
+            ], dim=1)
         return {
             'world_logits': world_logits,
+            'world_logits_without_query_adapter': (
+                world_logits_without_query_adapter),
             'current_logits': current_logits,
             'future_residual': future_residual,
             'valid_logits': valid_logits,
@@ -1500,6 +1508,20 @@ class OccWorldHead(OccHead):
             history_world_valid=history_world_valid)
         outputs.update(world_outputs)
         raw_world_prediction = world_outputs['world_logits'].argmax(dim=2)
+        world_prediction = self._fuse_world_prediction(
+            raw_world_prediction, world_outputs)
+        ablation_logits = world_outputs[
+            'world_logits_without_query_adapter']
+        if ablation_logits is not None:
+            outputs['query_adapter_ablation_world_pred'] = (
+                self._fuse_world_prediction(
+                    ablation_logits.argmax(dim=2), world_outputs))
+        outputs['world_pred'] = world_prediction
+        outputs['world_valid_probability'] = world_outputs[
+            'valid_logits'].sigmoid()
+        return outputs
+
+    def _fuse_world_prediction(self, raw_world_prediction, world_outputs):
         world_prediction = raw_world_prediction
         if self.world_physical_confidence_threshold is not None:
             physical_prediction = apply_physical_flow_fusion(
@@ -1529,7 +1551,4 @@ class OccWorldHead(OccHead):
                 world_outputs['warped_instance_probability'],
                 threshold=self.world_physical_flow_fusion_threshold,
                 instance_class=self.world_class_count - 1)
-        outputs['world_pred'] = world_prediction
-        outputs['world_valid_probability'] = world_outputs[
-            'valid_logits'].sigmoid()
-        return outputs
+        return world_prediction

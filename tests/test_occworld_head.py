@@ -589,6 +589,9 @@ def test_query_occupancy_adapter_is_exact_zero_residual_at_initialization():
 
     assert torch.equal(
         adapted_output['world_logits'], base_output['world_logits'])
+    assert torch.equal(
+        adapted_output['world_logits_without_query_adapter'],
+        base_output['world_logits'])
     assert torch.count_nonzero(
         adapted_output['query_instance_residual']) == 0
 
@@ -618,6 +621,8 @@ def test_query_occupancy_adapter_only_changes_future_instance_logits():
     torch.testing.assert_close(
         difference[:, 1:, 2],
         torch.full_like(difference[:, 1:, 2], 0.75))
+    assert torch.equal(
+        output['world_logits_without_query_adapter'], base_logits)
     output['world_logits'].sum().backward()
     assert torch.count_nonzero(
         adapted.query_occupancy_adapter.weight.grad) > 0

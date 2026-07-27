@@ -220,6 +220,7 @@ def export_checkpoint(model, wrapped_model, loader, dataset,
                       save_track_boxes: bool = False,
                       save_raw_world_prediction: bool = False,
                       save_query_dynamic_diagnostic: bool = False,
+                      save_query_residual_ablation: bool = False,
                       track_score_threshold: float = 0.1,
                       current_anchor_root: Path = None,
                       online_input_root: Path = None):
@@ -260,6 +261,15 @@ def export_checkpoint(model, wrapped_model, loader, dataset,
             raise RuntimeError(
                 f'Incomplete OccWorld output for {reference_index}')
         prediction = occ['world_pred'].detach().cpu()
+        query_residual_ablation = None
+        if save_query_residual_ablation:
+            query_residual_ablation = occ.get(
+                'query_adapter_ablation_world_pred')
+            if query_residual_ablation is None:
+                raise RuntimeError(
+                    'Query-residual ablation requires an enabled adapter')
+            query_residual_ablation = (
+                query_residual_ablation.detach().cpu())
         raw_prediction = None
         if save_raw_world_prediction:
             if 'world_logits' not in occ:
@@ -317,6 +327,14 @@ def export_checkpoint(model, wrapped_model, loader, dataset,
             raise ValueError(
                 f'Unexpected world prediction shape {prediction.shape}')
         prediction = prediction[0].numpy().astype(np.uint8, copy=False)
+        if query_residual_ablation is not None:
+            if query_residual_ablation.shape != prediction[None].shape:
+                raise ValueError(
+                    'Unexpected query-residual ablation shape '
+                    f'{query_residual_ablation.shape}')
+            query_residual_ablation = (
+                query_residual_ablation[0].numpy().astype(
+                    np.uint8, copy=False))
         if raw_prediction is not None:
             if raw_prediction.shape != prediction[None].shape:
                 raise ValueError(
@@ -406,6 +424,9 @@ def export_checkpoint(model, wrapped_model, loader, dataset,
             world_valid_probability_3d=valid_probability)
         if raw_prediction is not None:
             payload['raw_world_pred_class_3d'] = raw_prediction
+        if query_residual_ablation is not None:
+            payload['query_adapter_ablation_world_pred_class_3d'] = (
+                query_residual_ablation)
         if query_dynamic_probability is not None:
             payload['query_dynamic_probability_2d'] = (
                 query_dynamic_probability)
@@ -510,6 +531,9 @@ def parse_args():
         '--save-query-dynamic-diagnostic', action='store_true',
         help='Save query OCC and observation signals for validation audits.')
     parser.add_argument(
+        '--save-query-residual-ablation', action='store_true',
+        help='Save paired adapter-off semantics from the same forward pass.')
+    parser.add_argument(
         '--track-score-threshold', type=float, default=0.1)
     parser.add_argument(
         '--current-anchor-root', type=Path,
@@ -559,6 +583,8 @@ def main():
             save_raw_world_prediction=args.save_raw_world_prediction,
             save_query_dynamic_diagnostic=(
                 args.save_query_dynamic_diagnostic),
+            save_query_residual_ablation=(
+                args.save_query_residual_ablation),
             track_score_threshold=args.track_score_threshold,
             current_anchor_root=args.current_anchor_root,
             online_input_root=args.online_input_root)
