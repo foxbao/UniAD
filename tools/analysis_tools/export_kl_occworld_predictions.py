@@ -218,6 +218,7 @@ def export_checkpoint(model, wrapped_model, loader, dataset,
                       checkpoint_path: Path, split: str,
                       output_root: Path,
                       save_track_boxes: bool = False,
+                      save_raw_world_prediction: bool = False,
                       track_score_threshold: float = 0.1,
                       current_anchor_root: Path = None,
                       online_input_root: Path = None):
@@ -258,6 +259,13 @@ def export_checkpoint(model, wrapped_model, loader, dataset,
             raise RuntimeError(
                 f'Incomplete OccWorld output for {reference_index}')
         prediction = occ['world_pred'].detach().cpu()
+        raw_prediction = None
+        if save_raw_world_prediction:
+            if 'world_logits' not in occ:
+                raise RuntimeError(
+                    f'No raw world logits for reference {reference_index}')
+            raw_prediction = occ['world_logits'].argmax(
+                dim=2).detach().cpu()
         valid_probability = occ[
             'world_valid_probability'].detach().cpu()
         future_change_logits = occ.get('future_change_logits')
@@ -291,6 +299,12 @@ def export_checkpoint(model, wrapped_model, loader, dataset,
             raise ValueError(
                 f'Unexpected world prediction shape {prediction.shape}')
         prediction = prediction[0].numpy().astype(np.uint8, copy=False)
+        if raw_prediction is not None:
+            if raw_prediction.shape != prediction[None].shape:
+                raise ValueError(
+                    f'Unexpected raw prediction shape {raw_prediction.shape}')
+            raw_prediction = raw_prediction[0].numpy().astype(
+                np.uint8, copy=False)
         valid_probability = valid_probability[0].numpy().astype(
             np.float32, copy=False)
         if future_change_probability is not None:
@@ -352,6 +366,8 @@ def export_checkpoint(model, wrapped_model, loader, dataset,
             checkpoint_epoch=np.int64(epoch),
             world_pred_class_3d=prediction,
             world_valid_probability_3d=valid_probability)
+        if raw_prediction is not None:
+            payload['raw_world_pred_class_3d'] = raw_prediction
         if anchor_path is not None:
             payload['current_anchor_override'] = np.asarray(True)
             payload['current_anchor_path'] = np.asarray(str(anchor_path))
@@ -445,6 +461,9 @@ def parse_args():
         '--save-track-boxes', action='store_true',
         help='Save filtered current TrackFormer boxes in each prediction.')
     parser.add_argument(
+        '--save-raw-world-prediction', action='store_true',
+        help='Save pre-overlay argmax semantics for validation diagnostics.')
+    parser.add_argument(
         '--track-score-threshold', type=float, default=0.1)
     parser.add_argument(
         '--current-anchor-root', type=Path,
@@ -491,6 +510,7 @@ def main():
             split=args.split,
             output_root=args.output_root,
             save_track_boxes=args.save_track_boxes,
+            save_raw_world_prediction=args.save_raw_world_prediction,
             track_score_threshold=args.track_score_threshold,
             current_anchor_root=args.current_anchor_root,
             online_input_root=args.online_input_root)

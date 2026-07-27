@@ -89,3 +89,15 @@ def test_exporter_preserves_fresh_holdout_split_name(monkeypatch):
     args = parse_args()
 
     assert args.split == 'fresh_holdout'
+
+
+def test_exporter_exposes_opt_in_raw_prediction_diagnostic(monkeypatch):
+    monkeypatch.setattr(sys, 'argv', [
+        'export_kl_occworld_predictions.py',
+        '--checkpoint', 'candidate.pth',
+        '--save-raw-world-prediction',
+    ])
+
+    args = parse_args()
+
+    assert args.save_raw_world_prediction

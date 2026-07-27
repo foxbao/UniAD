@@ -860,6 +860,28 @@ def selected_world_cross_entropy(
         class_weights=class_weights)
 
 
+def stable_known_world_selection(
+        observation_known: torch.Tensor,
+        observation_class: torch.Tensor,
+        future_target: torch.Tensor,
+        ignore_index: int = 255) -> torch.Tensor:
+    """Select observed voxels whose future semantic state stays unchanged."""
+    if observation_known.shape != observation_class.shape:
+        raise ValueError(
+            'Observation known mask and class map must have matching shapes')
+    if future_target.ndim != observation_class.ndim + 1:
+        raise ValueError(
+            'Future world target must add one time dimension')
+    if (future_target.shape[0] != observation_class.shape[0] or
+            future_target.shape[2:] != observation_class.shape[1:]):
+        raise ValueError(
+            'Observation and future world target shapes are incompatible')
+    return (
+        observation_known.bool()[:, None] &
+        (future_target != ignore_index) &
+        (future_target == observation_class[:, None]))
+
+
 def selected_binary_cross_entropy_with_logits(
         logits: torch.Tensor,
         target: torch.Tensor,
@@ -927,6 +949,7 @@ class OccWorldHead(OccHead):
                  world_current_loss_weight: float = 1.0,
                  world_future_loss_weight: float = 1.0,
                  world_future_transition_loss_weight: float = 0.0,
+                 world_future_stability_loss_weight: float = 0.0,
                  world_future_change_gate_loss_weight: float = 0.0,
                  world_future_changed_class_loss_weight: float = 0.0,
                  world_future_change_positive_weight: float = 10.0,
@@ -967,6 +990,7 @@ class OccWorldHead(OccHead):
             world_loss_weight, world_current_loss_weight,
             world_future_loss_weight,
             world_future_transition_loss_weight,
+            world_future_stability_loss_weight,
             world_future_change_gate_loss_weight,
             world_future_changed_class_loss_weight,
             world_flow_loss_weight,
@@ -990,6 +1014,8 @@ class OccWorldHead(OccHead):
         self.world_future_loss_weight = float(world_future_loss_weight)
         self.world_future_transition_loss_weight = float(
             world_future_transition_loss_weight)
+        self.world_future_stability_loss_weight = float(
+            world_future_stability_loss_weight)
         self.world_future_change_gate_loss_weight = float(
             world_future_change_gate_loss_weight)
         self.world_future_changed_class_loss_weight = float(
@@ -1191,6 +1217,24 @@ class OccWorldHead(OccHead):
             losses['loss_world_future_transition_ce'] = (
                 transition_loss * self.world_loss_weight *
                 self.world_future_transition_loss_weight)
+        if self.world_future_stability_loss_weight > 0:
+            observation_known = outputs['observation_known_mask']
+            observation_class = outputs['observation_class']
+            if observation_known is None or observation_class is None:
+                raise ValueError(
+                    'Stability loss requires the observation anchor')
+            future_target = gt_world_occ[:, 1:]
+            stable_known = stable_known_world_selection(
+                observation_known, observation_class, future_target,
+                ignore_index=self.world_ignore_index)
+            stability_loss = selected_world_cross_entropy(
+                outputs['world_logits'][:, 1:], future_target,
+                stable_known,
+                ignore_index=self.world_ignore_index,
+                class_weights=class_weights)
+            losses['loss_world_future_stability_ce'] = (
+                stability_loss * self.world_loss_weight *
+                self.world_future_stability_loss_weight)
         gate_loss_enabled = self.world_future_change_gate_loss_weight > 0
         changed_loss_enabled = (
             self.world_future_changed_class_loss_weight > 0)

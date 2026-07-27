@@ -23,6 +23,7 @@ from projects.mmdet3d_plugin.uniad.dense_heads.occworld_head import (
     selected_binary_cross_entropy_with_logits,
     selected_smooth_l1_loss,
     selected_world_cross_entropy,
+    stable_known_world_selection,
     world_visibility_binary_cross_entropy,
 )
 from projects.mmdet3d_plugin.uniad.dense_heads.occ_head import OccHead
@@ -620,6 +621,67 @@ def test_selected_world_cross_entropy_only_backpropagates_on_subset():
     assert torch.count_nonzero(logits.grad[..., 0]).item() == 0
     assert torch.count_nonzero(logits.grad[..., 1]).item() > 0
     assert torch.count_nonzero(logits.grad[..., 2]).item() == 0
+
+
+def test_stable_known_world_selection_excludes_changes_and_unknowns():
+    observation_known = torch.tensor([[[[True, True, True, False]]]])
+    observation_class = torch.tensor([[[[0, 1, 2, 1]]]])
+    future_target = torch.tensor([
+        [[[[0, 2, 255, 1]]],
+         [[[1, 1, 2, 1]]]],
+    ])
+
+    selection = stable_known_world_selection(
+        observation_known, observation_class, future_target)
+
+    expected = torch.tensor([
+        [[[[True, False, False, False]]],
+         [[[False, True, True, False]]]],
+    ])
+    assert torch.equal(selection, expected)
+
+
+def test_occworld_stability_loss_only_backpropagates_on_stable_known_voxels():
+    head = SimpleNamespace(
+        world_class_weights=torch.tensor([]),
+        world_ignore_index=255,
+        world_valid_positive_weight=1.0,
+        world_loss_weight=1.0,
+        world_current_loss_weight=0.0,
+        world_future_loss_weight=0.0,
+        world_visibility_loss_weight=0.0,
+        world_future_transition_loss_weight=0.0,
+        world_future_stability_loss_weight=1.0,
+        world_future_change_gate_loss_weight=0.0,
+        world_future_changed_class_loss_weight=0.0,
+        world_flow_loss_weight=0.0,
+        world_physical_confidence_loss_weight=0.0)
+    world_logits = torch.zeros(
+        (1, 3, 3, 1, 1, 4), requires_grad=True)
+    outputs = {
+        'world_logits': world_logits,
+        'valid_logits': torch.zeros((1, 3, 1, 1, 4)),
+        'observation_known_mask': torch.tensor(
+            [[[[True, True, True, False]]]]),
+        'observation_class': torch.tensor([[[[0, 1, 2, 1]]]]),
+    }
+    target = torch.tensor([
+        [[[[0, 1, 2, 255]]],
+         [[[0, 2, 255, 1]]],
+         [[[1, 1, 2, 1]]]],
+    ])
+    valid = target != 255
+
+    losses = OccWorldHead.loss_world(head, outputs, target, valid)
+    assert 'loss_world_future_stability_ce' in losses
+    losses['loss_world_future_stability_ce'].backward()
+
+    future_gradient = world_logits.grad[:, 1:]
+    assert torch.count_nonzero(future_gradient[..., 0]).item() > 0
+    assert torch.count_nonzero(future_gradient[:, 0, ..., 1]).item() == 0
+    assert torch.count_nonzero(future_gradient[:, 1, ..., 1]).item() > 0
+    assert torch.count_nonzero(future_gradient[:, 1, ..., 2]).item() > 0
+    assert torch.count_nonzero(future_gradient[..., 3]).item() == 0
 
 
 def test_selected_binary_cross_entropy_only_uses_selected_voxels():

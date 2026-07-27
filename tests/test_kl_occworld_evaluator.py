@@ -275,6 +275,29 @@ def test_evaluator_accepts_exported_semantic_and_visibility_predictions(
     assert hard_result['semantic']['overall']['accuracy'] == 1.0
 
 
+def test_evaluator_can_read_opt_in_raw_prediction_key(tmp_path):
+    label_path = _write_evaluation_label(tmp_path / 'labels')
+    prediction_path = tmp_path / 'toy__occworld_prediction.npz'
+    raw_prediction = np.asarray([
+        [[[0, 1, 2]]],
+        [[[1, 1, 2]]],
+    ], dtype=np.uint8)
+    np.savez_compressed(
+        prediction_path,
+        reference_index=np.int64(7),
+        world_pred_class_3d=np.zeros_like(raw_prediction),
+        raw_world_pred_class_3d=raw_prediction)
+
+    result = evaluate_split(
+        manifest=_manifest(), split='test',
+        sequence_mapping={7: label_path},
+        prediction_mapping={7: prediction_path},
+        prediction_class_key='raw_world_pred_class_3d')
+
+    assert result['prediction_class_key'] == 'raw_world_pred_class_3d'
+    assert result['semantic']['overall']['accuracy'] == 1.0
+
+
 def test_evaluator_separates_completion_only_and_flow_only(tmp_path):
     label_path = _write_evaluation_label(tmp_path / 'labels')
     prediction_path = tmp_path / 'toy__occworld_prediction.npz'

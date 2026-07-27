@@ -107,18 +107,19 @@ def _persistence_prediction(
 
 def _load_model_prediction(
         path: Path,
-        expected_shape: Sequence[int]) -> Tuple[torch.Tensor,
+        expected_shape: Sequence[int],
+        prediction_class_key: str = PREDICTION_CLASS_KEY) -> Tuple[torch.Tensor,
                                                 Optional[torch.Tensor],
                                                 Optional[torch.Tensor],
                                                 Optional[torch.Tensor],
                                                 Optional[torch.Tensor],
                                                 Optional[torch.Tensor]]:
     with np.load(path, allow_pickle=False) as archive:
-        if PREDICTION_CLASS_KEY not in archive.files:
+        if prediction_class_key not in archive.files:
             raise ValueError(
-                f'{path} has no {PREDICTION_CLASS_KEY}')
+                f'{path} has no {prediction_class_key}')
         prediction = np.asarray(
-            archive[PREDICTION_CLASS_KEY], dtype=np.int64)
+            archive[prediction_class_key], dtype=np.int64)
         valid_probability = None
         if PREDICTION_VALID_PROBABILITY_KEY in archive.files:
             valid_probability = np.asarray(
@@ -303,7 +304,8 @@ def evaluate_split(
         flow_fusion_threshold: float = 0.5,
         apply_physical_confidence: bool = False,
         physical_confidence_threshold: float = 0.5,
-        physical_confidence_flow_threshold: float = 0.5) -> Dict[str, object]:
+        physical_confidence_flow_threshold: float = 0.5,
+        prediction_class_key: str = PREDICTION_CLASS_KEY) -> Dict[str, object]:
     """Evaluate persistence or pre-exported model predictions."""
     if not 0.0 <= visibility_threshold <= 1.0:
         raise ValueError('Visibility threshold must be in [0, 1]')
@@ -387,7 +389,8 @@ def evaluate_split(
              changed_class_prediction,
              warped_instance_probability,
              physical_confidence_probability) = _load_model_prediction(
-                 prediction_mapping[reference_index], target.shape)
+                 prediction_mapping[reference_index], target.shape,
+                 prediction_class_key=prediction_class_key)
         sample_visibility_available = visibility_probability is not None
         if visibility_available is None:
             visibility_available = sample_visibility_available
@@ -650,6 +653,8 @@ def evaluate_split(
         'prediction_source': (
             'constant_current_persistence'
             if prediction_mapping is None else 'exported_model_prediction'),
+        'prediction_class_key': (
+            None if prediction_mapping is None else prediction_class_key),
         'hard_change_gate_applied': bool(apply_change_gate),
         'completion_only_applied': bool(apply_completion_only),
         'flow_only_applied': bool(apply_flow_only),
@@ -708,6 +713,9 @@ def parse_args():
             'fresh_holdout'),
         default='test')
     parser.add_argument('--prediction-root', type=Path)
+    parser.add_argument(
+        '--prediction-class-key', default=PREDICTION_CLASS_KEY,
+        help='NPZ semantic class key; raw diagnostics are opt-in.')
     parser.add_argument('--visibility-threshold', type=float, default=0.5)
     parser.add_argument('--change-gate-threshold', type=float, default=0.5)
     parser.add_argument('--apply-change-gate', action='store_true')
@@ -753,7 +761,8 @@ def main():
         physical_confidence_threshold=(
             args.physical_confidence_threshold),
         physical_confidence_flow_threshold=(
-            args.physical_confidence_flow_threshold))
+            args.physical_confidence_flow_threshold),
+        prediction_class_key=args.prediction_class_key)
     args.out_file.parent.mkdir(parents=True, exist_ok=True)
     with args.out_file.open('w') as output:
         json.dump(summary, output, ensure_ascii=False, indent=2)
