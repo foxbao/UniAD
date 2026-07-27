@@ -422,6 +422,8 @@ class DenseWorldDecoder(nn.Module):
                  use_future_change_gate: bool = False,
                  future_change_prior: float = 0.01,
                  dynamic_change_logit_scale: float = 0.0,
+                 use_query_occupancy_adapter: bool = False,
+                 query_occupancy_adapter_scale: float = 1.0,
                  history_count: int = 0,
                  use_wide_history_context: bool = False,
                  use_flow_warp: bool = False,
@@ -479,6 +481,13 @@ class DenseWorldDecoder(nn.Module):
                 'Dynamic change logit scale must be non-negative')
         self.dynamic_change_logit_scale = float(
             dynamic_change_logit_scale)
+        self.use_query_occupancy_adapter = bool(
+            use_query_occupancy_adapter)
+        if query_occupancy_adapter_scale < 0:
+            raise ValueError(
+                'Query occupancy adapter scale must be non-negative')
+        self.query_occupancy_adapter_scale = float(
+            query_occupancy_adapter_scale)
         self.history_count = int(history_count)
         if self.history_count < 0:
             raise ValueError('History count must be non-negative')
@@ -562,6 +571,14 @@ class DenseWorldDecoder(nn.Module):
             hidden_channels,
             self.horizon_count * self.z_count,
             kernel_size=1)
+        if self.use_query_occupancy_adapter:
+            self.query_occupancy_adapter = nn.Conv2d(
+                self.horizon_count,
+                self.future_count * self.z_count,
+                kernel_size=1,
+                bias=False)
+        else:
+            self.query_occupancy_adapter = None
         if self.use_future_change_gate:
             self.future_change_head = nn.Conv2d(
                 hidden_channels,
@@ -615,6 +632,8 @@ class DenseWorldDecoder(nn.Module):
         if self.use_flow_warp:
             nn.init.zeros_(self.future_flow_head.weight)
             nn.init.zeros_(self.future_flow_head.bias)
+        if self.query_occupancy_adapter is not None:
+            nn.init.zeros_(self.query_occupancy_adapter.weight)
         if self.history_context_encoder is not None:
             nn.init.zeros_(self.history_context_encoder[-1].weight)
             nn.init.zeros_(self.history_context_encoder[-1].bias)
@@ -773,6 +792,7 @@ class DenseWorldDecoder(nn.Module):
         warped_instance_probability = None
         flow_change_prior = None
         physical_confidence_logits = None
+        query_instance_residual = None
         if dynamic_occupancy_probability is not None:
             expected_dynamic_shape = (
                 batch_size, self.horizon_count, height, width)
@@ -842,6 +862,23 @@ class DenseWorldDecoder(nn.Module):
             future_logits = torch.where(
                 observation_known[:, None, None],
                 gated_known_logits, future_logits)
+        if self.query_occupancy_adapter is not None:
+            if dynamic_occupancy_probability is None:
+                raise ValueError(
+                    'Query occupancy adapter requires dynamic occupancy')
+            query_instance_residual = self.query_occupancy_adapter(
+                dynamic_occupancy_probability *
+                self.query_occupancy_adapter_scale).reshape(
+                    batch_size, self.future_count, self.z_count,
+                    height, width)
+            instance_selector = F.one_hot(
+                torch.as_tensor(
+                    self.class_count - 1,
+                    device=future_logits.device),
+                num_classes=self.class_count).to(future_logits)
+            future_logits = future_logits + (
+                query_instance_residual[:, :, None] *
+                instance_selector.view(1, 1, self.class_count, 1, 1, 1))
         if self.use_physical_confidence:
             physical_confidence_logits = self.physical_confidence_head(
                 features).reshape(
@@ -876,6 +913,7 @@ class DenseWorldDecoder(nn.Module):
             'future_changed_class_logits': future_changed_class_logits,
             'dynamic_occupancy_probability': dynamic_occupancy_probability,
             'dynamic_change_prior': dynamic_change_prior,
+            'query_instance_residual': query_instance_residual,
             'history_features': history_features,
             'history_context_features': history_context_features,
             'future_flow': future_flow,
@@ -1033,6 +1071,8 @@ class OccWorldHead(OccHead):
                  world_use_future_change_gate: bool = False,
                  world_future_change_prior: float = 0.01,
                  world_dynamic_change_logit_scale: float = 0.0,
+                 world_use_query_occupancy_adapter: bool = False,
+                 world_query_occupancy_adapter_scale: float = 1.0,
                  world_history_count: int = 0,
                  world_use_wide_history_context: bool = False,
                  world_use_flow_warp: bool = False,
@@ -1163,6 +1203,10 @@ class OccWorldHead(OccHead):
             future_change_prior=world_future_change_prior,
             dynamic_change_logit_scale=(
                 world_dynamic_change_logit_scale),
+            use_query_occupancy_adapter=(
+                world_use_query_occupancy_adapter),
+            query_occupancy_adapter_scale=(
+                world_query_occupancy_adapter_scale),
             history_count=world_history_count,
             use_wide_history_context=world_use_wide_history_context,
             use_flow_warp=world_use_flow_warp,

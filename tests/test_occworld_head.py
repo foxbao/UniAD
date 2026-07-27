@@ -568,6 +568,84 @@ def test_candidate_signal_confidence_is_zero_residual_at_initialization():
         decoder.physical_confidence_signal_head[-1].weight.grad) > 0
 
 
+def test_query_occupancy_adapter_is_exact_zero_residual_at_initialization():
+    base = DenseWorldDecoder(
+        in_channels=4, hidden_channels=3,
+        horizon_count=3, class_count=3, z_count=2)
+    adapted = DenseWorldDecoder(
+        in_channels=4, hidden_channels=3,
+        horizon_count=3, class_count=3, z_count=2,
+        use_query_occupancy_adapter=True)
+    missing, unexpected = adapted.load_state_dict(
+        base.state_dict(), strict=False)
+    assert unexpected == []
+    assert missing == ['query_occupancy_adapter.weight']
+    feature = torch.randn(1, 4, 2, 3)
+    query_probability = torch.rand(1, 3, 2, 3)
+
+    base_output = base(feature)
+    adapted_output = adapted(
+        feature, dynamic_occupancy_probability=query_probability)
+
+    assert torch.equal(
+        adapted_output['world_logits'], base_output['world_logits'])
+    assert torch.count_nonzero(
+        adapted_output['query_instance_residual']) == 0
+
+
+def test_query_occupancy_adapter_only_changes_future_instance_logits():
+    base = DenseWorldDecoder(
+        in_channels=4, hidden_channels=3,
+        horizon_count=2, class_count=3, z_count=2)
+    adapted = DenseWorldDecoder(
+        in_channels=4, hidden_channels=3,
+        horizon_count=2, class_count=3, z_count=2,
+        use_query_occupancy_adapter=True)
+    adapted.load_state_dict(base.state_dict(), strict=False)
+    with torch.no_grad():
+        adapted.query_occupancy_adapter.weight.fill_(1.0)
+    feature = torch.randn(1, 4, 1, 2)
+    query_probability = torch.tensor([[[[0.25, 0.25]],
+                                       [[0.50, 0.50]]]])
+
+    base_logits = base(feature)['world_logits']
+    output = adapted(
+        feature, dynamic_occupancy_probability=query_probability)
+    difference = output['world_logits'] - base_logits
+
+    assert torch.count_nonzero(difference[:, :1]) == 0
+    assert torch.count_nonzero(difference[:, 1:, :2]) == 0
+    torch.testing.assert_close(
+        difference[:, 1:, 2],
+        torch.full_like(difference[:, 1:, 2], 0.75))
+    output['world_logits'].sum().backward()
+    assert torch.count_nonzero(
+        adapted.query_occupancy_adapter.weight.grad) > 0
+
+
+def test_query_occupancy_adapter_zero_scale_is_exact_ablation():
+    base = DenseWorldDecoder(
+        in_channels=4, hidden_channels=3,
+        horizon_count=2, class_count=3, z_count=1)
+    adapted = DenseWorldDecoder(
+        in_channels=4, hidden_channels=3,
+        horizon_count=2, class_count=3, z_count=1,
+        use_query_occupancy_adapter=True,
+        query_occupancy_adapter_scale=0.0)
+    adapted.load_state_dict(base.state_dict(), strict=False)
+    with torch.no_grad():
+        adapted.query_occupancy_adapter.weight.normal_()
+    feature = torch.randn(1, 4, 2, 2)
+    query_probability = torch.rand(1, 2, 2, 2)
+
+    base_logits = base(feature)['world_logits']
+    adapted_logits = adapted(
+        feature,
+        dynamic_occupancy_probability=query_probability)['world_logits']
+
+    assert torch.equal(adapted_logits, base_logits)
+
+
 def test_physical_confidence_signal_tensor_has_candidate_level_shape():
     future_logits = torch.zeros((1, 2, 3, 2, 2, 3))
     future_logits[:, :, 2] = 1.0
