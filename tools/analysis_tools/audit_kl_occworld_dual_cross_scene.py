@@ -149,6 +149,11 @@ def parse_args():
         help=(
             'Optional frozen evidence pool. Labels in this directory only '
             'contribute cross-scene support and are never written.'))
+    parser.add_argument(
+        '--support-ann-file',
+        help=(
+            'Annotation that owns support indices. Defaults to --ann-file '
+            'when target and support come from the same annotation.'))
     parser.add_argument('--support-indices', type=int, nargs='+')
     parser.add_argument('--match-radius', type=float, default=1.2)
     parser.add_argument('--min-support-frames', type=int, default=2)
@@ -196,7 +201,14 @@ def main():
     if bool(args.support_dual_dir) != bool(args.support_indices):
         raise ValueError(
             '--support-dual-dir and --support-indices must be used together')
+    if args.support_ann_file and not args.support_dual_dir:
+        raise ValueError(
+            '--support-ann-file requires --support-dual-dir')
     if args.support_dual_dir:
+        support_infos = infos
+        if args.support_ann_file:
+            support_infos, _ = _load_infos(
+                _resolve_path(args.support_ann_file))
         support_map = _index_dual_labels(Path(args.support_dual_dir))
         support_indices = list(dict.fromkeys(args.support_indices))
         missing_support = [
@@ -205,9 +217,17 @@ def main():
         if missing_support:
             raise ValueError(
                 f'Missing support dual labels: {missing_support}')
+        invalid_support = [
+            index for index in support_indices
+            if not 0 <= index < len(support_infos)
+        ]
+        if invalid_support:
+            raise ValueError(
+                f'Support indices are outside support annotation: '
+                f'{invalid_support}')
         target_scenes = set(group_ids)
         support_scenes = {
-            str(infos[index].get('scene_token', index))
+            str(support_infos[index].get('scene_token', index))
             for index in support_indices
         }
         if target_scenes.intersection(support_scenes):
@@ -222,9 +242,9 @@ def main():
                     (support_label['map_drivable_prior_bev'] == 0))
                 pc_range = support_label['pc_range']
             point_sets.append(_bev_mask_to_global_xy(
-                candidate, infos[index]['ego2global'], pc_range))
+                candidate, support_infos[index]['ego2global'], pc_range))
             group_ids.append(
-                str(infos[index].get('scene_token', index)))
+                str(support_infos[index].get('scene_token', index)))
 
     support_sets = _cross_frame_support(
         point_sets, radius=args.match_radius,

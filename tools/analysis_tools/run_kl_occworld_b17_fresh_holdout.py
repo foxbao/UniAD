@@ -176,6 +176,7 @@ def prepare_evaluation_manifest(
         'roots': _root_mapping(),
         'cross_scene_support': {
             'source_split': 'train',
+            'annotation_file': existing['annotation_file'],
             'dual_dir': existing['roots']['dual'],
             'reference_indices': [
                 int(row['reference_index'])

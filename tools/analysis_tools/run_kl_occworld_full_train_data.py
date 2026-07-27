@@ -246,6 +246,7 @@ def run_cross_scene(manifest: dict, disk_root: Path, dry_run: bool):
     command = [
         sys.executable,
         'tools/analysis_tools/audit_kl_occworld_dual_cross_scene.py',
+        *_annotation_args(manifest),
         '--dual-dir', str(REPO_ROOT / manifest['roots']['dual']),
         '--indices', *reference_args,
         '--out-dir', str(
@@ -260,6 +261,10 @@ def run_cross_scene(manifest: dict, disk_root: Path, dry_run: bool):
                 str(index) for index in support['reference_indices']
             ],
         ])
+        if support.get('annotation_file'):
+            command.extend([
+                '--support-ann-file', str(support['annotation_file']),
+            ])
     _run(command, disk_root / 'logs/cross_scene.log', dry_run)
 
 

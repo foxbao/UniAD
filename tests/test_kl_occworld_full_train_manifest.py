@@ -113,13 +113,23 @@ def test_data_generation_passes_manifest_annotation_to_generators(
             'reference_index': 3,
             'scene_token': 'fresh-scene',
         }]},
-        'roots': {'dual_cross_scene': 'unused/dual'},
+        'roots': {
+            'dual': 'unused/target-dual',
+            'dual_cross_scene': 'unused/cross-scene',
+        },
+        'cross_scene_support': {
+            'annotation_file': 'data/kl_8/kl_infos_train.pkl',
+            'dual_dir': 'unused/support-dual',
+            'reference_indices': [10],
+        },
     }
 
     run_kl_occworld_full_train_data.run_base_labels(
         manifest, tmp_path, worker_count=1, dry_run=True)
     run_kl_occworld_full_train_data.run_sequence_history(
         manifest, tmp_path, worker_count=1, dry_run=True)
+    run_kl_occworld_full_train_data.run_cross_scene(
+        manifest, tmp_path, dry_run=True)
 
     generators_with_annotations = {
         'generate_kl_occworld_temporal_labels.py',
@@ -137,3 +147,13 @@ def test_data_generation_passes_manifest_annotation_to_generators(
         assert command[position + 1] == 'data/kl_8/kl_infos_val.pkl'
         checked.add(script)
     assert checked == generators_with_annotations
+    cross_scene = next(
+        command for command in commands
+        if command[1].endswith(
+            'audit_kl_occworld_dual_cross_scene.py'))
+    target_position = cross_scene.index('--ann-file')
+    support_position = cross_scene.index('--support-ann-file')
+    assert cross_scene[target_position + 1] == (
+        'data/kl_8/kl_infos_val.pkl')
+    assert cross_scene[support_position + 1] == (
+        'data/kl_8/kl_infos_train.pkl')
