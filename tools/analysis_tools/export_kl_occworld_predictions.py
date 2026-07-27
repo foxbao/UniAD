@@ -432,7 +432,8 @@ def parse_args():
     parser.add_argument('--checkpoint-glob', default='epoch_*.pth')
     parser.add_argument(
         '--split', choices=(
-            'train', 'validation', 'test', 'blind', 'final_holdout'),
+            'train', 'validation', 'test', 'blind', 'final_holdout',
+            'fresh_holdout'),
         default='validation')
     parser.add_argument(
         '--output-root', type=Path,

@@ -1,3 +1,4 @@
+import sys
 from types import SimpleNamespace
 
 import numpy as np
@@ -7,6 +8,7 @@ from tools.analysis_tools.export_kl_occworld_predictions import (
     _override_current_anchor,
     _override_online_inputs,
     _shard_dataset_by_scene,
+    parse_args,
 )
 
 
@@ -75,3 +77,15 @@ def test_exporter_overrides_complete_online_input_contract():
 
     for key in shapes:
         assert torch.all(batch[key].data[0])
+
+
+def test_exporter_preserves_fresh_holdout_split_name(monkeypatch):
+    monkeypatch.setattr(sys, 'argv', [
+        'export_kl_occworld_predictions.py',
+        '--checkpoint', 'candidate.pth',
+        '--split', 'fresh_holdout',
+    ])
+
+    args = parse_args()
+
+    assert args.split == 'fresh_holdout'
