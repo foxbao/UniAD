@@ -219,6 +219,7 @@ def export_checkpoint(model, wrapped_model, loader, dataset,
                       output_root: Path,
                       save_track_boxes: bool = False,
                       save_raw_world_prediction: bool = False,
+                      save_query_dynamic_diagnostic: bool = False,
                       track_score_threshold: float = 0.1,
                       current_anchor_root: Path = None,
                       online_input_root: Path = None):
@@ -266,6 +267,23 @@ def export_checkpoint(model, wrapped_model, loader, dataset,
                     f'No raw world logits for reference {reference_index}')
             raw_prediction = occ['world_logits'].argmax(
                 dim=2).detach().cpu()
+        query_dynamic_probability = None
+        observation_class = None
+        observation_known = None
+        if save_query_dynamic_diagnostic:
+            query_dynamic_probability = occ.get(
+                'dynamic_occupancy_probability')
+            observation_class = occ.get('observation_class')
+            observation_known = occ.get('observation_known_mask')
+            if (query_dynamic_probability is None or
+                    observation_class is None or observation_known is None):
+                raise RuntimeError(
+                    'Query dynamic diagnostic requires world query, '
+                    'observation class and observation known outputs')
+            query_dynamic_probability = (
+                query_dynamic_probability.detach().cpu())
+            observation_class = observation_class.detach().cpu()
+            observation_known = observation_known.detach().cpu()
         valid_probability = occ[
             'world_valid_probability'].detach().cpu()
         future_change_logits = occ.get('future_change_logits')
@@ -305,6 +323,25 @@ def export_checkpoint(model, wrapped_model, loader, dataset,
                     f'Unexpected raw prediction shape {raw_prediction.shape}')
             raw_prediction = raw_prediction[0].numpy().astype(
                 np.uint8, copy=False)
+        if query_dynamic_probability is not None:
+            if (query_dynamic_probability.ndim != 4 or
+                    query_dynamic_probability.shape != (
+                        1, prediction.shape[0], prediction.shape[-2],
+                        prediction.shape[-1])):
+                raise ValueError(
+                    'Unexpected query dynamic probability shape '
+                    f'{query_dynamic_probability.shape}')
+            expected_observation = (1, *prediction.shape[1:])
+            if (observation_class.shape != expected_observation or
+                    observation_known.shape != expected_observation):
+                raise ValueError('Unexpected observation diagnostic shape')
+            query_dynamic_probability = (
+                query_dynamic_probability[0].numpy().astype(
+                    np.float32, copy=False))
+            observation_class = observation_class[0].numpy().astype(
+                np.uint8, copy=False)
+            observation_known = observation_known[0].numpy().astype(
+                np.bool_, copy=False)
         valid_probability = valid_probability[0].numpy().astype(
             np.float32, copy=False)
         if future_change_probability is not None:
@@ -347,7 +384,8 @@ def export_checkpoint(model, wrapped_model, loader, dataset,
                     f'{warped_instance_probability.shape}')
             warped_instance_probability = (
                 warped_instance_probability[0].numpy().astype(
-                    np.float16, copy=False))
+                    np.float32 if save_query_dynamic_diagnostic
+                    else np.float16, copy=False))
         if physical_confidence_probability is not None:
             if (physical_confidence_probability.ndim != 5 or
                     physical_confidence_probability.shape[0] != 1):
@@ -368,6 +406,11 @@ def export_checkpoint(model, wrapped_model, loader, dataset,
             world_valid_probability_3d=valid_probability)
         if raw_prediction is not None:
             payload['raw_world_pred_class_3d'] = raw_prediction
+        if query_dynamic_probability is not None:
+            payload['query_dynamic_probability_2d'] = (
+                query_dynamic_probability)
+            payload['observation_class_3d'] = observation_class
+            payload['observation_known_3d'] = observation_known
         if anchor_path is not None:
             payload['current_anchor_override'] = np.asarray(True)
             payload['current_anchor_path'] = np.asarray(str(anchor_path))
@@ -464,6 +507,9 @@ def parse_args():
         '--save-raw-world-prediction', action='store_true',
         help='Save pre-overlay argmax semantics for validation diagnostics.')
     parser.add_argument(
+        '--save-query-dynamic-diagnostic', action='store_true',
+        help='Save query OCC and observation signals for validation audits.')
+    parser.add_argument(
         '--track-score-threshold', type=float, default=0.1)
     parser.add_argument(
         '--current-anchor-root', type=Path,
@@ -511,6 +557,8 @@ def main():
             output_root=args.output_root,
             save_track_boxes=args.save_track_boxes,
             save_raw_world_prediction=args.save_raw_world_prediction,
+            save_query_dynamic_diagnostic=(
+                args.save_query_dynamic_diagnostic),
             track_score_threshold=args.track_score_threshold,
             current_anchor_root=args.current_anchor_root,
             online_input_root=args.online_input_root)

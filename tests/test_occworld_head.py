@@ -13,6 +13,7 @@ from projects.mmdet3d_plugin.uniad.dense_heads.occworld_head import (
     apply_physical_confidence_fusion,
     apply_physical_flow_fusion,
     apply_local_flow_overlay,
+    apply_query_conditioned_local_flow_overlay,
     bev_to_world_layout,
     compose_incremental_flow_2d,
     flow_to_world_layout,
@@ -171,6 +172,26 @@ def test_local_flow_overlay_preserves_raw_outside_instance_events():
         warped, threshold=0.7)
 
     assert fused[0, 1, 0, 0].tolist() == [1, 2, 0, 0]
+
+
+def test_query_conditioned_overlay_rejects_inconsistent_flow_events():
+    prediction = torch.tensor([[
+        [[[2, 0, 0]]],
+        [[[1, 0, 1]]],
+    ]])
+    observation_class = torch.tensor([[[[2, 0, 0]]]])
+    observation_known = torch.ones_like(
+        observation_class, dtype=torch.bool)
+    warped = torch.tensor([[[[[0.0, 1.0, 1.0]]]]])
+    query_future = torch.tensor([[[[0.8, 0.9, 0.1]]]])
+
+    fused = apply_query_conditioned_local_flow_overlay(
+        prediction, observation_class, observation_known,
+        warped, query_future,
+        flow_threshold=0.7, query_threshold=0.5)
+
+    # Query OCC blocks departure at 0 and arrival at 2, but supports arrival 1.
+    assert fused[0, 1, 0, 0].tolist() == [1, 2, 1]
 
 
 def test_physical_confidence_selects_only_supervised_disagreements():

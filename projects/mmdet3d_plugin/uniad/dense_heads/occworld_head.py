@@ -204,6 +204,72 @@ def apply_local_flow_overlay(
     return fused
 
 
+def query_conditioned_flow_event_masks(
+        observation_class: torch.Tensor,
+        observation_known: torch.Tensor,
+        warped_instance_probability: torch.Tensor,
+        query_future_probability: torch.Tensor,
+        flow_threshold: float,
+        query_threshold: float,
+        instance_class: int = 2) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Keep flow events only where query OCC agrees with their direction."""
+    if (observation_class.shape != observation_known.shape or
+            observation_class.ndim != 4 or
+            warped_instance_probability.ndim != 5 or
+            query_future_probability.ndim != 4):
+        raise ValueError('Query-conditioned flow inputs have invalid shapes')
+    batch_size, z_count, height, width = observation_class.shape
+    expected_future = (
+        batch_size, warped_instance_probability.shape[1],
+        z_count, height, width)
+    expected_query = (
+        batch_size, warped_instance_probability.shape[1], height, width)
+    if (tuple(warped_instance_probability.shape) != expected_future or
+            tuple(query_future_probability.shape) != expected_query):
+        raise ValueError('Query-conditioned flow shapes do not match')
+    if not 0.0 <= flow_threshold <= 1.0:
+        raise ValueError('Flow threshold must be in [0, 1]')
+    if not 0.0 <= query_threshold <= 1.0:
+        raise ValueError('Query threshold must be in [0, 1]')
+    current_instance = (
+        observation_known & (observation_class == instance_class))
+    current_instance = current_instance[:, None].to(
+        warped_instance_probability.dtype)
+    arrival = (
+        warped_instance_probability - current_instance >= flow_threshold)
+    departure = (
+        current_instance - warped_instance_probability >= flow_threshold)
+    query_future = query_future_probability[:, :, None]
+    return (arrival & (query_future >= query_threshold),
+            departure & (query_future < query_threshold))
+
+
+def apply_query_conditioned_local_flow_overlay(
+        raw_prediction: torch.Tensor,
+        observation_class: torch.Tensor,
+        observation_known: torch.Tensor,
+        warped_instance_probability: torch.Tensor,
+        query_future_probability: torch.Tensor,
+        flow_threshold: float,
+        query_threshold: float,
+        instance_class: int = 2) -> torch.Tensor:
+    """Overlay only flow events consistent with future query OCC support."""
+    if raw_prediction.ndim != 5:
+        raise ValueError('Query-conditioned overlay expects [B,T,Z,H,W]')
+    if raw_prediction.shape[1] != warped_instance_probability.shape[1] + 1:
+        raise ValueError('Overlay horizon count does not match flow horizons')
+    arrival, departure = query_conditioned_flow_event_masks(
+        observation_class, observation_known, warped_instance_probability,
+        query_future_probability, flow_threshold, query_threshold,
+        instance_class=instance_class)
+    fused = raw_prediction.clone()
+    fused[:, 1:] = torch.where(
+        arrival, torch.full_like(fused[:, 1:], instance_class), fused[:, 1:])
+    fused[:, 1:] = torch.where(
+        departure, torch.zeros_like(fused[:, 1:]), fused[:, 1:])
+    return fused
+
+
 def apply_physical_confidence_fusion(
         raw_prediction: torch.Tensor,
         physical_prediction: torch.Tensor,
@@ -808,6 +874,7 @@ class DenseWorldDecoder(nn.Module):
             'observation_class': observation_class,
             'future_change_logits': future_change_logits,
             'future_changed_class_logits': future_changed_class_logits,
+            'dynamic_occupancy_probability': dynamic_occupancy_probability,
             'dynamic_change_prior': dynamic_change_prior,
             'history_features': history_features,
             'history_context_features': history_context_features,
