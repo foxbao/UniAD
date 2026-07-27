@@ -51,6 +51,14 @@ def parse_args():
         default=Path(
             'outputs/patent_2026_occ/'
             'occworld_b15_final_holdout30_visuals_v1/summary.json'))
+    parser.add_argument('--split', default='final_holdout')
+    parser.add_argument(
+        '--required-status',
+        default='final_holdout_evaluated_once_no_retuning_allowed')
+    parser.add_argument('--model-label', default='B15')
+    parser.add_argument(
+        '--title-prefix', default='B15 OccWorld final holdout')
+    parser.add_argument('--stem-prefix', default='b15_final')
     parser.add_argument('--references', type=int, nargs='+')
     parser.add_argument(
         '--out-dir', type=Path,
@@ -64,8 +72,10 @@ def parse_args():
     return parser.parse_args()
 
 
-def _frame(sample, horizon, visibility_threshold):
-    panel = _scene_panel(sample, horizon, visibility_threshold)
+def _frame(sample, horizon, visibility_threshold, model_label,
+           title_prefix):
+    panel = _scene_panel(
+        sample, horizon, visibility_threshold, model_label=model_label)
     panel = cv2.resize(
         panel, (1200, 900), interpolation=cv2.INTER_NEAREST)
     header_height = 72
@@ -75,7 +85,7 @@ def _frame(sample, horizon, visibility_threshold):
     time_s = float(sample['target_times'][horizon])
     cv2.putText(
         frame,
-        f"B15 OccWorld final holdout | sample #{sample['reference']} | "
+        f"{title_prefix} | sample #{sample['reference']} | "
         f't={time_s:.1f}s',
         (24, 46), cv2.FONT_HERSHEY_SIMPLEX, 1.0,
         (238, 238, 238), 2, cv2.LINE_AA)
@@ -102,7 +112,7 @@ def _write_mp4(frames, path, fps, seconds_per_horizon,
         raise RuntimeError(f'Empty video output: {path}')
 
 
-def _write_browser_outputs(mp4_path, output_dir, stem):
+def _write_browser_outputs(mp4_path, output_dir, stem, title):
     ffmpeg = shutil.which('ffmpeg')
     if ffmpeg is None:
         raise RuntimeError('ffmpeg is required for browser video outputs')
@@ -124,7 +134,7 @@ def _write_browser_outputs(mp4_path, output_dir, stem):
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>B15 OccWorld sample</title>
+  <title>{title}</title>
   <style>
     html, body {{ width: 100%; height: 100%; margin: 0; background: #181818; }}
     body {{ display: grid; place-items: center; overflow: hidden; }}
@@ -147,9 +157,8 @@ def main():
     if args.fps < 1 or args.seconds_per_horizon <= 0:
         raise ValueError('Animation timing must be positive')
     manifest = _load_manifest(args.manifest)
-    if manifest.get('status') != (
-            'final_holdout_evaluated_once_no_retuning_allowed'):
-        raise ValueError('Final holdout is not sealed')
+    if manifest.get('status') != args.required_status:
+        raise ValueError('Requested holdout is not sealed')
     visibility_threshold = float(
         manifest['frozen_model_protocol']['visibility_threshold'])
     with args.visual_summary.open() as source:
@@ -162,7 +171,7 @@ def main():
         ])
     allowed = {
         int(row['reference_index'])
-        for row in manifest['splits']['final_holdout']
+        for row in manifest['splits'][args.split]
     }
     if not references or not set(references).issubset(allowed):
         raise ValueError('Requested reference is outside final holdout')
@@ -174,7 +183,9 @@ def main():
         sample = _load_sample(
             reference, labels[reference], predictions[reference])
         frames = [
-            _frame(sample, horizon, visibility_threshold)
+            _frame(
+                sample, horizon, visibility_threshold,
+                args.model_label, args.title_prefix)
             for horizon in range(len(sample['target_times']))
         ]
         output_dir = args.out_dir / f'{reference:06d}'
@@ -185,13 +196,14 @@ def main():
             path = frame_dir / f'horizon_{horizon}.png'
             if not cv2.imwrite(str(path), frame):
                 raise RuntimeError(f'Could not write {path}')
-        stem = f'b15_final_{reference:06d}'
+        stem = f'{args.stem_prefix}_{reference:06d}'
         mp4_path = output_dir / f'{stem}.mp4'
         _write_mp4(
             frames, mp4_path, args.fps,
             args.seconds_per_horizon, args.final_hold_seconds)
         webm_path, h264_path, html_path = _write_browser_outputs(
-            mp4_path, output_dir, stem)
+            mp4_path, output_dir, stem,
+            f'{args.title_prefix} sample {reference}')
         entries.append({
             'reference_index': reference,
             'new_model_inference_performed': False,
@@ -202,11 +214,12 @@ def main():
             'html_player_path': str(html_path),
         })
     summary = {
-        'split': 'final_holdout',
+        'split': args.split,
         'layout': 'one reference per animation',
         'selection_rule': (
             'frozen six evenly spaced manifest positions unless overridden'),
         'visibility_threshold': visibility_threshold,
+        'model_label': args.model_label,
         'fps': args.fps,
         'seconds_per_horizon': args.seconds_per_horizon,
         'final_hold_seconds': args.final_hold_seconds,

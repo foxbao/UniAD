@@ -104,7 +104,7 @@ def _load_sample(reference, label_path, prediction_path):
     }
 
 
-def _scene_panel(sample, horizon, visibility_threshold):
+def _scene_panel(sample, horizon, visibility_threshold, model_label='B15'):
     reference = sample['reference']
     time_s = float(sample['target_times'][horizon])
     suffix = f'#{reference} | t={time_s:.1f}s'
@@ -115,7 +115,7 @@ def _scene_panel(sample, horizon, visibility_threshold):
         f'GT | {suffix}')
     model = _bev_tile(
         sample['prediction'][horizon], z_centers, collision_z,
-        f'B15 | {suffix}')
+        f'{model_label} | {suffix}')
     persistence = _bev_tile(
         sample['persistence'][horizon], z_centers, collision_z,
         f'constant-current | {suffix}')

@@ -59,6 +59,15 @@ def parse_args():
             'outputs/patent_2026_occ/'
             'occworld_predictions_b15_epoch7_final_holdout30_v1/'
             'final_holdout/epoch_007'))
+    parser.add_argument('--split', default='final_holdout')
+    parser.add_argument(
+        '--required-status',
+        default='final_holdout_evaluated_once_no_retuning_allowed')
+    parser.add_argument(
+        '--model-label', default='B15 epoch 7 + overlay 0.9')
+    parser.add_argument('--file-prefix', default='b15_final')
+    parser.add_argument(
+        '--overview-name', default='b15_final_holdout_even6_overview.png')
     parser.add_argument('--visibility-threshold', type=float, default=0.7)
     parser.add_argument('--overview-count', type=int, default=6)
     parser.add_argument(
@@ -72,13 +81,12 @@ def parse_args():
 def main():
     args = parse_args()
     manifest = _load_manifest(args.manifest)
-    if manifest.get('status') != (
-            'final_holdout_evaluated_once_no_retuning_allowed'):
-        raise ValueError('Final holdout is not sealed')
+    if manifest.get('status') != args.required_status:
+        raise ValueError('Requested holdout is not sealed')
     protocol = manifest['frozen_model_protocol']
     if float(protocol['visibility_threshold']) != args.visibility_threshold:
         raise ValueError('Visualization threshold differs from frozen value')
-    references = _split_references(manifest, 'final_holdout')
+    references = _split_references(manifest, args.split)
     labels = _sequence_mapping(args.sequence_root)
     predictions = _prediction_mapping(args.prediction_root)
     if set(labels).intersection(references) != set(references):
@@ -119,13 +127,14 @@ def main():
                 'constant-current', persistence, target_times,
                 z_centers, collision_z),
             _semantic_row(
-                'B15 epoch 7 + overlay 0.9', prediction, target_times,
+                args.model_label, prediction, target_times,
                 z_centers, collision_z),
             _visibility_row(
                 'GT visibility', known.astype(np.float32), target_times,
                 z_centers, collision_z),
             _visibility_row(
-                'B15 visibility', valid_probability, target_times,
+                f'{args.model_label} visibility', valid_probability,
+                target_times,
                 z_centers, collision_z, args.visibility_threshold),
         ]
         separator = np.full(
@@ -133,12 +142,13 @@ def main():
         contact = rows[0]
         for row in rows[1:]:
             contact = np.concatenate([contact, separator, row], axis=0)
-        path = args.out_dir / f'{reference:06d}__b15_final_compare.png'
+        path = args.out_dir / (
+            f'{reference:06d}__{args.file_prefix}_compare.png')
         if not cv2.imwrite(str(path), contact):
             raise RuntimeError(f'Failed to write {path}')
         contact_paths.append(str(path))
         overview_by_reference[reference] = _tile(
-            contact, f'final holdout #{reference}', (1200, 800))
+            contact, f'{args.split} #{reference}', (1200, 800))
 
     positions = _even_positions(len(references), args.overview_count)
     overview_references = [references[position] for position in positions]
@@ -152,16 +162,17 @@ def main():
         row.extend([blank] * (columns - len(row)))
         rows.append(np.concatenate(row, axis=1))
     overview = np.concatenate(rows, axis=0)
-    overview_path = args.out_dir / 'b15_final_holdout_even6_overview.png'
+    overview_path = args.out_dir / args.overview_name
     if not cv2.imwrite(str(overview_path), overview):
         raise RuntimeError(f'Failed to write {overview_path}')
     summary = {
-        'split': 'final_holdout',
+        'split': args.split,
         'source_status': manifest['status'],
         'new_model_inference_performed': False,
         'selection_rule': (
             'six evenly spaced positions in frozen manifest order'),
         'visibility_threshold': args.visibility_threshold,
+        'model_label': args.model_label,
         'all_reference_indices': list(references),
         'overview_reference_indices': overview_references,
         'contact_paths': contact_paths,
