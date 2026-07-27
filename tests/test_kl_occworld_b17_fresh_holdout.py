@@ -2,6 +2,7 @@ import numpy as np
 
 from tools.analysis_tools.run_kl_occworld_b17_fresh_holdout import (
     _generation_view,
+    validate_prediction_artifacts,
     validate_online_artifacts,
     validate_fresh_records,
 )
@@ -123,3 +124,46 @@ def test_b17_online_artifacts_require_exact_causal_queue(tmp_path):
     assert result['track_queue_count'] == 1
     assert result['queue_frame_count'] == 5
     assert result['track_box_count'] == 3
+
+
+def test_b17_prediction_audit_requires_online_override(tmp_path):
+    online_root = tmp_path / 'online'
+    prediction_root = tmp_path / 'predictions'
+    (online_root / '000003').mkdir(parents=True)
+    (prediction_root / '000003').mkdir(parents=True)
+    np.savez_compressed(
+        online_root / '000003/occworld_online_input.npz',
+        reference_index=np.int64(3))
+    prediction_path = (
+        prediction_root / '000003/toy__occworld_prediction.npz')
+    np.savez_compressed(
+        prediction_path,
+        reference_index=np.int64(3),
+        checkpoint_epoch=np.int64(3),
+        world_pred_class_3d=np.zeros(
+            (5, 10, 120, 160), dtype=np.uint8),
+        world_valid_probability_3d=np.zeros(
+            (5, 10, 120, 160), dtype=np.float32),
+        online_input_override=np.asarray(True),
+        online_input_path=np.asarray(
+            str(online_root / '000003/occworld_online_input.npz')),
+        future_change_probability_3d=np.zeros(
+            (4, 10, 120, 160), dtype=np.float16),
+        future_flow_2d=np.zeros((4, 2, 120, 160), dtype=np.float16),
+        flow_change_prior_3d=np.zeros(
+            (4, 10, 120, 160), dtype=np.float16),
+        future_changed_class_pred_3d=np.zeros(
+            (4, 10, 120, 160), dtype=np.uint8),
+        warped_instance_probability_3d=np.zeros(
+            (4, 10, 120, 160), dtype=np.float16))
+    manifest = {
+        'splits': {'fresh_holdout': [_record(3)]},
+        'frozen_model_protocol': {'checkpoint_epoch': 3},
+        'online_input_audit': {'online_input_root': str(online_root)},
+    }
+
+    result = validate_prediction_artifacts(manifest, prediction_root)
+
+    assert result['prediction_count'] == 1
+    assert result['online_input_override_all_true']
+    assert not result['metrics_computed_during_audit']

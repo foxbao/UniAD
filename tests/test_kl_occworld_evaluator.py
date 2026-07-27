@@ -17,7 +17,7 @@ from tools.analysis_tools.audit_kl_occworld_raw_flow_disagreement import (
     apply_flow_events_to_raw,
     restore_raw_visible_changes,
 )
-from tools.analysis_tools.evaluate_kl_occworld import evaluate_split
+from tools.analysis_tools.evaluate_kl_occworld import evaluate_split, parse_args
 from tools.analysis_tools.select_kl_occworld_checkpoint import (
     select_checkpoint,
 )
@@ -62,6 +62,13 @@ def _manifest():
             }],
         },
     }
+
+
+def test_evaluator_cli_accepts_fresh_holdout(monkeypatch):
+    monkeypatch.setattr(
+        'sys.argv', ['evaluate_kl_occworld.py', '--split', 'fresh_holdout'])
+
+    assert parse_args().split == 'fresh_holdout'
 
 
 def test_scene_split_keeps_all_references_from_one_scene_together():

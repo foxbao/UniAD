@@ -6,6 +6,7 @@ import copy
 import hashlib
 import json
 import sys
+from datetime import date
 from pathlib import Path
 
 import numpy as np
@@ -56,6 +57,16 @@ ONLINE_INPUT_ROOT = REPO_ROOT / (
 ONLINE_INPUT_AUDIT = REPO_ROOT / (
     'documents/patent_2026_occ/'
     'kl_occworld_b17_fresh_holdout_val65_online_input_audit_v1.json')
+PREDICTION_ROOT = REPO_ROOT / (
+    'outputs/patent_2026_occ/'
+    'occworld_predictions_b17a_fresh_holdout_val65_v1/'
+    'fresh_holdout/epoch_003')
+MODEL_REPORT = REPO_ROOT / (
+    'documents/patent_2026_occ/'
+    'kl_occworld_b17a_epoch3_fresh_holdout_val65_model_v1.json')
+PERSISTENCE_REPORT = REPO_ROOT / (
+    'documents/patent_2026_occ/'
+    'kl_occworld_b17a_fresh_holdout_val65_persistence_v1.json')
 
 
 def _read_json(path: Path) -> dict:
@@ -227,6 +238,8 @@ def _load_evaluation_manifest(path: Path) -> dict:
         'frozen_before_fresh_holdout_gt_generation',
         'ready_for_track_queue_export',
         'ready_for_single_model_inference',
+        'ready_for_single_fixed_protocol_evaluation',
+        'fresh_holdout_evaluated_once_no_retuning_allowed',
     }
     if manifest.get('status') not in allowed:
         raise ValueError(
@@ -372,6 +385,206 @@ def finalize_online_inputs(manifest: dict, track_queue_root: Path,
     return result
 
 
+def _prediction_mapping(prediction_root: Path) -> dict:
+    mapping = {}
+    for path in sorted(
+            prediction_root.glob('*/*__occworld_prediction.npz')):
+        with np.load(path, allow_pickle=False) as payload:
+            if 'reference_index' not in payload.files:
+                raise ValueError(f'Prediction has no reference index: {path}')
+            reference = int(payload['reference_index'])
+        if reference in mapping:
+            raise ValueError(f'Duplicate prediction for reference {reference}')
+        mapping[reference] = path
+    return mapping
+
+
+def _resolve_recorded_path(path_value: str) -> Path:
+    path = Path(path_value)
+    return path.resolve() if path.is_absolute() else (REPO_ROOT / path).resolve()
+
+
+def validate_prediction_artifacts(manifest: dict,
+                                  prediction_root: Path) -> dict:
+    """Validate B17 prediction metadata without computing any metric."""
+    expected = [
+        int(row['reference_index'])
+        for row in manifest['splits']['fresh_holdout']
+    ]
+    predictions = _prediction_mapping(prediction_root)
+    if set(predictions) != set(expected):
+        missing = sorted(set(expected).difference(predictions))
+        extra = sorted(set(predictions).difference(expected))
+        raise ValueError(
+            f'Prediction reference set changed; missing={missing}, extra={extra}')
+    epoch = int(manifest['frozen_model_protocol']['checkpoint_epoch'])
+    online_root = _resolve_recorded_path(
+        manifest['online_input_audit']['online_input_root'])
+    dynamic_shapes = {
+        'future_change_probability_3d': (4, 10, 120, 160),
+        'future_flow_2d': (4, 2, 120, 160),
+        'flow_change_prior_3d': (4, 10, 120, 160),
+        'future_changed_class_pred_3d': (4, 10, 120, 160),
+        'warped_instance_probability_3d': (4, 10, 120, 160),
+    }
+    for reference in expected:
+        path = predictions[reference]
+        with np.load(path, allow_pickle=False) as payload:
+            required = {
+                'reference_index', 'checkpoint_epoch',
+                'world_pred_class_3d', 'world_valid_probability_3d',
+                'online_input_override', 'online_input_path',
+            }
+            missing_keys = sorted(required.difference(payload.files))
+            if missing_keys:
+                raise ValueError(
+                    f'Prediction {reference} lacks keys {missing_keys}')
+            if int(payload['reference_index']) != reference:
+                raise ValueError(f'Prediction path/reference mismatch: {path}')
+            if int(payload['checkpoint_epoch']) != epoch:
+                raise ValueError(f'Prediction {reference} changed epoch')
+            if not bool(payload['online_input_override']):
+                raise ValueError(
+                    f'Prediction {reference} did not use online inputs')
+            expected_online = (
+                online_root / f'{reference:06d}' /
+                'occworld_online_input.npz').resolve()
+            recorded_online = _resolve_recorded_path(
+                str(payload['online_input_path'].item()))
+            if recorded_online != expected_online or not expected_online.is_file():
+                raise ValueError(
+                    f'Prediction {reference} has the wrong online input')
+            prediction = np.asarray(payload['world_pred_class_3d'])
+            visibility = np.asarray(payload['world_valid_probability_3d'])
+            if prediction.shape != (5, 10, 120, 160):
+                raise ValueError(f'Prediction {reference} has a bad shape')
+            if visibility.shape != prediction.shape:
+                raise ValueError(f'Visibility {reference} has a bad shape')
+            if np.any((prediction < 0) | (prediction > 2)):
+                raise ValueError(f'Prediction {reference} has a bad class')
+            if (not np.all(np.isfinite(visibility)) or
+                    np.any((visibility < 0.0) | (visibility > 1.0))):
+                raise ValueError(
+                    f'Visibility {reference} is outside probability range')
+            for key, shape in dynamic_shapes.items():
+                if key not in payload.files:
+                    raise ValueError(f'Prediction {reference} lacks {key}')
+                value = np.asarray(payload[key])
+                if value.shape != shape:
+                    raise ValueError(
+                        f'Prediction {reference} has bad {key} shape')
+                if np.issubdtype(value.dtype, np.floating) and (
+                        not np.all(np.isfinite(value))):
+                    raise ValueError(
+                        f'Prediction {reference} has non-finite {key}')
+    return {
+        'prediction_count': len(predictions),
+        'reference_indices': expected,
+        'reference_sets_exactly_equal': True,
+        'checkpoint_epoch': epoch,
+        'prediction_shape': [5, 10, 120, 160],
+        'visibility_shape': [5, 10, 120, 160],
+        'dynamic_horizon_count': 4,
+        'online_input_override_all_true': True,
+        'online_input_paths_exact': True,
+        'metrics_computed_during_audit': False,
+    }
+
+
+def audit_predictions(manifest: dict, prediction_root: Path) -> dict:
+    if manifest.get('status') != 'ready_for_single_model_inference':
+        raise ValueError('Fresh holdout is not ready for model inference audit')
+    for path_key, hash_key in (
+            ('evaluation_config', 'evaluation_config_sha256'),
+            ('candidate_freeze', 'candidate_freeze_sha256')):
+        if _sha256(REPO_ROOT / manifest[path_key]) != manifest[hash_key]:
+            raise ValueError(f'Frozen artifact changed: {path_key}')
+    checkpoint = REPO_ROOT / manifest['frozen_model_protocol'][
+        'checkpoint_path']
+    if _sha256(checkpoint) != manifest['frozen_model_protocol'][
+            'checkpoint_sha256']:
+        raise ValueError('Frozen checkpoint changed')
+    verify_candidate_freeze(REPO_ROOT / manifest['candidate_freeze'])
+    audit = validate_prediction_artifacts(manifest, prediction_root)
+    result = copy.deepcopy(manifest)
+    result['status'] = 'ready_for_single_fixed_protocol_evaluation'
+    result['online_input_audit']['model_inference_performed'] = True
+    result['prediction_artifact_audit'] = {
+        **audit,
+        'prediction_root': _record_path(prediction_root),
+        'prediction_export_code_commit': manifest.get(
+            'prediction_export_code_commit'),
+        'model_predictions_visually_inspected': False,
+        'additional_model_inference_allowed': False,
+    }
+    return result
+
+
+def _future_mean(report: dict) -> float:
+    return float(np.mean([
+        row['mean_iou'] for row in report['semantic']['by_horizon'][1:]
+    ]))
+
+
+def mark_evaluated(manifest: dict, prediction_root: Path,
+                   model_report_path: Path,
+                   persistence_report_path: Path) -> dict:
+    if manifest.get('status') != (
+            'ready_for_single_fixed_protocol_evaluation'):
+        raise ValueError('Fresh holdout is not ready for fixed evaluation')
+    validation = validate_prediction_artifacts(manifest, prediction_root)
+    if validation != {
+            key: manifest['prediction_artifact_audit'][key]
+            for key in validation}:
+        raise ValueError('Prediction audit changed before evaluation sealing')
+    model_report = _read_json(model_report_path)
+    persistence_report = _read_json(persistence_report_path)
+    expected = validation['reference_indices']
+    for name, report in (
+            ('model', model_report), ('persistence', persistence_report)):
+        if report.get('split') != 'fresh_holdout':
+            raise ValueError(f'{name} report is not fresh_holdout')
+        if report.get('reference_indices') != expected:
+            raise ValueError(f'{name} report reference order changed')
+        if int(report.get('sample_count', -1)) != len(expected):
+            raise ValueError(f'{name} report sample count changed')
+        if float(report['visibility_threshold']) != 0.7:
+            raise ValueError(f'{name} report changed visibility threshold')
+    if model_report.get('prediction_source') != 'exported_model_prediction':
+        raise ValueError('Model report did not use exported predictions')
+    if persistence_report.get('prediction_source') != (
+            'constant_current_persistence'):
+        raise ValueError('Persistence report is not the frozen baseline')
+    fusion_flags = (
+        'hard_change_gate_applied', 'completion_only_applied',
+        'flow_only_applied', 'physical_flow_fusion_applied',
+        'local_flow_overlay_applied', 'physical_confidence_applied')
+    if any(bool(model_report.get(key)) for key in fusion_flags):
+        raise ValueError('Evaluator applied an unfrozen post-processing mode')
+    result = copy.deepcopy(manifest)
+    result['status'] = 'fresh_holdout_evaluated_once_no_retuning_allowed'
+    result['model_predictions_inspected'] = True
+    result['fresh_holdout_metrics_inspected'] = True
+    result['fresh_holdout_evaluation'] = {
+        'completed_on': date.today().isoformat(),
+        'checkpoint_epoch': validation['checkpoint_epoch'],
+        'visibility_threshold': 0.7,
+        'local_flow_overlay_threshold_in_forward_test': 0.9,
+        'evaluator_post_overlay': False,
+        'prediction_root': _record_path(prediction_root),
+        'model_report': _record_path(model_report_path),
+        'model_report_sha256': _sha256(model_report_path),
+        'persistence_report': _record_path(persistence_report_path),
+        'persistence_report_sha256': _sha256(persistence_report_path),
+        'model_future_mean_iou': _future_mean(model_report),
+        'persistence_future_mean_iou': _future_mean(persistence_report),
+        'threshold_scan_performed': False,
+        'additional_model_inference_allowed': False,
+        'further_tuning_on_fresh_holdout_allowed': False,
+    }
+    return result
+
+
 def _artifact_mapping(root: Path, suffix: str) -> dict:
     mapping = {}
     for path in sorted(root.glob(f'*/*__{suffix}.npz')):
@@ -452,7 +665,8 @@ def parse_args():
         '--phase', choices=(
             'prepare', 'setup', 'base-labels', 'cross-scene',
             'sequence-history', 'audit', 'all',
-            'finalize-online-inputs'),
+            'finalize-online-inputs', 'audit-predictions',
+            'mark-evaluated'),
         default='prepare')
     parser.add_argument('--fresh-manifest', type=Path,
                         default=FRESH_SELECTION_MANIFEST)
@@ -473,6 +687,11 @@ def parse_args():
                         default=ONLINE_INPUT_ROOT)
     parser.add_argument('--online-input-audit', type=Path,
                         default=ONLINE_INPUT_AUDIT)
+    parser.add_argument('--prediction-root', type=Path,
+                        default=PREDICTION_ROOT)
+    parser.add_argument('--model-report', type=Path, default=MODEL_REPORT)
+    parser.add_argument('--persistence-report', type=Path,
+                        default=PERSISTENCE_REPORT)
     parser.add_argument('--workers', type=int, default=8)
     parser.add_argument('--dry-run', action='store_true')
     return parser.parse_args()
@@ -508,6 +727,33 @@ def main():
                     manifest['fresh_holdout_reference_count']),
                 'evaluation_manifest': str(manifest_path),
                 'disk_root': str(args.disk_root),
+            }, ensure_ascii=False, indent=2))
+            return
+        if args.phase == 'audit-predictions':
+            manifest = audit_predictions(
+                manifest, args.prediction_root.resolve())
+            _write_json(manifest_path, manifest)
+            print(json.dumps({
+                'phase': args.phase,
+                'status': manifest['status'],
+                'prediction_artifact_audit': (
+                    manifest['prediction_artifact_audit']),
+                'evaluation_manifest': str(manifest_path),
+            }, ensure_ascii=False, indent=2))
+            return
+        if args.phase == 'mark-evaluated':
+            manifest = mark_evaluated(
+                manifest,
+                args.prediction_root.resolve(),
+                args.model_report.resolve(),
+                args.persistence_report.resolve())
+            _write_json(manifest_path, manifest)
+            print(json.dumps({
+                'phase': args.phase,
+                'status': manifest['status'],
+                'fresh_holdout_evaluation': (
+                    manifest['fresh_holdout_evaluation']),
+                'evaluation_manifest': str(manifest_path),
             }, ensure_ascii=False, indent=2))
             return
         view = _generation_view(manifest)

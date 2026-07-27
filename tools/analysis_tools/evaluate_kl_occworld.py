@@ -704,7 +704,8 @@ def parse_args():
             'outputs/patent_2026_occ/occworld_sequence_batch20'))
     parser.add_argument(
         '--split', choices=(
-            'train', 'validation', 'test', 'blind', 'final_holdout'),
+            'train', 'validation', 'test', 'blind', 'final_holdout',
+            'fresh_holdout'),
         default='test')
     parser.add_argument('--prediction-root', type=Path)
     parser.add_argument('--visibility-threshold', type=float, default=0.5)
