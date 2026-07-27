@@ -237,6 +237,7 @@ def main():
         'status': 'frozen_before_label_generation_and_inference',
         'strategy': (
             'fresh_scene_disjoint_evenly_spaced_after_full_contract_audit'),
+        'annotation_file': str(resolved_ann_file),
         'source_preflight': str(report_path),
         'source_annotation_file': str(resolved_ann_file),
         'source_annotation_sha256': annotation_sha256,

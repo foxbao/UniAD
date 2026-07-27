@@ -104,6 +104,13 @@ def _scene_shards(records: Sequence[dict], count: int):
     return [sorted(values) for values in shards]
 
 
+def _annotation_args(manifest: dict):
+    annotation_file = manifest.get('annotation_file')
+    if not annotation_file:
+        raise ValueError('Manifest has no annotation_file')
+    return ['--ann-file', str(annotation_file)]
+
+
 def _run(command: Sequence[str], log_path: Path, dry_run: bool):
     printable = ' '.join(command)
     if dry_run:
@@ -185,6 +192,7 @@ def run_base_labels(manifest: dict, disk_root: Path,
         _run([
             sys.executable,
             'tools/data_converter/generate_kl_occworld_temporal_labels.py',
+            *_annotation_args(manifest),
             '--indices', *index_args,
             '--save-per-sensor-diagnostics',
             '--out-dir', str(temporal),
@@ -200,6 +208,7 @@ def run_base_labels(manifest: dict, disk_root: Path,
         _run([
             sys.executable,
             'tools/analysis_tools/audit_kl_occworld_dual_batch.py',
+            *_annotation_args(manifest),
             '--temporal-dir', str(temporal),
             '--occlusion-dir', str(occlusion),
             '--indices', *index_args,
@@ -273,6 +282,7 @@ def run_sequence_history(manifest: dict, disk_root: Path,
         _run([
             sys.executable,
             'tools/data_converter/generate_kl_occworld_observation_cache.py',
+            *_annotation_args(manifest),
             '--reference-indices', *index_args,
             '--offsets', *[str(index) for index in range(-4, 9)],
             '--out-dir', str(cache),
@@ -280,6 +290,7 @@ def run_sequence_history(manifest: dict, disk_root: Path,
         _run([
             sys.executable,
             'tools/data_converter/generate_kl_occworld_sequence_batch.py',
+            *_annotation_args(manifest),
             '--reference-indices', *index_args,
             '--dual-dir', str(cross_scene),
             '--observation-cache-dir', str(cache),
@@ -289,6 +300,7 @@ def run_sequence_history(manifest: dict, disk_root: Path,
         _run([
             sys.executable,
             'tools/data_converter/generate_kl_occworld_history_batch.py',
+            *_annotation_args(manifest),
             '--reference-indices', *index_args,
             '--observation-cache-dir', str(cache),
             '--out-dir', str(history),

@@ -143,6 +143,7 @@ def prepare_manifest(source_path: Path, selection_path: Path,
         'schema_version': 1,
         'name': 'kl_occworld_b15_final_holdout30_evaluation_v1',
         'status': 'frozen_before_final_holdout_gt_generation',
+        'annotation_file': source['annotation_file'],
         'source_manifest': str(source_path.relative_to(REPO_ROOT)),
         'source_manifest_sha256': _sha256(source_path),
         'validation_selection_report': str(
