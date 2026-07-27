@@ -47,6 +47,15 @@ EVAL_CONFIG = REPO_ROOT / (
     'base_e2e_lidar_occworld_b17a_fresh_holdout_val65_eval.py')
 DISK_ROOT = Path(
     '/mnt/disk1/baojiali/UniAD_occworld_b17_fresh_holdout_val65_v1')
+TRACK_QUEUE_ROOT = REPO_ROOT / (
+    'outputs/patent_2026_occ/'
+    'occworld_track_queues_b17_fresh_holdout_val65_v1')
+ONLINE_INPUT_ROOT = REPO_ROOT / (
+    'outputs/patent_2026_occ/'
+    'occworld_online_inputs_b17_fresh_holdout_val65_v1')
+ONLINE_INPUT_AUDIT = REPO_ROOT / (
+    'documents/patent_2026_occ/'
+    'kl_occworld_b17_fresh_holdout_val65_online_input_audit_v1.json')
 
 
 def _read_json(path: Path) -> dict:
@@ -67,6 +76,13 @@ def _sha256(path: Path) -> str:
         for block in iter(lambda: source.read(1024 * 1024), b''):
             digest.update(block)
     return digest.hexdigest()
+
+
+def _record_path(path: Path) -> str:
+    try:
+        return str(path.relative_to(REPO_ROOT))
+    except ValueError:
+        return str(path)
 
 
 def _root_mapping() -> dict:
@@ -210,6 +226,7 @@ def _load_evaluation_manifest(path: Path) -> dict:
     allowed = {
         'frozen_before_fresh_holdout_gt_generation',
         'ready_for_track_queue_export',
+        'ready_for_single_model_inference',
     }
     if manifest.get('status') not in allowed:
         raise ValueError(
@@ -224,6 +241,134 @@ def _generation_view(manifest: dict) -> dict:
         'train': result['splits']['fresh_holdout']}
     result['train_reference_count'] = int(
         result['fresh_holdout_reference_count'])
+    return result
+
+
+def _single_artifact(root: Path, reference: int, name: str) -> Path:
+    path = root / f'{reference:06d}' / name
+    if not path.is_file():
+        raise FileNotFoundError(f'Missing artifact: {path}')
+    return path
+
+
+def validate_online_artifacts(manifest: dict, track_queue_root: Path,
+                              online_input_root: Path,
+                              audit_report: dict) -> dict:
+    """Validate exact causal online inputs without running the world model."""
+    expected = {
+        int(row['reference_index']): str(row['scene_token'])
+        for row in manifest['splits']['fresh_holdout']
+    }
+    track_references = {
+        int(path.parent.name)
+        for path in track_queue_root.glob('*/occworld_track_queue.npz')
+    }
+    online_references = {
+        int(path.parent.name)
+        for path in online_input_root.glob('*/occworld_online_input.npz')
+    }
+    if track_references != set(expected):
+        raise ValueError('Track queue references are not exact')
+    if online_references != set(expected):
+        raise ValueError('Online input references are not exact')
+    total_frames = 0
+    total_boxes = 0
+    for reference, expected_scene in sorted(expected.items()):
+        track_path = _single_artifact(
+            track_queue_root, reference, 'occworld_track_queue.npz')
+        online_path = _single_artifact(
+            online_input_root, reference, 'occworld_online_input.npz')
+        with np.load(track_path, allow_pickle=False) as track:
+            if int(track['reference_index']) != reference:
+                raise ValueError(f'Wrong track reference: {track_path}')
+            queue_indices = np.asarray(
+                track['queue_frame_indices'], dtype=np.int64)
+            scenes = np.asarray(track['queue_scene_tokens']).astype(str)
+            offsets = np.asarray(
+                track['track_box_offsets'], dtype=np.int64)
+            if queue_indices.shape != (5,) or scenes.shape != (5,):
+                raise ValueError(f'Bad track queue shape for {reference}')
+            if set(scenes.tolist()) != {expected_scene}:
+                raise ValueError(
+                    f'Track queue changed scene for {reference}')
+            if offsets.shape != (6,) or np.any(np.diff(offsets) < 0):
+                raise ValueError(f'Bad track box offsets for {reference}')
+            total_frames += len(queue_indices)
+            total_boxes += int(offsets[-1])
+        with np.load(online_path, allow_pickle=False) as online:
+            if int(online['reference_index']) != reference:
+                raise ValueError(f'Wrong online reference: {online_path}')
+            if online['current_world_state_3d'].shape != (10, 120, 160):
+                raise ValueError(f'Bad current state for {reference}')
+            if online['current_world_valid_3d'].shape != (10, 120, 160):
+                raise ValueError(f'Bad current valid mask for {reference}')
+            if online['history_world_state_3d'].shape != (
+                    5, 10, 120, 160):
+                raise ValueError(f'Bad history state for {reference}')
+            if online['history_world_valid_3d'].shape != (
+                    5, 10, 120, 160):
+                raise ValueError(f'Bad history valid mask for {reference}')
+            np.testing.assert_array_equal(
+                online['queue_frame_indices'], queue_indices)
+            if str(online['input_contract']) != (
+                    'five_frame_sequential_trackformer_predicted_boxes'):
+                raise ValueError(
+                    f'Wrong online input contract for {reference}')
+    aggregate = audit_report.get('aggregate', {})
+    if int(aggregate.get('reference_count', -1)) != len(expected):
+        raise ValueError('Online audit reference count changed')
+    if int(aggregate.get('frame_count', -1)) != total_frames:
+        raise ValueError('Online audit frame count changed')
+    report_references = {
+        int(row['reference_index'])
+        for row in audit_report.get('rows', [])
+    }
+    if report_references != set(expected):
+        raise ValueError('Online audit rows are not exact')
+    return {
+        'track_queue_count': len(track_references),
+        'online_input_count': len(online_references),
+        'queue_frame_count': total_frames,
+        'track_box_count': total_boxes,
+        'reference_sets_exactly_equal': True,
+        'input_contract': (
+            'five_frame_sequential_trackformer_predicted_boxes'),
+        'instance_iou': aggregate['instance_iou'],
+        'instance_precision': aggregate['instance_precision'],
+        'instance_recall': aggregate['instance_recall'],
+        'mean_current_state_mismatch_ratio': aggregate[
+            'mean_current_state_mismatch_ratio'],
+        'mean_history_state_mismatch_ratio': aggregate[
+            'mean_history_state_mismatch_ratio'],
+    }
+
+
+def finalize_online_inputs(manifest: dict, track_queue_root: Path,
+                           online_input_root: Path,
+                           audit_path: Path) -> dict:
+    if manifest.get('status') != 'ready_for_track_queue_export':
+        raise ValueError('Fresh holdout is not ready for online inputs')
+    for path_key, hash_key in (
+            ('track_export_config', 'track_export_config_sha256'),
+            ('evaluation_config', 'evaluation_config_sha256'),
+            ('candidate_freeze', 'candidate_freeze_sha256')):
+        path = REPO_ROOT / manifest[path_key]
+        if _sha256(path) != manifest[hash_key]:
+            raise ValueError(f'Frozen artifact changed: {path_key}')
+    verify_candidate_freeze(REPO_ROOT / manifest['candidate_freeze'])
+    audit = _read_json(audit_path)
+    validation = validate_online_artifacts(
+        manifest, track_queue_root, online_input_root, audit)
+    result = copy.deepcopy(manifest)
+    result['status'] = 'ready_for_single_model_inference'
+    result['online_input_audit'] = {
+        **validation,
+        'track_queue_root': _record_path(track_queue_root),
+        'online_input_root': _record_path(online_input_root),
+        'audit_report': _record_path(audit_path),
+        'audit_report_sha256': _sha256(audit_path),
+        'model_inference_performed': False,
+    }
     return result
 
 
@@ -306,7 +451,8 @@ def parse_args():
     parser.add_argument(
         '--phase', choices=(
             'prepare', 'setup', 'base-labels', 'cross-scene',
-            'sequence-history', 'audit', 'all'),
+            'sequence-history', 'audit', 'all',
+            'finalize-online-inputs'),
         default='prepare')
     parser.add_argument('--fresh-manifest', type=Path,
                         default=FRESH_SELECTION_MANIFEST)
@@ -321,6 +467,12 @@ def parse_args():
     parser.add_argument('--eval-config', type=Path,
                         default=EVAL_CONFIG)
     parser.add_argument('--disk-root', type=Path, default=DISK_ROOT)
+    parser.add_argument('--track-queue-root', type=Path,
+                        default=TRACK_QUEUE_ROOT)
+    parser.add_argument('--online-input-root', type=Path,
+                        default=ONLINE_INPUT_ROOT)
+    parser.add_argument('--online-input-audit', type=Path,
+                        default=ONLINE_INPUT_AUDIT)
     parser.add_argument('--workers', type=int, default=8)
     parser.add_argument('--dry-run', action='store_true')
     return parser.parse_args()
@@ -342,6 +494,22 @@ def main():
         _write_json(manifest_path, manifest)
     else:
         manifest = _load_evaluation_manifest(manifest_path)
+        if args.phase == 'finalize-online-inputs':
+            manifest = finalize_online_inputs(
+                manifest,
+                args.track_queue_root.resolve(),
+                args.online_input_root.resolve(),
+                args.online_input_audit.resolve())
+            _write_json(manifest_path, manifest)
+            print(json.dumps({
+                'phase': args.phase,
+                'status': manifest['status'],
+                'fresh_holdout_reference_count': (
+                    manifest['fresh_holdout_reference_count']),
+                'evaluation_manifest': str(manifest_path),
+                'disk_root': str(args.disk_root),
+            }, ensure_ascii=False, indent=2))
+            return
         view = _generation_view(manifest)
         setup_paths(view, args.disk_root)
         phases = (
