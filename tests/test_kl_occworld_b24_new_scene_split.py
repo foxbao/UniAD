@@ -1,10 +1,13 @@
 from pathlib import Path
 
+import numpy as np
+
 from tools.analysis_tools.prepare_kl_occworld_b24_new_scene_split import (
     annotation_scene_manifest,
     build_b24_split_manifest,
     select_b24_new_scene_records,
     split_interleaved_records,
+    validate_ego_pose_window,
 )
 
 
@@ -67,6 +70,19 @@ def test_b24_interleaving_rejects_duplicate_scenes():
         raise AssertionError('Expected duplicate B24 scenes to fail')
 
 
+def test_b24_pose_window_rejects_non_rigid_ego_transform():
+    infos = [{'ego2global': np.eye(4)} for _ in range(3)]
+    infos[2]['ego2global'][0, 0] = 2.0
+
+    try:
+        validate_ego_pose_window(infos, reference_index=1,
+                                 required_offsets=[-1, 0, 1])
+    except ValueError as error:
+        assert 'rotation is not rigid' in str(error)
+    else:
+        raise AssertionError('Expected invalid B24 ego pose to fail')
+
+
 def test_b24_selection_rejects_insufficient_fresh_scenes():
     records = _records(4)
     existing = {'splits': {'old': records[:2]}}
@@ -107,6 +123,8 @@ def test_b24_manifest_freezes_final_without_label_or_prediction_access():
     assert manifest['selection_uses_occworld_labels'] is False
     assert manifest['selection_uses_model_predictions'] is False
     assert manifest['threshold_retuning_on_final_holdout'] is False
+    assert manifest['lidar_extrinsics_check'] is True
+    assert manifest['ego_pose_check'] is True
     assert manifest['source_existing_annotations'][0]['path'] == 'old.pkl'
     assert set(manifest['split_scene_tokens']['development_validation']).isdisjoint(
         manifest['split_scene_tokens']['final_holdout'])

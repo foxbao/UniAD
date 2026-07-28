@@ -7,6 +7,8 @@ import sys
 from pathlib import Path
 from typing import Mapping, Sequence
 
+import numpy as np
+
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
@@ -73,6 +75,49 @@ def annotation_scene_manifest(infos: Sequence[Mapping]) -> dict:
     return {
         'splits': {'canonical_annotation_scenes': list(records.values())},
     }
+
+
+def validate_ego_pose_window(
+        infos: Sequence[Mapping], reference_index: int,
+        required_offsets: Sequence[int]) -> None:
+    """Require a finite rigid ego pose for every frame used by OccWorld."""
+    for offset in required_offsets:
+        frame_index = reference_index + int(offset)
+        try:
+            pose = np.asarray(
+                infos[frame_index]['ego2global'], dtype=np.float64)
+        except (KeyError, TypeError, ValueError) as error:
+            raise ValueError(
+                f'frame {frame_index} has no valid ego2global: {error}')
+        if pose.shape != (4, 4):
+            raise ValueError(
+                f'frame {frame_index} ego2global has shape {pose.shape}, '
+                'expected (4, 4)')
+        if not np.isfinite(pose).all():
+            raise ValueError(
+                f'frame {frame_index} ego2global contains non-finite values')
+        if not np.allclose(
+                pose[3], np.asarray([0.0, 0.0, 0.0, 1.0]), atol=1e-6):
+            raise ValueError(
+                f'frame {frame_index} ego2global has invalid homogeneous row')
+        rotation = pose[:3, :3]
+        if (not np.allclose(rotation.T @ rotation, np.eye(3), atol=1e-3)
+                or np.linalg.det(rotation) <= 1e-6):
+            raise ValueError(
+                f'frame {frame_index} ego2global rotation is not rigid')
+
+
+def validate_b24_reference(
+        infos: Sequence[Mapping], reference_index: int,
+        required_offsets: Sequence[int]) -> None:
+    """Apply the frozen nested-time and ego-pose contracts together."""
+    _validate_fixed_frame_times(
+        infos, reference_index,
+        target_offsets=list(range(5)),
+        reveal_offsets=list(range(5)),
+        expected_step_s=EXPECTED_STEP_S,
+        max_time_error_s=MAX_TIME_ERROR_S)
+    validate_ego_pose_window(infos, reference_index, required_offsets)
 
 
 def split_interleaved_records(
@@ -191,6 +236,8 @@ def build_b24_split_manifest(
         'model_queue_max_gap_s': float(model_queue_max_gap_s),
         'expected_sensor_count': int(expected_sensor_count),
         'lidar_file_check': bool(lidar_file_check),
+        'lidar_extrinsics_check': True,
+        'ego_pose_check': True,
         'splits': {
             'development_validation': development,
             'final_holdout': final,
@@ -305,12 +352,8 @@ def main():
         max_time_error_s=MAX_TIME_ERROR_S,
         expected_sensor_count=EXPECTED_SENSOR_COUNT,
         check_lidar_files=True,
-        reference_validator=lambda reference: _validate_fixed_frame_times(
-            infos, reference,
-            target_offsets=list(range(5)),
-            reveal_offsets=list(range(5)),
-            expected_step_s=EXPECTED_STEP_S,
-            max_time_error_s=MAX_TIME_ERROR_S))
+        reference_validator=lambda reference: validate_b24_reference(
+            infos, reference, required_offsets))
     model_queue_valid = _queue_checker(
         infos, MODEL_QUEUE_LENGTH, MODEL_QUEUE_MAX_GAP_S)
 
@@ -341,6 +384,8 @@ def main():
         'model_queue_max_gap_s': MODEL_QUEUE_MAX_GAP_S,
         'expected_sensor_count': EXPECTED_SENSOR_COUNT,
         'lidar_file_check': True,
+        'lidar_extrinsics_check': True,
+        'ego_pose_check': True,
         'eligibility_audit_csv': str(audit_csv),
         'requested_development_validation_scene_count': (
             args.development_scene_count),
