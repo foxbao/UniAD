@@ -89,6 +89,7 @@ class MotionHeadLidar(MotionHead):
             actor_masks = [actor_mask[index] for index in range(batch_size)]
 
         future_list = []
+        box_list = []
         size_list = []
         yaw_list = []
         score_list = []
@@ -104,6 +105,7 @@ class MotionHeadLidar(MotionHead):
             if num_objects == 0 or not mask.any():
                 future_list.append(preds.new_zeros(
                     (0, preds.size(-2), 2)))
+                box_list.append(preds.new_zeros((0, 7)))
                 size_list.append(preds.new_zeros((0, 2)))
                 yaw_list.append(preds.new_zeros((0,)))
                 score_list.append(preds.new_zeros((0,)))
@@ -132,6 +134,10 @@ class MotionHeadLidar(MotionHead):
 
             future_list.append(
                 (centers[:, None] + selected_preds)[mask])
+            # Keep the native LiDARInstance3DBoxes tensor contract. Its
+            # z coordinate is the box bottom; offline OccWorld diagnostics
+            # perform the frozen B15 z-convention conversion explicitly.
+            box_list.append(box_tensor[:num_objects, :7][mask])
             size_list.append(sizes[mask])
             yaw_list.append(yaws[mask])
             score_list.append((detection_scores * mode_scores)[mask])
@@ -140,6 +146,7 @@ class MotionHeadLidar(MotionHead):
         planning_steps = preds.size(-2)
         actor_future = preds.new_zeros(
             (batch_size, max_actors, planning_steps, 2))
+        actor_boxes = preds.new_zeros((batch_size, max_actors, 7))
         actor_sizes = preds.new_zeros((batch_size, max_actors, 2))
         actor_yaws = preds.new_zeros((batch_size, max_actors))
         actor_scores = preds.new_zeros((batch_size, max_actors))
@@ -150,16 +157,33 @@ class MotionHeadLidar(MotionHead):
             if count == 0:
                 continue
             actor_future[batch_index, :count] = future
+            actor_boxes[batch_index, :count] = box_list[batch_index]
             actor_sizes[batch_index, :count] = size_list[batch_index]
             actor_yaws[batch_index, :count] = yaw_list[batch_index]
             actor_scores[batch_index, :count] = score_list[batch_index]
             actor_valid[batch_index, :count] = True
 
         outs_motion['planning_actor_future'] = actor_future.detach()
+        outs_motion['planning_actor_boxes_3d'] = actor_boxes.detach()
         outs_motion['planning_actor_sizes'] = actor_sizes.detach()
         outs_motion['planning_actor_yaws'] = actor_yaws.detach()
         outs_motion['planning_actor_scores'] = actor_scores.detach()
         outs_motion['planning_actor_valid'] = actor_valid
+
+    def _attach_empty_planning_actor_context(self, outs_motion, reference):
+        """Keep the actor diagnostic schema valid when no tracks exist."""
+        batch_size = reference.size(1)
+        outs_motion.update(
+            planning_actor_future=reference.new_zeros(
+                (batch_size, 0, self.predict_steps, 2)),
+            planning_actor_boxes_3d=reference.new_zeros(
+                (batch_size, 0, 7)),
+            planning_actor_sizes=reference.new_zeros((batch_size, 0, 2)),
+            planning_actor_yaws=reference.new_zeros((batch_size, 0)),
+            planning_actor_scores=reference.new_zeros((batch_size, 0)),
+            planning_actor_valid=torch.zeros(
+                (batch_size, 0), device=reference.device,
+                dtype=torch.bool))
 
     def forward_train(self,
                       bev_embed,
@@ -233,6 +257,8 @@ class MotionHeadLidar(MotionHead):
                 traj_query=track_query.new_zeros(
                     (self.motionformer.num_layers, 1, 0, self.num_anchor,
                      self.embed_dims)))
+            self._attach_empty_planning_actor_context(
+                outs_motion, track_query)
             return dict(
                 losses=losses,
                 outs_motion=outs_motion,
@@ -349,6 +375,8 @@ class MotionHeadLidar(MotionHead):
                 traj_query=track_query.new_zeros(
                     (self.motionformer.num_layers, 1, 0, self.num_anchor,
                      self.embed_dims)))
+            self._attach_empty_planning_actor_context(
+                outs_motion, track_query)
             return [dict(traj=empty_traj.cpu(),
                          traj_scores=empty_scores.cpu())], outs_motion
 

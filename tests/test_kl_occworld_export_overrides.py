@@ -5,6 +5,7 @@ import numpy as np
 import torch
 
 from tools.analysis_tools.export_kl_occworld_predictions import (
+    _motion_actor_diagnostic_payload,
     _override_current_anchor,
     _override_online_inputs,
     _shard_dataset_by_scene,
@@ -125,3 +126,37 @@ def test_exporter_exposes_opt_in_query_residual_ablation(monkeypatch):
     args = parse_args()
 
     assert args.save_query_residual_ablation
+
+
+def test_exporter_exposes_opt_in_motion_actor_diagnostic(monkeypatch):
+    monkeypatch.setattr(sys, 'argv', [
+        'export_kl_occworld_predictions.py',
+        '--checkpoint', 'candidate.pth',
+        '--save-motion-actor-diagnostic',
+    ])
+
+    args = parse_args()
+
+    assert args.save_motion_actor_diagnostic
+    assert args.motion_actor_step_seconds == 0.5
+
+
+def test_motion_actor_diagnostic_payload_preserves_geometry_and_time():
+    future = torch.arange(48, dtype=torch.float32).reshape(1, 2, 12, 2)
+    boxes = torch.arange(14, dtype=torch.float32).reshape(1, 2, 7)
+    scores = torch.tensor([[0.8, 0.3]])
+    valid = torch.tensor([[True, False]])
+
+    payload = _motion_actor_diagnostic_payload(dict(
+        planning_actor_future=future,
+        planning_actor_boxes_3d=boxes,
+        planning_actor_scores=scores,
+        planning_actor_valid=valid))
+
+    assert payload['motion_actor_future_xy'].shape == (2, 12, 2)
+    assert np.array_equal(payload['motion_actor_boxes_3d'], boxes[0].numpy())
+    assert np.array_equal(payload['motion_actor_valid'], valid[0].numpy())
+    assert np.allclose(
+        payload['motion_actor_step_times_s'],
+        np.arange(1, 13, dtype=np.float32) * 0.5)
+    assert payload['motion_actor_box_z_origin'].item() == 'bottom'

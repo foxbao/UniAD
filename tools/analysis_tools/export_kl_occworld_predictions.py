@@ -195,6 +195,58 @@ def _override_online_inputs(batch: dict, payload: dict):
         target[0].copy_(tensor)
 
 
+def _motion_actor_diagnostic_payload(occ: dict,
+                                     step_seconds: float = 0.5) -> dict:
+    """Convert detached MotionHead actor geometry into a stable NPZ schema."""
+    if step_seconds <= 0:
+        raise ValueError('Motion actor step seconds must be positive')
+    required = (
+        'planning_actor_future', 'planning_actor_boxes_3d',
+        'planning_actor_scores', 'planning_actor_valid')
+    missing = [key for key in required if key not in occ]
+    if missing:
+        raise RuntimeError(
+            'Motion actor diagnostic is missing: ' + ', '.join(missing))
+
+    values = {
+        key: occ[key].detach().cpu()
+        for key in required
+    }
+    future = values['planning_actor_future']
+    boxes = values['planning_actor_boxes_3d']
+    scores = values['planning_actor_scores']
+    valid = values['planning_actor_valid']
+    if future.ndim != 4 or future.shape[0] != 1 or future.shape[-1] != 2:
+        raise ValueError(
+            f'Unexpected planning actor future shape {tuple(future.shape)}')
+    actor_count = future.shape[1]
+    if boxes.shape != (1, actor_count, 7):
+        raise ValueError(
+            f'Unexpected planning actor box shape {tuple(boxes.shape)}')
+    if scores.shape != (1, actor_count):
+        raise ValueError(
+            f'Unexpected planning actor score shape {tuple(scores.shape)}')
+    if valid.shape != (1, actor_count):
+        raise ValueError(
+            f'Unexpected planning actor valid shape {tuple(valid.shape)}')
+
+    planning_steps = future.shape[2]
+    return {
+        'motion_actor_future_xy': future[0].numpy().astype(
+            np.float32, copy=False),
+        'motion_actor_boxes_3d': boxes[0].numpy().astype(
+            np.float32, copy=False),
+        'motion_actor_scores': scores[0].numpy().astype(
+            np.float32, copy=False),
+        'motion_actor_valid': valid[0].numpy().astype(
+            np.bool_, copy=False),
+        'motion_actor_step_times_s': (
+            np.arange(1, planning_steps + 1, dtype=np.float32) *
+            np.float32(step_seconds)),
+        'motion_actor_box_z_origin': np.asarray('bottom'),
+    }
+
+
 def _load_checkpoint(model, path: Path):
     checkpoint = torch.load(path, map_location='cpu')
     state_dict = checkpoint.get('state_dict', checkpoint)
@@ -221,6 +273,8 @@ def export_checkpoint(model, wrapped_model, loader, dataset,
                       save_raw_world_prediction: bool = False,
                       save_query_dynamic_diagnostic: bool = False,
                       save_query_residual_ablation: bool = False,
+                      save_motion_actor_diagnostic: bool = False,
+                      motion_actor_step_seconds: float = 0.5,
                       track_score_threshold: float = 0.1,
                       current_anchor_root: Path = None,
                       online_input_root: Path = None):
@@ -270,6 +324,10 @@ def export_checkpoint(model, wrapped_model, loader, dataset,
                     'Query-residual ablation requires an enabled adapter')
             query_residual_ablation = (
                 query_residual_ablation.detach().cpu())
+        motion_actor_diagnostic = None
+        if save_motion_actor_diagnostic:
+            motion_actor_diagnostic = _motion_actor_diagnostic_payload(
+                occ, step_seconds=motion_actor_step_seconds)
         raw_prediction = None
         if save_raw_world_prediction:
             if 'world_logits' not in occ:
@@ -422,6 +480,8 @@ def export_checkpoint(model, wrapped_model, loader, dataset,
             checkpoint_epoch=np.int64(epoch),
             world_pred_class_3d=prediction,
             world_valid_probability_3d=valid_probability)
+        if motion_actor_diagnostic is not None:
+            payload.update(motion_actor_diagnostic)
         if raw_prediction is not None:
             payload['raw_world_pred_class_3d'] = raw_prediction
         if query_residual_ablation is not None:
@@ -534,6 +594,12 @@ def parse_args():
         '--save-query-residual-ablation', action='store_true',
         help='Save paired adapter-off semantics from the same forward pass.')
     parser.add_argument(
+        '--save-motion-actor-diagnostic', action='store_true',
+        help='Save aligned MotionHead actor boxes and future XY centers.')
+    parser.add_argument(
+        '--motion-actor-step-seconds', type=float, default=0.5,
+        help='Time interval represented by consecutive motion steps.')
+    parser.add_argument(
         '--track-score-threshold', type=float, default=0.1)
     parser.add_argument(
         '--current-anchor-root', type=Path,
@@ -585,6 +651,9 @@ def main():
                 args.save_query_dynamic_diagnostic),
             save_query_residual_ablation=(
                 args.save_query_residual_ablation),
+            save_motion_actor_diagnostic=(
+                args.save_motion_actor_diagnostic),
+            motion_actor_step_seconds=args.motion_actor_step_seconds,
             track_score_threshold=args.track_score_threshold,
             current_anchor_root=args.current_anchor_root,
             online_input_root=args.online_input_root)

@@ -1519,6 +1519,11 @@ class OccWorldHead(OccHead):
         outputs['world_pred'] = world_prediction
         outputs['world_valid_probability'] = world_outputs[
             'valid_logits'].sigmoid()
+        for key in (
+                'planning_actor_future', 'planning_actor_boxes_3d',
+                'planning_actor_scores', 'planning_actor_valid'):
+            if key in outs_dict:
+                outputs[key] = outs_dict[key]
         return outputs
 
     def _fuse_world_prediction(self, raw_world_prediction, world_outputs):
