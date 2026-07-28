@@ -13,6 +13,7 @@ from projects.mmdet3d_plugin.uniad.dense_heads.occworld_head import (
     apply_physical_confidence_fusion,
     apply_physical_flow_fusion,
     apply_local_flow_overlay,
+    apply_motion_actor_arrival_overlay,
     apply_query_conditioned_local_flow_overlay,
     bev_to_world_layout,
     compose_incremental_flow_2d,
@@ -24,6 +25,7 @@ from projects.mmdet3d_plugin.uniad.dense_heads.occworld_head import (
     selected_binary_cross_entropy_with_logits,
     selected_smooth_l1_loss,
     selected_world_cross_entropy,
+    rasterize_motion_actor_support,
     stable_known_world_selection,
     world_visibility_binary_cross_entropy,
 )
@@ -172,6 +174,39 @@ def test_local_flow_overlay_preserves_raw_outside_instance_events():
         warped, threshold=0.7)
 
     assert fused[0, 1, 0, 0].tolist() == [1, 2, 0, 0]
+
+
+def test_motion_actor_raster_uses_legacy_z_and_image_aligned_rows():
+    future = torch.tensor([[[[0.5, 0.5], [1.5, 0.5]]]])
+    boxes = torch.tensor([[[0.5, 0.5, 0.0, 1.0, 1.0, 1.0, 0.0]]])
+    scores = torch.tensor([[0.5]])
+    valid = torch.tensor([[True]])
+
+    motion, stationary = rasterize_motion_actor_support(
+        future, boxes, scores, valid, future_count=2,
+        pc_range=[0.0, 0.0, 0.0, 4.0, 4.0, 2.0],
+        z_count=2, height=4, width=4, score_threshold=0.1)
+
+    assert stationary[:, :, :, 3, 0].all()
+    assert motion[0, 0, :, 3, 0].all()
+    assert motion[0, 1, :, 3, 1].all()
+    assert not motion[0, 1, :, 3, 0].any()
+
+
+def test_motion_actor_overlay_updates_only_raw_free_arrivals():
+    raw = torch.tensor([[
+        [[[0, 0, 0]]],
+        [[[0, 1, 2]]],
+    ]])
+    motion = torch.ones((1, 1, 1, 1, 3), dtype=torch.bool)
+    stationary = torch.zeros_like(motion)
+
+    fused, arrival = apply_motion_actor_arrival_overlay(
+        raw, motion, stationary, raw_class_gate=0)
+
+    assert arrival[0, 0, 0, 0].tolist() == [True, False, False]
+    assert torch.equal(fused[0, 0], raw[0, 0])
+    assert fused[0, 1, 0, 0].tolist() == [2, 1, 2]
 
 
 def test_query_conditioned_overlay_rejects_inconsistent_flow_events():

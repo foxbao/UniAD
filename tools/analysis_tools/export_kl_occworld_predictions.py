@@ -274,6 +274,7 @@ def export_checkpoint(model, wrapped_model, loader, dataset,
                       save_query_dynamic_diagnostic: bool = False,
                       save_query_residual_ablation: bool = False,
                       save_motion_actor_diagnostic: bool = False,
+                      save_motion_actor_overlay_diagnostic: bool = False,
                       motion_actor_step_seconds: float = 0.5,
                       track_score_threshold: float = 0.1,
                       current_anchor_root: Path = None,
@@ -328,6 +329,14 @@ def export_checkpoint(model, wrapped_model, loader, dataset,
         if save_motion_actor_diagnostic:
             motion_actor_diagnostic = _motion_actor_diagnostic_payload(
                 occ, step_seconds=motion_actor_step_seconds)
+        motion_actor_arrival = None
+        if save_motion_actor_overlay_diagnostic:
+            motion_actor_arrival = occ.get('motion_actor_arrival_mask')
+            if motion_actor_arrival is None:
+                raise RuntimeError(
+                    'Motion actor overlay diagnostic requires an enabled '
+                    'motion actor overlay')
+            motion_actor_arrival = motion_actor_arrival.detach().cpu()
         raw_prediction = None
         if save_raw_world_prediction:
             if 'world_logits' not in occ:
@@ -482,6 +491,16 @@ def export_checkpoint(model, wrapped_model, loader, dataset,
             world_valid_probability_3d=valid_probability)
         if motion_actor_diagnostic is not None:
             payload.update(motion_actor_diagnostic)
+        if motion_actor_arrival is not None:
+            expected_arrival = (1, prediction.shape[0] - 1,
+                                *prediction.shape[1:])
+            if tuple(motion_actor_arrival.shape) != expected_arrival:
+                raise ValueError(
+                    'Unexpected motion actor arrival shape '
+                    f'{tuple(motion_actor_arrival.shape)}')
+            payload['motion_actor_arrival_mask_3d'] = (
+                motion_actor_arrival[0].numpy().astype(
+                    np.bool_, copy=False))
         if raw_prediction is not None:
             payload['raw_world_pred_class_3d'] = raw_prediction
         if query_residual_ablation is not None:
@@ -597,6 +616,9 @@ def parse_args():
         '--save-motion-actor-diagnostic', action='store_true',
         help='Save aligned MotionHead actor boxes and future XY centers.')
     parser.add_argument(
+        '--save-motion-actor-overlay-diagnostic', action='store_true',
+        help='Save the model-side raw-free Motion actor arrival mask.')
+    parser.add_argument(
         '--motion-actor-step-seconds', type=float, default=0.5,
         help='Time interval represented by consecutive motion steps.')
     parser.add_argument(
@@ -653,6 +675,8 @@ def main():
                 args.save_query_residual_ablation),
             save_motion_actor_diagnostic=(
                 args.save_motion_actor_diagnostic),
+            save_motion_actor_overlay_diagnostic=(
+                args.save_motion_actor_overlay_diagnostic),
             motion_actor_step_seconds=args.motion_actor_step_seconds,
             track_score_threshold=args.track_score_threshold,
             current_anchor_root=args.current_anchor_root,

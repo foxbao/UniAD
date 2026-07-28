@@ -204,6 +204,133 @@ def apply_local_flow_overlay(
     return fused
 
 
+def rasterize_motion_actor_support(
+        actor_future: torch.Tensor,
+        actor_boxes_3d: torch.Tensor,
+        actor_scores: torch.Tensor,
+        actor_valid: torch.Tensor,
+        future_count: int,
+        pc_range: Sequence[float],
+        z_count: int,
+        height: int,
+        width: int,
+        score_threshold: float = 0.1) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Rasterize current boxes and future centers into image-aligned ZHW.
+
+    ``actor_boxes_3d`` follows ``LiDARInstance3DBoxes`` and therefore stores
+    bottom-z. B15's frozen target builder used its original annotation
+    center-z as a box floor, so the historical input contract shifts the
+    predicted bottom-z by half the box height before rasterization.
+    """
+    if actor_future.ndim != 4 or actor_future.shape[-1] != 2:
+        raise ValueError('Actor future must have shape [B,A,T,2]')
+    batch_size, actor_count, step_count, _ = actor_future.shape
+    if actor_boxes_3d.shape != (batch_size, actor_count, 7):
+        raise ValueError('Actor boxes must have shape [B,A,7]')
+    if actor_scores.shape != (batch_size, actor_count):
+        raise ValueError('Actor scores must have shape [B,A]')
+    if actor_valid.shape != (batch_size, actor_count):
+        raise ValueError('Actor valid mask must have shape [B,A]')
+    if future_count < 1 or future_count > step_count:
+        raise ValueError('Future count must be within actor motion steps')
+    if score_threshold < 0:
+        raise ValueError('Actor score threshold must be non-negative')
+    pc_range = tuple(float(value) for value in pc_range)
+    if len(pc_range) != 6 or any(
+            upper <= lower for lower, upper in zip(pc_range[:3],
+                                                    pc_range[3:])):
+        raise ValueError('Invalid motion actor point-cloud range')
+    if min(z_count, height, width) < 1:
+        raise ValueError('Motion actor grid dimensions must be positive')
+
+    dtype = torch.float32
+    device = actor_future.device
+    voxel_x = (pc_range[3] - pc_range[0]) / width
+    voxel_y = (pc_range[4] - pc_range[1]) / height
+    voxel_z = (pc_range[5] - pc_range[2]) / z_count
+    grid_x = (pc_range[0] +
+              (torch.arange(width, device=device, dtype=dtype) + 0.5) *
+              voxel_x)[None, :]
+    # OccWorld rows descend from maximum to minimum physical Y.
+    grid_y = (pc_range[4] -
+              (torch.arange(height, device=device, dtype=dtype) + 0.5) *
+              voxel_y)[:, None]
+    grid_z_index = torch.arange(z_count, device=device)
+    stationary = torch.zeros(
+        (batch_size, future_count, z_count, height, width),
+        dtype=torch.bool, device=device)
+    motion = torch.zeros_like(stationary)
+
+    def box_mask(box):
+        box = box.to(dtype=dtype)
+        length, box_width, box_height = box[3:6]
+        if bool((length <= 0) | (box_width <= 0) | (box_height <= 0)):
+            return stationary.new_zeros((z_count, height, width))
+        yaw = box[6]
+        cos_yaw = torch.cos(yaw)
+        sin_yaw = torch.sin(yaw)
+        rel_x = grid_x - box[0]
+        rel_y = grid_y - box[1]
+        local_x = rel_x * cos_yaw + rel_y * sin_yaw
+        local_y = -rel_x * sin_yaw + rel_y * cos_yaw
+        inside_xy = ((local_x.abs() <= length * 0.5) &
+                     (local_y.abs() <= box_width * 0.5))
+        # Match RaycastDrivableBuilder.box_voxel_indices: z uses the index
+        # interval [floor(bottom), ceil(bottom + height)).
+        legacy_floor_z = box[2] + box_height * 0.5
+        z_lo = torch.floor(
+            (legacy_floor_z - pc_range[2]) / voxel_z).long()
+        z_hi = torch.ceil(
+            (legacy_floor_z + box_height - pc_range[2]) / voxel_z).long()
+        inside_z = (grid_z_index >= z_lo) & (grid_z_index < z_hi)
+        return inside_z[:, None, None] & inside_xy[None]
+
+    for batch_index in range(batch_size):
+        for actor_index in range(actor_count):
+            if not bool(actor_valid[batch_index, actor_index]):
+                continue
+            score = actor_scores[batch_index, actor_index]
+            if not bool(torch.isfinite(score) & (score >= score_threshold)):
+                continue
+            box = actor_boxes_3d[batch_index, actor_index]
+            if not bool(torch.isfinite(box).all()):
+                continue
+            static_mask = box_mask(box)
+            for horizon in range(future_count):
+                stationary[batch_index, horizon] |= static_mask
+                moving_box = box.clone()
+                moving_box[:2] = actor_future[
+                    batch_index, actor_index, horizon].to(moving_box)
+                motion[batch_index, horizon] |= box_mask(moving_box)
+    return motion, stationary
+
+
+def apply_motion_actor_arrival_overlay(
+        raw_prediction: torch.Tensor,
+        motion_support: torch.Tensor,
+        stationary_support: torch.Tensor,
+        raw_class_gate: int = 0,
+        instance_class: int = 2) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Set only raw-free geometric arrivals to instance, preserving raw."""
+    if raw_prediction.ndim != 5:
+        raise ValueError('Raw prediction must have shape [B,T,Z,H,W]')
+    expected = (raw_prediction.shape[0], raw_prediction.shape[1] - 1,
+                *raw_prediction.shape[2:])
+    if (tuple(motion_support.shape) != expected or
+            tuple(stationary_support.shape) != expected):
+        raise ValueError(f'Motion support must have shape {expected}')
+    if raw_class_gate < 0 or raw_class_gate == instance_class:
+        raise ValueError('Raw class gate must be a non-instance class')
+    arrival = (
+        motion_support & ~stationary_support &
+        (raw_prediction[:, 1:] == raw_class_gate))
+    fused = raw_prediction.clone()
+    fused[:, 1:] = torch.where(
+        arrival, torch.full_like(fused[:, 1:], instance_class),
+        fused[:, 1:])
+    return fused, arrival
+
+
 def query_conditioned_flow_event_masks(
         observation_class: torch.Tensor,
         observation_known: torch.Tensor,
@@ -1091,6 +1218,11 @@ class OccWorldHead(OccHead):
                      float] = None,
                  world_local_flow_overlay_threshold: Optional[
                      float] = None,
+                 world_use_motion_actor_arrival_overlay: bool = False,
+                 world_motion_actor_score_threshold: float = 0.1,
+                 world_motion_actor_raw_class_gate: int = 0,
+                 world_motion_actor_pc_range: Sequence[float] = (
+                     -64.0, -48.0, -2.0, 64.0, 48.0, 6.0),
                  world_use_physical_confidence: bool = False,
                  world_use_physical_confidence_signals: bool = False,
                  world_physical_confidence_prior: float = 0.8,
@@ -1164,6 +1296,34 @@ class OccWorldHead(OccHead):
         self.world_local_flow_overlay_threshold = (
             None if world_local_flow_overlay_threshold is None
             else float(world_local_flow_overlay_threshold))
+        self.world_use_motion_actor_arrival_overlay = bool(
+            world_use_motion_actor_arrival_overlay)
+        if world_motion_actor_score_threshold < 0:
+            raise ValueError(
+                'world_motion_actor_score_threshold must be non-negative')
+        self.world_motion_actor_score_threshold = float(
+            world_motion_actor_score_threshold)
+        if (world_motion_actor_raw_class_gate < 0 or
+                world_motion_actor_raw_class_gate >=
+                self.world_class_count - 1):
+            raise ValueError(
+                'world_motion_actor_raw_class_gate must be free or static')
+        self.world_motion_actor_raw_class_gate = int(
+            world_motion_actor_raw_class_gate)
+        self.world_motion_actor_pc_range = tuple(
+            float(value) for value in world_motion_actor_pc_range)
+        if (len(self.world_motion_actor_pc_range) != 6 or any(
+                upper <= lower
+                for lower, upper in zip(
+                    self.world_motion_actor_pc_range[:3],
+                    self.world_motion_actor_pc_range[3:]))):
+            raise ValueError('world_motion_actor_pc_range is invalid')
+        if (self.world_use_motion_actor_arrival_overlay and
+                (self.world_physical_flow_fusion_threshold is not None or
+                 self.world_local_flow_overlay_threshold is not None or
+                 world_physical_confidence_threshold is not None)):
+            raise ValueError(
+                'Motion actor overlay is exclusive with flow fusion')
         self.world_use_physical_confidence = bool(
             world_use_physical_confidence)
         if not 0.0 <= world_physical_confidence_flow_threshold <= 1.0:
@@ -1509,13 +1669,17 @@ class OccWorldHead(OccHead):
         outputs.update(world_outputs)
         raw_world_prediction = world_outputs['world_logits'].argmax(dim=2)
         world_prediction = self._fuse_world_prediction(
-            raw_world_prediction, world_outputs)
+            raw_world_prediction, world_outputs, outs_dict=outs_dict)
+        if 'motion_actor_arrival_mask' in world_outputs:
+            outputs['motion_actor_arrival_mask'] = world_outputs[
+                'motion_actor_arrival_mask']
         ablation_logits = world_outputs[
             'world_logits_without_query_adapter']
         if ablation_logits is not None:
             outputs['query_adapter_ablation_world_pred'] = (
                 self._fuse_world_prediction(
-                    ablation_logits.argmax(dim=2), world_outputs))
+                    ablation_logits.argmax(dim=2), world_outputs,
+                    outs_dict=outs_dict))
         outputs['world_pred'] = world_prediction
         outputs['world_valid_probability'] = world_outputs[
             'valid_logits'].sigmoid()
@@ -1526,9 +1690,34 @@ class OccWorldHead(OccHead):
                 outputs[key] = outs_dict[key]
         return outputs
 
-    def _fuse_world_prediction(self, raw_world_prediction, world_outputs):
+    def _fuse_world_prediction(self, raw_world_prediction, world_outputs,
+                               outs_dict=None):
         world_prediction = raw_world_prediction
-        if self.world_physical_confidence_threshold is not None:
+        if self.world_use_motion_actor_arrival_overlay:
+            required = (
+                'planning_actor_future', 'planning_actor_boxes_3d',
+                'planning_actor_scores', 'planning_actor_valid')
+            if outs_dict is None or any(key not in outs_dict for key in required):
+                raise ValueError(
+                    'Motion actor overlay requires aligned MotionHead actors')
+            motion_support, stationary_support = (
+                rasterize_motion_actor_support(
+                    outs_dict['planning_actor_future'],
+                    outs_dict['planning_actor_boxes_3d'],
+                    outs_dict['planning_actor_scores'],
+                    outs_dict['planning_actor_valid'],
+                    future_count=world_prediction.shape[1] - 1,
+                    pc_range=self.world_motion_actor_pc_range,
+                    z_count=world_prediction.shape[2],
+                    height=world_prediction.shape[3],
+                    width=world_prediction.shape[4],
+                    score_threshold=self.world_motion_actor_score_threshold))
+            world_prediction, arrival = apply_motion_actor_arrival_overlay(
+                raw_world_prediction, motion_support, stationary_support,
+                raw_class_gate=self.world_motion_actor_raw_class_gate,
+                instance_class=self.world_class_count - 1)
+            world_outputs['motion_actor_arrival_mask'] = arrival
+        elif self.world_physical_confidence_threshold is not None:
             physical_prediction = apply_physical_flow_fusion(
                 raw_world_prediction,
                 world_outputs['observation_class'],
