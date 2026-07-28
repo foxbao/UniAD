@@ -25,6 +25,9 @@ from tools.data_converter.generate_kl_occworld_labels import (
     _load_infos,
     _resolve_path,
 )
+from tools.data_converter.generate_kl_occworld_sequence_labels import (
+    _validate_fixed_frame_times,
+)
 
 
 class InsufficientFreshScenesError(ValueError):
@@ -54,6 +57,39 @@ def _combine_manifests(manifests: Sequence[Mapping]) -> dict:
         for split_name, records in manifest['splits'].items():
             splits[f'manifest_{manifest_index}:{split_name}'] = records
     return {'splits': splits}
+
+
+def _build_reference_replacement_audit(
+        superseded: Mapping, selected: Sequence[Mapping],
+        invalid_reference: int, reason: str) -> dict:
+    old_records = [
+        dict(record)
+        for record in superseded.get('splits', {}).get('fresh_holdout', [])
+        if int(record['reference_index']) == int(invalid_reference)
+    ]
+    if len(old_records) != 1:
+        raise ValueError(
+            f'Expected one superseded reference {invalid_reference}')
+    old_record = old_records[0]
+    replacement_records = [
+        dict(record) for record in selected
+        if str(record['scene_token']) == str(old_record['scene_token'])
+    ]
+    if len(replacement_records) != 1:
+        raise ValueError('Replacement must preserve the frozen scene')
+    replacement = replacement_records[0]
+    if int(replacement['reference_index']) == int(invalid_reference):
+        raise ValueError('Nested-window audit did not replace the reference')
+    if not reason:
+        raise ValueError('Replacement reason must be non-empty')
+    return {
+        'excluded_record': old_record,
+        'reason': str(reason),
+        'replacement_record': replacement,
+        'scene_token_preserved': True,
+        'occworld_metrics_inspected_before_replacement': False,
+        'model_predictions_inspected_before_replacement': False,
+    }
 
 
 def select_fresh_holdout_records(
@@ -140,6 +176,10 @@ def parse_args():
     parser.add_argument(
         '--selection-source',
         default='fresh_evenly_spaced_before_b17_holdout_label_generation')
+    parser.add_argument('--supersedes-manifest', type=Path)
+    parser.add_argument('--superseded-evaluation-manifest', type=Path)
+    parser.add_argument('--invalid-reference', type=int)
+    parser.add_argument('--replacement-reason', default='')
     parser.add_argument('--scene-count', type=int, default=30)
     parser.add_argument('--history-offsets', type=int, nargs='+',
                         default=[-4, -3, -2, -1, 0])
@@ -185,7 +225,13 @@ def main():
         expected_step_s=args.expected_step_s,
         max_time_error_s=args.max_time_error_s,
         expected_sensor_count=args.expected_sensor_count,
-        check_lidar_files=not args.skip_lidar_file_check)
+        check_lidar_files=not args.skip_lidar_file_check,
+        reference_validator=lambda reference: _validate_fixed_frame_times(
+            infos, reference,
+            target_offsets=list(range(5)),
+            reveal_offsets=list(range(5)),
+            expected_step_s=args.expected_step_s,
+            max_time_error_s=args.max_time_error_s))
     queue_valid = _queue_checker(
         infos, args.model_queue_length, args.model_queue_max_gap_s)
 
@@ -211,6 +257,8 @@ def main():
         'eligible_scene_count': len(eligible),
         'ineligible_scene_count': len(audit_rows) - len(eligible),
         'required_offsets': required_offsets,
+        'nested_sequence_target_offsets': list(range(5)),
+        'nested_sequence_reveal_offsets': list(range(5)),
         'expected_step_s': args.expected_step_s,
         'max_time_error_s': args.max_time_error_s,
         'model_queue_length': args.model_queue_length,
@@ -248,6 +296,40 @@ def main():
     report.update(diagnostics)
     for record in selected:
         record['selection_source'] = args.selection_source
+    replacement_audit = None
+    replacement_args = (
+        args.supersedes_manifest,
+        args.superseded_evaluation_manifest,
+        args.invalid_reference,
+        args.replacement_reason,
+    )
+    if any(value not in (None, '') for value in replacement_args):
+        if any(value in (None, '') for value in replacement_args):
+            raise ValueError(
+                'All pre-inference replacement arguments are required')
+        superseded = _load_manifest(args.supersedes_manifest)
+        superseded_evaluation = _load_manifest(
+            args.superseded_evaluation_manifest)
+        if superseded_evaluation.get('status') != (
+                'frozen_before_fresh_holdout_gt_generation'):
+            raise ValueError('Superseded evaluation already advanced')
+        if (superseded_evaluation.get('model_predictions_inspected') or
+                superseded_evaluation.get(
+                    'fresh_holdout_metrics_inspected')):
+            raise ValueError(
+                'Cannot replace a reference after predictions or metrics')
+        replacement_audit = _build_reference_replacement_audit(
+            superseded, selected, args.invalid_reference,
+            args.replacement_reason)
+        report['superseded_manifest'] = {
+            'path': str(args.supersedes_manifest),
+            'sha256': _sha256(args.supersedes_manifest),
+        }
+        report['superseded_evaluation_manifest'] = {
+            'path': str(args.superseded_evaluation_manifest),
+            'sha256': _sha256(args.superseded_evaluation_manifest),
+        }
+        report['pre_inference_exclusions'] = [replacement_audit]
     report.update({
         'status': 'fresh_holdout_frozen_before_label_generation',
         'selected_scene_count': len(selected),
@@ -290,6 +372,11 @@ def main():
             'fresh_holdout': [
                 str(record['scene_token']) for record in selected]},
     }
+    if replacement_audit is not None:
+        manifest['supersedes_manifest'] = report['superseded_manifest']
+        manifest['superseded_evaluation_manifest'] = report[
+            'superseded_evaluation_manifest']
+        manifest['pre_inference_exclusions'] = [replacement_audit]
     args.out_manifest.parent.mkdir(parents=True, exist_ok=True)
     with args.out_manifest.open('w') as output:
         json.dump(manifest, output, ensure_ascii=False, indent=2)

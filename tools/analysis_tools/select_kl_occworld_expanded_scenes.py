@@ -7,7 +7,7 @@ import json
 import sys
 from collections import defaultdict
 from pathlib import Path
-from typing import Dict, Iterable, List, Mapping, Sequence, Tuple
+from typing import Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -113,7 +113,9 @@ def audit_scene_references(
         infos: Sequence[Mapping], required_offsets: Sequence[int],
         expected_step_s: float, max_time_error_s: float,
         expected_sensor_count: int = 8,
-        check_lidar_files: bool = True) -> Tuple[List[dict], List[dict]]:
+        check_lidar_files: bool = True,
+        reference_validator: Optional[Callable[[int], None]] = None
+        ) -> Tuple[List[dict], List[dict]]:
     """Find one center-biased valid reference in every eligible scene."""
     required_offsets = sorted(set(int(value) for value in required_offsets))
     extrinsics_cache: Dict[Path, set] = {}
@@ -136,6 +138,13 @@ def audit_scene_references(
                 timing_failures += 1
                 last_reason = reason
                 continue
+            if reference_validator is not None:
+                try:
+                    reference_validator(reference_index)
+                except ValueError as error:
+                    timing_failures += 1
+                    last_reason = str(error)
+                    continue
             if check_lidar_files:
                 reason = _lidar_window_error(
                     infos, reference_index, required_offsets,

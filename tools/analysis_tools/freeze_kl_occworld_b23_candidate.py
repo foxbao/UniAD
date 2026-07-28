@@ -22,13 +22,13 @@ OVERLAY_CONFIG = Path(
     'base_e2e_lidar_occworld_b23_raw_free_actor_arrival_eval.py')
 HOLDOUT_MANIFEST = Path(
     'documents/patent_2026_occ/'
-    'kl_occworld_b23_fresh_holdout_remaining_val31_v1.json')
+    'kl_occworld_b23_fresh_holdout_remaining_val31_v2.json')
 HOLDOUT_PREFLIGHT = Path(
     'outputs/patent_2026_occ/'
-    'occworld_b23_fresh_holdout_selection_remaining_val31_v1/preflight.json')
+    'occworld_b23_fresh_holdout_selection_remaining_val31_v2/preflight.json')
 OUTPUT = Path(
     'documents/patent_2026_occ/'
-    'kl_occworld_b23_candidate_freeze_v1.json')
+    'kl_occworld_b23_candidate_freeze_v2.json')
 IMPLEMENTATION_COMMIT = '4b269685c428d78061dc66f2a658accecad27f31'
 
 
@@ -68,7 +68,7 @@ def build_freeze() -> dict:
         raise ValueError('B23 fresh holdout is not the frozen 30 scenes')
 
     freeze = copy.deepcopy(base)
-    freeze['schema_version'] = 'kl_occworld_b23_candidate_freeze_v1'
+    freeze['schema_version'] = 'kl_occworld_b23_candidate_freeze_v2'
     freeze['candidate_name'] = 'B23_raw_free_motion_actor_arrival_overlay'
     freeze['scope'] = (
         'Inference-only raw-free motion-actor arrival overlay on the frozen '

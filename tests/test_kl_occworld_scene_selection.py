@@ -3,6 +3,7 @@ from tools.analysis_tools.build_kl_occworld_blind_holdout import (
     select_blind_records,
 )
 from tools.analysis_tools.prepare_kl_occworld_fresh_holdout import (
+    _build_reference_replacement_audit,
     _combine_manifests,
     select_fresh_holdout_records,
 )
@@ -193,6 +194,48 @@ def test_fresh_holdout_combines_multiple_consumed_manifests():
 
     assert [record['reference_index'] for record in selected] == [2, 3]
     assert diagnostics['existing_scene_count'] == 2
+
+
+def test_scene_audit_tries_next_reference_after_nested_window_failure():
+    infos = _toy_infos(scene_count=1, frames_per_scene=13)
+    rejected = []
+
+    def reject_center(reference_index):
+        if reference_index == 6:
+            rejected.append(reference_index)
+            raise ValueError('nested target/reveal timing mismatch')
+
+    eligible, rows = audit_scene_references(
+        infos, required_offsets=[-2, -1, 0, 1, 2],
+        expected_step_s=0.5, max_time_error_s=0.2,
+        check_lidar_files=False, reference_validator=reject_center)
+
+    assert rejected == [6]
+    assert eligible[0]['reference_index'] == 5
+    assert rows[0]['timing_candidate_failures'] == 1
+
+
+def test_fresh_replacement_audit_preserves_scene_before_inference():
+    old = {
+        'reference_index': 10,
+        'scene_token': 'scene-a',
+        'sample_token': 'old',
+        'timestamp': 1.0,
+    }
+    replacement = {
+        'reference_index': 9,
+        'scene_token': 'scene-a',
+        'sample_token': 'new',
+        'timestamp': 0.5,
+    }
+
+    audit = _build_reference_replacement_audit(
+        {'splits': {'fresh_holdout': [old]}}, [replacement], 10,
+        'nested target/reveal timing mismatch')
+
+    assert audit['replacement_record']['reference_index'] == 9
+    assert audit['scene_token_preserved']
+    assert not audit['model_predictions_inspected_before_replacement']
 
 
 def test_blind_replacement_requires_fresh_complete_model_queue():

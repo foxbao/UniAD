@@ -6,7 +6,7 @@ _base_ = [
 # causal predicted current/history inputs and does not run the B23 overlay.
 fresh_manifest = (
     'documents/patent_2026_occ/'
-    'kl_occworld_b23_fresh_holdout_evaluation_v1.json')
+    'kl_occworld_b23_fresh_holdout_evaluation_v2.json')
 fresh_label_root = (
     'outputs/patent_2026_occ/'
     'occworld_sequence_b23_fresh_holdout_remaining_val31_v1')
