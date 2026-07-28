@@ -96,21 +96,18 @@ def _record_path(path: Path) -> str:
         return str(path)
 
 
-def _root_mapping() -> dict:
+def _root_mapping(
+        artifact_tag: str = 'b17_fresh_holdout_val65_v1') -> dict:
     suffixes = {
-        'temporal': 'occworld_temporal_b17_fresh_holdout_val65_v1',
-        'occlusion': 'occworld_occlusion_b17_fresh_holdout_val65_v1',
-        'dual': 'occworld_dual_b17_fresh_holdout_val65_v1',
-        'dual_cross_scene': (
-            'occworld_dual_cross_scene_b17_fresh_holdout_val65_v1'),
-        'observation_cache': (
-            'occworld_observation_cache_b17_fresh_holdout_val65_v1'),
-        'sequence': 'occworld_sequence_b17_fresh_holdout_val65_v1',
-        'history': 'occworld_history_b17_fresh_holdout_val65_v1',
-        'sequence_audit': (
-            'occworld_sequence_b17_fresh_holdout_val65_v1_audit'),
-        'history_audit': (
-            'occworld_history_b17_fresh_holdout_val65_v1_audit'),
+        'temporal': f'occworld_temporal_{artifact_tag}',
+        'occlusion': f'occworld_occlusion_{artifact_tag}',
+        'dual': f'occworld_dual_{artifact_tag}',
+        'dual_cross_scene': f'occworld_dual_cross_scene_{artifact_tag}',
+        'observation_cache': f'occworld_observation_cache_{artifact_tag}',
+        'sequence': f'occworld_sequence_{artifact_tag}',
+        'history': f'occworld_history_{artifact_tag}',
+        'sequence_audit': f'occworld_sequence_{artifact_tag}_audit',
+        'history_audit': f'occworld_history_{artifact_tag}_audit',
     }
     return {
         key: f'outputs/patent_2026_occ/{value}'
@@ -157,7 +154,10 @@ def validate_fresh_records(fresh_manifest: dict,
 
 def prepare_evaluation_manifest(
         fresh_path: Path, existing_path: Path, freeze_path: Path,
-        track_config_path: Path, eval_config_path: Path) -> dict:
+        track_config_path: Path, eval_config_path: Path,
+        artifact_tag: str = 'b17_fresh_holdout_val65_v1',
+        evaluation_name: str = (
+            'kl_occworld_b17a_fresh_holdout_val65_evaluation_v1')) -> dict:
     fresh = _read_json(fresh_path)
     existing = _read_json(existing_path)
     candidate_summary = verify_candidate_freeze(freeze_path)
@@ -176,7 +176,7 @@ def prepare_evaluation_manifest(
     checkpoint = freeze['selected_checkpoint']
     return {
         'schema_version': 1,
-        'name': 'kl_occworld_b17a_fresh_holdout_val65_evaluation_v1',
+        'name': evaluation_name,
         'status': 'frozen_before_fresh_holdout_gt_generation',
         'annotation_file': str(annotation_file),
         'annotation_sha256': annotation_sha256,
@@ -200,7 +200,7 @@ def prepare_evaluation_manifest(
             'fresh_holdout': [
                 str(row['scene_token']) for row in records]},
         'splits': {'fresh_holdout': records},
-        'roots': _root_mapping(),
+        'roots': _root_mapping(artifact_tag),
         'cross_scene_support': {
             'source_split': 'train',
             'annotation_file': existing['annotation_file'],
@@ -219,6 +219,14 @@ def prepare_evaluation_manifest(
             'visibility_threshold': protocol['visibility_threshold'],
             'local_flow_overlay_threshold': protocol[
                 'model_local_overlay_threshold'],
+            'motion_actor_arrival_overlay': protocol.get(
+                'motion_actor_arrival_overlay', False),
+            'motion_actor_score_threshold': protocol.get(
+                'motion_actor_score_threshold'),
+            'motion_actor_raw_class_gate': protocol.get(
+                'motion_actor_raw_class_gate'),
+            'required_prediction_artifacts': protocol.get(
+                'required_prediction_artifacts', {}),
             'evaluator_post_overlay': protocol[
                 'evaluator_post_overlay'],
             'threshold_retuning_allowed': False,
@@ -427,6 +435,11 @@ def validate_prediction_artifacts(manifest: dict,
         'future_changed_class_pred_3d': (4, 10, 120, 160),
         'warped_instance_probability_3d': (4, 10, 120, 160),
     }
+    required_shapes = {
+        str(key): tuple(int(value) for value in shape)
+        for key, shape in manifest['frozen_model_protocol'].get(
+            'required_prediction_artifacts', {}).items()
+    }
     for reference in expected:
         path = predictions[reference]
         with np.load(path, allow_pickle=False) as payload:
@@ -477,6 +490,12 @@ def validate_prediction_artifacts(manifest: dict,
                         not np.all(np.isfinite(value))):
                     raise ValueError(
                         f'Prediction {reference} has non-finite {key}')
+            for key, shape in required_shapes.items():
+                if key not in payload.files:
+                    raise ValueError(f'Prediction {reference} lacks {key}')
+                if np.asarray(payload[key]).shape != shape:
+                    raise ValueError(
+                        f'Prediction {reference} has bad {key} shape')
     return {
         'prediction_count': len(predictions),
         'reference_indices': expected,
@@ -488,6 +507,8 @@ def validate_prediction_artifacts(manifest: dict,
         'online_input_override_all_true': True,
         'online_input_paths_exact': True,
         'metrics_computed_during_audit': False,
+        'required_prediction_artifacts': {
+            key: list(shape) for key, shape in required_shapes.items()},
     }
 
 
@@ -569,7 +590,15 @@ def mark_evaluated(manifest: dict, prediction_root: Path,
         'completed_on': date.today().isoformat(),
         'checkpoint_epoch': validation['checkpoint_epoch'],
         'visibility_threshold': 0.7,
-        'local_flow_overlay_threshold_in_forward_test': 0.9,
+        'local_flow_overlay_threshold_in_forward_test': manifest[
+            'frozen_model_protocol'].get('local_flow_overlay_threshold'),
+        'motion_actor_arrival_overlay_in_forward_test': bool(
+            manifest['frozen_model_protocol'].get(
+                'motion_actor_arrival_overlay', False)),
+        'motion_actor_score_threshold': manifest[
+            'frozen_model_protocol'].get('motion_actor_score_threshold'),
+        'motion_actor_raw_class_gate': manifest[
+            'frozen_model_protocol'].get('motion_actor_raw_class_gate'),
         'evaluator_post_overlay': False,
         'prediction_root': _record_path(prediction_root),
         'model_report': _record_path(model_report_path),
@@ -693,6 +722,11 @@ def parse_args():
     parser.add_argument('--persistence-report', type=Path,
                         default=PERSISTENCE_REPORT)
     parser.add_argument('--workers', type=int, default=8)
+    parser.add_argument(
+        '--artifact-tag', default='b17_fresh_holdout_val65_v1')
+    parser.add_argument(
+        '--evaluation-name',
+        default='kl_occworld_b17a_fresh_holdout_val65_evaluation_v1')
     parser.add_argument('--dry-run', action='store_true')
     return parser.parse_args()
 
@@ -709,7 +743,9 @@ def main():
             args.existing_manifest.resolve(),
             args.candidate_freeze.resolve(),
             args.track_config.resolve(),
-            args.eval_config.resolve())
+            args.eval_config.resolve(),
+            artifact_tag=args.artifact_tag,
+            evaluation_name=args.evaluation_name)
         _write_json(manifest_path, manifest)
     else:
         manifest = _load_evaluation_manifest(manifest_path)

@@ -3,6 +3,7 @@ from tools.analysis_tools.build_kl_occworld_blind_holdout import (
     select_blind_records,
 )
 from tools.analysis_tools.prepare_kl_occworld_fresh_holdout import (
+    _combine_manifests,
     select_fresh_holdout_records,
 )
 from tools.analysis_tools.select_kl_occworld_expanded_scenes import (
@@ -172,6 +173,26 @@ def test_fresh_holdout_rejects_insufficient_unconsumed_scenes():
         assert 'Only 0 fresh scenes' in str(error)
     else:
         raise AssertionError('Expected fresh-holdout selection to fail')
+
+
+def test_fresh_holdout_combines_multiple_consumed_manifests():
+    records = [{
+        'reference_index': index,
+        'scene_token': f'scene-{index}',
+        'sample_token': f'token-{index}',
+        'timestamp': float(index),
+    } for index in range(4)]
+    combined = _combine_manifests([
+        {'splits': {'train': [records[0]]}},
+        {'splits': {'fresh_holdout': [records[1]]}},
+    ])
+
+    selected, diagnostics = select_fresh_holdout_records(
+        records, combined, scene_count=2,
+        model_queue_valid=lambda _: True)
+
+    assert [record['reference_index'] for record in selected] == [2, 3]
+    assert diagnostics['existing_scene_count'] == 2
 
 
 def test_blind_replacement_requires_fresh_complete_model_queue():

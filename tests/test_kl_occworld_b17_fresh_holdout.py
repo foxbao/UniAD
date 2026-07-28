@@ -167,3 +167,51 @@ def test_b17_prediction_audit_requires_online_override(tmp_path):
     assert result['prediction_count'] == 1
     assert result['online_input_override_all_true']
     assert not result['metrics_computed_during_audit']
+
+
+def test_prediction_audit_requires_candidate_specific_artifact(tmp_path):
+    online_root = tmp_path / 'online'
+    prediction_root = tmp_path / 'predictions'
+    (online_root / '000003').mkdir(parents=True)
+    (prediction_root / '000003').mkdir(parents=True)
+    online_path = online_root / '000003/occworld_online_input.npz'
+    np.savez_compressed(online_path, reference_index=np.int64(3))
+    payload = {
+        'reference_index': np.int64(3),
+        'checkpoint_epoch': np.int64(3),
+        'world_pred_class_3d': np.zeros(
+            (5, 10, 120, 160), dtype=np.uint8),
+        'world_valid_probability_3d': np.zeros(
+            (5, 10, 120, 160), dtype=np.float32),
+        'online_input_override': np.asarray(True),
+        'online_input_path': np.asarray(str(online_path)),
+        'future_change_probability_3d': np.zeros(
+            (4, 10, 120, 160), dtype=np.float16),
+        'future_flow_2d': np.zeros((4, 2, 120, 160), dtype=np.float16),
+        'flow_change_prior_3d': np.zeros(
+            (4, 10, 120, 160), dtype=np.float16),
+        'future_changed_class_pred_3d': np.zeros(
+            (4, 10, 120, 160), dtype=np.uint8),
+        'warped_instance_probability_3d': np.zeros(
+            (4, 10, 120, 160), dtype=np.float16),
+    }
+    prediction_path = (
+        prediction_root / '000003/toy__occworld_prediction.npz')
+    np.savez_compressed(prediction_path, **payload)
+    manifest = {
+        'splits': {'fresh_holdout': [_record(3)]},
+        'frozen_model_protocol': {
+            'checkpoint_epoch': 3,
+            'required_prediction_artifacts': {
+                'motion_actor_arrival_mask_3d': [4, 10, 120, 160],
+            },
+        },
+        'online_input_audit': {'online_input_root': str(online_root)},
+    }
+
+    try:
+        validate_prediction_artifacts(manifest, prediction_root)
+    except ValueError as error:
+        assert 'lacks motion_actor_arrival_mask_3d' in str(error)
+    else:
+        raise AssertionError('Expected missing actor overlay mask to fail')

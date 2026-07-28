@@ -47,6 +47,15 @@ def _manifest_scene_set(manifest: Mapping) -> set:
     }
 
 
+def _combine_manifests(manifests: Sequence[Mapping]) -> dict:
+    """Combine split records so every previously consumed scene is excluded."""
+    splits = {}
+    for manifest_index, manifest in enumerate(manifests):
+        for split_name, records in manifest['splits'].items():
+            splits[f'manifest_{manifest_index}:{split_name}'] = records
+    return {'splits': splits}
+
+
 def select_fresh_holdout_records(
         eligible_records: Sequence[Mapping], existing_manifest: Mapping,
         scene_count: int, model_queue_valid) -> tuple:
@@ -121,10 +130,16 @@ def parse_args():
         '--ann-file', type=Path,
         default=Path('data/kl_8/kl_infos_train.pkl'))
     parser.add_argument(
-        '--existing-manifest', type=Path,
-        default=Path(
-            'documents/patent_2026_occ/'
-            'kl_occworld_full_train3_final30_manifest_v1.json'))
+        '--existing-manifest', type=Path, action='append',
+        help=(
+            'Manifest whose scenes must be excluded. Repeat this option to '
+            'exclude multiple previously consumed manifests.'))
+    parser.add_argument(
+        '--manifest-name',
+        default='kl_occworld_b17_fresh_holdout_v1')
+    parser.add_argument(
+        '--selection-source',
+        default='fresh_evenly_spaced_before_b17_holdout_label_generation')
     parser.add_argument('--scene-count', type=int, default=30)
     parser.add_argument('--history-offsets', type=int, nargs='+',
                         default=[-4, -3, -2, -1, 0])
@@ -153,7 +168,12 @@ def main():
     args = parse_args()
     if args.scene_count < 1:
         raise ValueError('--scene-count must be positive')
-    existing_manifest = _load_manifest(args.existing_manifest)
+    existing_manifest_paths = args.existing_manifest or [Path(
+        'documents/patent_2026_occ/'
+        'kl_occworld_full_train3_final30_manifest_v1.json')]
+    existing_manifests = [
+        _load_manifest(path) for path in existing_manifest_paths]
+    existing_manifest = _combine_manifests(existing_manifests)
     resolved_ann_file = Path(_resolve_path(str(args.ann_file)))
     annotation_sha256 = _sha256(resolved_ann_file)
     infos, _ = _load_infos(resolved_ann_file)
@@ -179,8 +199,13 @@ def main():
         'annotation_file': str(args.ann_file),
         'resolved_annotation_file': str(resolved_ann_file),
         'annotation_sha256': annotation_sha256,
-        'existing_manifest': str(args.existing_manifest),
-        'existing_manifest_sha256': _sha256(args.existing_manifest),
+        'existing_manifests': [
+            {
+                'path': str(path),
+                'sha256': _sha256(path),
+            }
+            for path in existing_manifest_paths
+        ],
         'annotation_frame_count': len(infos),
         'annotation_scene_count': len(audit_rows),
         'eligible_scene_count': len(eligible),
@@ -221,6 +246,8 @@ def main():
         return
 
     report.update(diagnostics)
+    for record in selected:
+        record['selection_source'] = args.selection_source
     report.update({
         'status': 'fresh_holdout_frozen_before_label_generation',
         'selected_scene_count': len(selected),
@@ -233,7 +260,7 @@ def main():
         output.write('\n')
     manifest = {
         'schema_version': 1,
-        'name': 'kl_occworld_b17_fresh_holdout_v1',
+        'name': args.manifest_name,
         'status': 'frozen_before_label_generation_and_inference',
         'strategy': (
             'fresh_scene_disjoint_evenly_spaced_after_full_contract_audit'),
@@ -241,8 +268,13 @@ def main():
         'source_preflight': str(report_path),
         'source_annotation_file': str(resolved_ann_file),
         'source_annotation_sha256': annotation_sha256,
-        'source_existing_manifest': str(args.existing_manifest),
-        'source_existing_manifest_sha256': _sha256(args.existing_manifest),
+        'source_existing_manifests': [
+            {
+                'path': str(path),
+                'sha256': _sha256(path),
+            }
+            for path in existing_manifest_paths
+        ],
         'selection_uses_occworld_labels': False,
         'selection_uses_model_predictions': False,
         'threshold_retuning_allowed': False,
