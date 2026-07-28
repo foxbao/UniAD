@@ -176,6 +176,7 @@ def _online_input(path_value, prediction_path: Path, reference: int):
 
 def _load_prediction(path: Path, reference: int) -> dict:
     required = (
+        'reference_index', 'checkpoint_epoch',
         'world_pred_class_3d', 'raw_world_pred_class_3d',
         'world_valid_probability_3d', 'future_change_probability_3d',
         'future_flow_2d', 'warped_instance_probability_3d',
@@ -185,6 +186,8 @@ def _load_prediction(path: Path, reference: int) -> dict:
         if missing:
             raise ValueError(f'{path} lacks diagnostics: {missing}')
         result = {key: np.array(payload[key], copy=True) for key in required}
+    if int(result['reference_index']) != reference:
+        raise ValueError(f'Prediction reference mismatch for {reference}')
     result['online_input'] = _online_input(
         result['online_input_path'], path, reference)
     return result
@@ -236,7 +239,7 @@ def _summarize_signal_store(store: dict) -> dict:
 
 
 def audit(manifest: dict, sequences: dict, predictions: dict, split: str,
-          threshold: float) -> dict:
+          threshold: float, expected_checkpoint_epoch: int = 3) -> dict:
     references = _split_references(manifest, split)
     if set(references).difference(sequences):
         raise ValueError('Validation labels are incomplete')
@@ -270,10 +273,12 @@ def audit(manifest: dict, sequences: dict, predictions: dict, split: str,
     parity_quantization_explained_voxels = 0
     parity_unexplained_voxels = 0
     online_paths = []
+    checkpoint_epochs = set()
 
     for reference in references:
         prediction_path = predictions[reference]
         diagnostic = _load_prediction(prediction_path, reference)
+        checkpoint_epochs.add(int(diagnostic['checkpoint_epoch']))
         labels = _target_payload(sequences[reference])
         (online_state, online_valid, history_state, history_valid,
          online_path) = diagnostic['online_input']
@@ -445,13 +450,21 @@ def audit(manifest: dict, sequences: dict, predictions: dict, split: str,
 
     rows.sort(
         key=lambda row: row['corrections']['net_correct_voxels'])
+    if checkpoint_epochs != {int(expected_checkpoint_epoch)}:
+        raise ValueError(
+            f'Expected checkpoint epoch {expected_checkpoint_epoch}, got '
+            f'{sorted(checkpoint_epochs)}')
     return {
         'schema_version': 1,
-        'purpose': 'Fixed-protocol validation failure classification.',
+        'purpose': (
+            'B24 training event supervision density audit.'
+            if split == 'train' else
+            'Fixed-protocol validation failure classification.'),
         'split': split,
         'reference_count': len(references),
         'reference_indices': references,
         'event_threshold': float(threshold),
+        'checkpoint_epochs': sorted(checkpoint_epochs),
         'model_inference_performed': False,
         'threshold_scan_performed': False,
         'parity': {
@@ -501,8 +514,10 @@ def parse_args():
             'outputs/patent_2026_occ/'
             'occworld_predictions_b17a_epoch3_full_history_'
             'validation_raw_diagnostic_v1/validation/epoch_003'))
-    parser.add_argument('--split', choices=('validation',), default='validation')
+    parser.add_argument(
+        '--split', choices=('train', 'validation'), default='validation')
     parser.add_argument('--event-threshold', type=float, default=0.9)
+    parser.add_argument('--expected-checkpoint-epoch', type=int, default=3)
     parser.add_argument(
         '--out-file', type=Path,
         default=Path(
@@ -517,7 +532,7 @@ def main():
     report = audit(
         manifest, _sequence_mapping(args.sequence_root),
         _prediction_mapping(args.prediction_root), args.split,
-        args.event_threshold)
+        args.event_threshold, args.expected_checkpoint_epoch)
     report['inputs'] = {
         'manifest': str(args.manifest),
         'manifest_sha256': _sha256(args.manifest),
