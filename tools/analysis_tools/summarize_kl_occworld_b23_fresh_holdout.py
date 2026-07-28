@@ -70,6 +70,7 @@ def build_summary(args) -> dict:
     manifest = _read_json(args.evaluation_manifest)
     model = _read_json(args.model_report)
     raw = _read_json(args.raw_report)
+    b17_final = _read_json(args.b17_final_report)
     persistence = _read_json(args.persistence_report)
     overlay = _read_json(args.overlay_audit)
     parity = _read_json(args.parity_report)
@@ -78,7 +79,8 @@ def build_summary(args) -> dict:
         raise ValueError('Fresh holdout is not sealed')
     expected = manifest['prediction_artifact_audit']['reference_indices']
     for name, report in (
-            ('model', model), ('raw', raw), ('persistence', persistence)):
+            ('model', model), ('raw', raw), ('b17_final', b17_final),
+            ('persistence', persistence)):
         if report.get('reference_indices') != expected:
             raise ValueError(f'{name} report changed reference order')
         if int(report.get('sample_count', -1)) != len(expected):
@@ -89,9 +91,34 @@ def build_summary(args) -> dict:
     metrics = {
         'b23': _metrics(model),
         'raw': _metrics(raw),
+        'b17_final_local_overlay': _metrics(b17_final),
         'persistence': _metrics(persistence),
     }
-    checks = overlay['qualification']['checks']
+    b23_vs_raw = _delta_pp(metrics['b23'], metrics['raw'])
+    b23_vs_b17 = _delta_pp(
+        metrics['b23'], metrics['b17_final_local_overlay'])
+    corrections = overlay['corrections_vs_raw']
+    preservation = overlay['preservation']
+    checks = {
+        'raw_preserved_outside_arrival': (
+            int(preservation['outside_arrival_difference_voxels']) == 0 and
+            int(preservation['current_difference_voxels']) == 0),
+        'positive_net_correct': int(
+            corrections['net_correct_voxels']) > 0,
+        'future_instance_gain_at_least_0_10_pp': (
+            b23_vs_raw['future_instance_iou'] >= 0.10),
+        'visible_transition_not_below_raw': (
+            b23_vs_raw['future_visible_transition_miou'] >= 0.0),
+        'instance_transition_not_below_raw': (
+            b23_vs_raw['future_instance_transition_miou'] >= 0.0),
+        'semantic_losses_within_0_05_pp': (
+            b23_vs_raw['future_miou'] >= -0.05 and
+            b23_vs_raw['future_current_visible_miou'] >= -0.05),
+        'not_below_b17_final_dynamic_metrics': (
+            b23_vs_b17['future_instance_iou'] >= 0.0 and
+            b23_vs_b17['future_visible_transition_miou'] >= 0.0 and
+            b23_vs_b17['future_instance_transition_miou'] >= 0.0),
+    }
     promoted = all(bool(value) for value in checks.values())
     return {
         'schema_version': 1,
@@ -114,13 +141,17 @@ def build_summary(args) -> dict:
         },
         'metrics': metrics,
         'deltas_percentage_points': {
-            'b23_vs_raw': _delta_pp(metrics['b23'], metrics['raw']),
+            'b23_vs_raw': b23_vs_raw,
+            'b23_vs_b17_final_local_overlay': b23_vs_b17,
             'b23_vs_persistence': _delta_pp(
                 metrics['b23'], metrics['persistence']),
         },
-        'overlay_corrections_vs_raw': overlay['corrections_vs_raw'],
-        'overlay_preservation': overlay['preservation'],
-        'predeclared_qualification': overlay['qualification'],
+        'overlay_corrections_vs_raw': corrections,
+        'overlay_preservation': preservation,
+        'predeclared_qualification': {
+            'checks': checks,
+            'qualified': promoted,
+        },
         'model_oracle_parity': {
             key: parity[key] for key in (
                 'reference_count', 'mask_difference_voxels',
@@ -128,17 +159,24 @@ def build_summary(args) -> dict:
         },
         'decision': {
             'promoted': promoted,
-            'current_model_after_decision': 'B17A epoch 3 raw prediction',
+            'current_model_after_decision': (
+                'B17A epoch 3 plus frozen local-flow overlay 0.9; unchanged '
+                'because holdout reselection is forbidden'),
             'reason': (
                 'Dynamic transition subsets improve, but net corrected '
                 'voxels and future instance IoU fail the frozen promotion '
                 'criteria on unseen scenes.'),
             'retuning_on_this_holdout_allowed': False,
+            'risk_note': (
+                'The read-only B17 final reconstruction is substantially '
+                'below raw on stable semantic metrics in this holdout, but '
+                'this consumed holdout cannot be used to switch protocols.'),
         },
         'evidence': {
             'evaluation_manifest': _artifact(args.evaluation_manifest),
             'model_report': _artifact(args.model_report),
             'raw_report': _artifact(args.raw_report),
+            'b17_final_report': _artifact(args.b17_final_report),
             'persistence_report': _artifact(args.persistence_report),
             'overlay_audit': _artifact(args.overlay_audit),
             'parity_report': _artifact(args.parity_report),
@@ -158,6 +196,10 @@ def parse_args():
     parser.add_argument(
         '--raw-report', type=Path,
         default=root / 'kl_occworld_b23_fresh_holdout_raw_v1.json')
+    parser.add_argument(
+        '--b17-final-report', type=Path,
+        default=root / (
+            'kl_occworld_b23_fresh_holdout_b17_final_local_overlay_v1.json'))
     parser.add_argument(
         '--persistence-report', type=Path,
         default=root / 'kl_occworld_b23_fresh_holdout_persistence_v1.json')
