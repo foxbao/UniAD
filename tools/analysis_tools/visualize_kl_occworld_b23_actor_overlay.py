@@ -73,6 +73,7 @@ def parse_args():
             'outputs/patent_2026_occ/'
             'occworld_predictions_b23_raw_free_actor_validation_v1/'
             'validation/epoch_003'))
+    parser.add_argument('--split', default='validation')
     parser.add_argument('--overview-count', type=int, default=10)
     parser.add_argument(
         '--out-dir', type=Path,
@@ -87,7 +88,7 @@ def main():
     if args.overview_count < 1:
         raise ValueError('Overview count must be positive')
     references = _split_references(
-        _load_manifest(args.manifest), 'validation')
+        _load_manifest(args.manifest), args.split)
     labels = _sequence_mapping(args.sequence_root)
     predictions = _prediction_mapping(args.prediction_root)
     missing = sorted(set(references).difference(predictions))
