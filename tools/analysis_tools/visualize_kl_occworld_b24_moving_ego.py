@@ -21,6 +21,10 @@ from PIL import Image, ImageDraw
 from tools.analysis_tools.build_kl_occworld_scene_split import (
     _sequence_mapping,
 )
+from tools.analysis_tools.audit_kl_occworld_future_reveal import (
+    _paint_point_band,
+    _point_indices,
+)
 from tools.analysis_tools.evaluate_kl_occworld import (
     _load_manifest,
     _prediction_mapping,
@@ -42,6 +46,11 @@ from tools.analysis_tools.visualize_kl_occworld_temporal_predictions import (
 )
 from tools.data_converter.generate_kl_occworld_history_batch import (
     _voxel_z_centers,
+)
+from tools.data_converter.generate_kl_occworld_labels import (
+    MultiLidarOccLabelBuilder,
+    _load_infos,
+    _resolve_path,
 )
 
 
@@ -198,7 +207,8 @@ def _semantic_tile(state: np.ndarray, title: str,
         tile, path_xy, pc_range, occ_size, horizon)
 
 
-def _heatmap_tile(values: np.ndarray, valid: np.ndarray, title: str,
+def _heatmap_tile(values: np.ndarray, valid: np.ndarray,
+                  scope: np.ndarray, title: str,
                   z_centers: np.ndarray, collision_z,
                   path_xy: np.ndarray, pc_range: np.ndarray,
                   occ_size: np.ndarray, horizon: int) -> np.ndarray:
@@ -206,9 +216,12 @@ def _heatmap_tile(values: np.ndarray, valid: np.ndarray, title: str,
             (z_centers <= collision_z[1]))
     bev = np.where(valid[keep], values[keep], 0.0).max(axis=0)
     valid_bev = valid[keep].any(axis=0)
-    image = cv2.applyColorMap(
+    scope_bev = scope[keep].any(axis=0)
+    heatmap = cv2.applyColorMap(
         np.clip(bev * 255, 0, 255).astype(np.uint8), cv2.COLORMAP_TURBO)
-    image[~valid_bev] = 28
+    image = np.full((*valid_bev.shape, 3), (20, 22, 26), dtype=np.uint8)
+    image[scope_bev] = (92, 96, 104)
+    image[valid_bev] = heatmap[valid_bev]
     image = cv2.resize(image, (300, 225), interpolation=cv2.INTER_NEAREST)
     header = np.full((30, 300, 3), 28, dtype=np.uint8)
     cv2.putText(header, title, (7, 20), cv2.FONT_HERSHEY_SIMPLEX,
@@ -227,10 +240,37 @@ def _binary_tile(mask: np.ndarray, scope: np.ndarray, title: str,
             (z_centers <= collision_z[1]))
     mask_bev = mask[keep].any(axis=0)
     scope_bev = scope[keep].any(axis=0)
-    image = np.full((*mask_bev.shape, 3), 28, dtype=np.uint8)
-    image[scope_bev] = (48, 48, 48)
+    image = np.full((*mask_bev.shape, 3), (20, 22, 26), dtype=np.uint8)
+    image[scope_bev] = (92, 96, 104)
     image[mask_bev] = color
     image = cv2.resize(image, (300, 225), interpolation=cv2.INTER_NEAREST)
+    header = np.full((30, 300, 3), 28, dtype=np.uint8)
+    cv2.putText(header, title, (7, 20), cv2.FONT_HERSHEY_SIMPLEX,
+                0.48, (235, 235, 235), 1, cv2.LINE_AA)
+    tile = np.concatenate([header, image], axis=0)
+    return _draw_ego_path(
+        tile, path_xy, pc_range, occ_size, horizon)
+
+
+def _pointcloud_tile(points: np.ndarray, title: str,
+                     collision_z, path_xy: np.ndarray,
+                     pc_range: np.ndarray, occ_size: np.ndarray,
+                     horizon: int) -> np.ndarray:
+    scale = 4
+    image_shape = (int(occ_size[1]) * scale,
+                   int(occ_size[0]) * scale)
+    image = np.full((*image_shape, 3), (20, 22, 26), dtype=np.uint8)
+    rows, columns, heights = _point_indices(
+        points, pc_range, image_shape)
+    low = heights < collision_z[0]
+    collision = ((heights >= collision_z[0]) &
+                 (heights <= collision_z[1]))
+    high = heights > collision_z[1]
+    _paint_point_band(image, rows[low], columns[low], (180, 145, 100))
+    _paint_point_band(image, rows[high], columns[high], (205, 105, 205))
+    _paint_point_band(
+        image, rows[collision], columns[collision], (70, 220, 250))
+    image = cv2.resize(image, (300, 225), interpolation=cv2.INTER_AREA)
     header = np.full((30, 300, 3), 28, dtype=np.uint8)
     cv2.putText(header, title, (7, 20), cv2.FONT_HERSHEY_SIMPLEX,
                 0.48, (235, 235, 235), 1, cv2.LINE_AA)
@@ -252,12 +292,18 @@ def _diagnostic_tiles(sample: dict, horizon: int) -> dict:
             sample['raw'][horizon], f'B17A raw | {suffix}', *common),
         'final': _semantic_tile(
             sample['final'][horizon], f'B24 final | {suffix}', *common),
+        'pointcloud': _pointcloud_tile(
+            sample['pointclouds'][horizon],
+            f'aligned 8-LiDAR | {suffix}', sample['collision_z'],
+            sample['ego_path_xy'], sample['pc_range'], sample['occ_size'],
+            horizon),
         'event': _binary_tile(
             sample['event_mask'][horizon], sample['future_scope'][horizon],
             f'event candidate | {suffix}', *common, color=(0, 215, 255)),
         'alpha': _heatmap_tile(
             sample['alpha'][horizon], sample['event_mask'][horizon],
-            f'event alpha | {suffix}', *common),
+            sample['future_scope'][horizon], f'event alpha | {suffix}',
+            *common),
         'fixed': _binary_tile(
             sample['improved'][horizon], sample['future_scope'][horizon],
             f'fixed raw error | {suffix}', *common, color=(80, 220, 80)),
@@ -268,12 +314,17 @@ def _diagnostic_tiles(sample: dict, horizon: int) -> dict:
 
 
 def _contact_sheet(sample: dict, output_path: Path) -> None:
-    keys = ('target', 'raw', 'final', 'event', 'alpha', 'fixed', 'harmed')
+    keys = (
+        'target', 'raw', 'final', 'pointcloud', 'event', 'alpha',
+        'fixed', 'harmed')
+    tiles = [
+        _diagnostic_tiles(sample, horizon)
+        for horizon in range(len(sample['target_times']))
+    ]
     rows = []
     for key in keys:
         rows.append(np.concatenate([
-            _diagnostic_tiles(sample, horizon)[key]
-            for horizon in range(len(sample['target_times']))
+            horizon_tiles[key] for horizon_tiles in tiles
         ], axis=1))
     separator = np.full((6, rows[0].shape[1], 3), 28, dtype=np.uint8)
     sheet = rows[0]
@@ -295,7 +346,7 @@ def _animation_frames(sample: dict, rendered: dict,
         ('target', 'GT target'), ('raw', 'B17A raw'),
         ('final', 'B24 final'))
     for horizon, time_s in enumerate(sample['target_times']):
-        canvas = Image.new('RGB', (1440, 830), (248, 249, 251))
+        canvas = Image.new('RGB', (1600, 850), (248, 249, 251))
         draw = ImageDraw.Draw(canvas)
         displacement = float(np.linalg.norm(
             sample['ego_path_xy'][horizon] - sample['ego_path_xy'][0]))
@@ -310,22 +361,25 @@ def _animation_frames(sample: dict, rendered: dict,
             'yellow dashed: future path',
             fill=(70, 75, 84), font=body_font)
         for column, (key, label) in enumerate(methods):
-            x = column * 480
+            x = column * 533
             draw.text((x + 18, 76), label, fill=(42, 47, 55),
                       font=body_font)
             image = Image.open(rendered[key][horizon]).convert('RGB')
-            image = image.resize((480, 360), resampling)
+            image = image.resize((533, 360), resampling)
             canvas.paste(image, (x, 102))
 
         diagnostics = _diagnostic_tiles(sample, horizon)
-        for column, key in enumerate(('event', 'alpha', 'fixed', 'harmed')):
+        diagnostic_keys = (
+            'pointcloud', 'event', 'alpha', 'fixed', 'harmed')
+        for column, key in enumerate(diagnostic_keys):
             tile = cv2.cvtColor(diagnostics[key], cv2.COLOR_BGR2RGB)
-            image = Image.fromarray(tile).resize((360, 306), resampling)
-            canvas.paste(image, (column * 360, 482))
+            image = Image.fromarray(tile).resize((320, 272), resampling)
+            canvas.paste(image, (column * 320, 490))
         draw.text(
-            (22, 802),
+            (22, 815),
             'semantic: green free, red static, blue instance | '
-            'alpha heatmap: blue low, red high',
+            'LiDAR: tan ground, cyan collision-height, purple high | '
+            'alpha: blue low, red high',
             fill=(70, 75, 84), font=body_font)
         path = output_dir / f'horizon_{horizon}.png'
         canvas.save(path)
@@ -395,6 +449,8 @@ def _load_sample(label_path: Path, prediction_path: Path,
             label['target_times_s'], dtype=np.float32)
         target_to_reference = np.asarray(
             label['target_to_reference'], dtype=np.float64)
+        target_indices = np.asarray(
+            label['target_indices'], dtype=np.int64)
         pc_range = np.asarray(label['pc_range'], dtype=np.float32)
         occ_size = np.asarray(label['occ_size'], dtype=np.int64)
         collision_z = tuple(
@@ -454,12 +510,41 @@ def _load_sample(label_path: Path, prediction_path: Path,
         'known_changed_voxels': known_changed_voxels,
         'target_times': target_times,
         'target_to_reference': target_to_reference,
+        'target_indices': target_indices,
         'ego_path_xy': ego_path_xy,
         'pc_range': pc_range,
         'occ_size': occ_size,
         'collision_z': collision_z,
         'z_centers': _voxel_z_centers(pc_range, occ_size),
     }
+
+
+def _load_aligned_pointclouds(ann_file: Path, sample: dict) -> list:
+    infos, metainfo = _load_infos(_resolve_path(ann_file))
+    target_indices = sample['target_indices']
+    if np.any(target_indices < 0) or np.any(target_indices >= len(infos)):
+        raise IndexError('A target frame index is outside the annotation file')
+    target_frame = str(metainfo.get('lidar_coord_frame', 'FLU'))
+    builder = MultiLidarOccLabelBuilder(
+        sample['pc_range'],
+        (int(sample['occ_size'][1]), int(sample['occ_size'][0])),
+        sample['occ_size'], target_frame=target_frame,
+        collision_z=sample['collision_z'])
+    aligned_pointclouds = []
+    for horizon, target_index in enumerate(target_indices):
+        result = builder.build(
+            infos[int(target_index)], diagnostics=False,
+            return_points=True)
+        points = np.asarray(result['points'], dtype=np.float32)
+        homogeneous = np.concatenate([
+            points[:, :3], np.ones((len(points), 1), dtype=np.float32)
+        ], axis=1)
+        aligned = points.copy()
+        aligned[:, :3] = (
+            homogeneous @ sample['target_to_reference'][horizon].T
+        )[:, :3]
+        aligned_pointclouds.append(aligned)
+    return aligned_pointclouds
 
 
 def parse_args():
@@ -481,6 +566,9 @@ def parse_args():
             'internal_dev/epoch_003'))
     parser.add_argument('--split', default='internal_dev')
     parser.add_argument('--reference', type=int, default=25267)
+    parser.add_argument(
+        '--ann-file', type=Path,
+        default=Path('data/kl_8/kl_infos_train.pkl'))
     parser.add_argument(
         '--out-dir', type=Path,
         default=Path(
@@ -513,6 +601,8 @@ def main():
         raise FileNotFoundError('Reference label or prediction is missing')
     sample = _load_sample(
         labels[args.reference], predictions[args.reference], args.reference)
+    sample['pointclouds'] = _load_aligned_pointclouds(
+        args.ann_file, sample)
     args.out_dir.mkdir(parents=True, exist_ok=True)
 
     contact_path = args.out_dir / 'b24_moving_ego_bev_diagnostics.png'
@@ -558,6 +648,9 @@ def main():
             'rendering from causal pose metadata and prediction diagnostics'),
         'selection_uses_gt_accuracy': False,
         'target_times_s': sample['target_times'].tolist(),
+        'target_frame_indices': sample['target_indices'].tolist(),
+        'aligned_point_counts': [
+            int(len(points)) for points in sample['pointclouds']],
         'ego_path_xy_in_reference_m': path_xy.tolist(),
         'ego_displacement_t0_to_t4_m': displacement,
         'ego_yaw_change_t0_to_t4_deg': _angle_difference_degrees(
@@ -572,8 +665,9 @@ def main():
         'net_correct_voxels': improved - harmed,
         'scope': 'evaluation-known voxels for GT/raw/final comparison',
         'coordinate_note': (
-            'All occupancy horizons and the ego path are expressed in the '
-            'reference-frame coordinate; ego motion is not image jitter.'),
+            'All occupancy horizons, LiDAR points, and the ego path are '
+            'expressed in the reference-frame coordinate; ego motion is '
+            'not image jitter.'),
         'rendered_voxel_counts': counts,
         'shared_render_crop_box_xyxy': crop_box,
         'new_model_inference_performed': False,
