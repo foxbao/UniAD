@@ -145,7 +145,6 @@ def _render_state_with_ego(
     axis.scatter(
         [ego_path_xy[0, 0]], [ego_path_xy[0, 1]], [path_z[0]],
         marker='s', s=34, c=['#20242a'], depthshade=False)
-
     axis.set_xlim(float(pc_range[0]), float(pc_range[3]))
     axis.set_ylim(float(pc_range[1]), float(pc_range[4]))
     axis.set_zlim(float(pc_range[2]), float(pc_range[5]))
@@ -181,6 +180,29 @@ def _draw_ego_path(tile: np.ndarray, path_xy: np.ndarray,
                    horizon: int) -> np.ndarray:
     tile = tile.copy()
     pixels = _world_to_tile_xy(path_xy, pc_range, occ_size)
+    axis_points = _world_to_tile_xy(
+        np.asarray([[0.0, 0.0], [14.0, 0.0], [0.0, 14.0]],
+                   dtype=np.float32),
+        pc_range, occ_size)
+    origin, x_end, y_end = axis_points
+    for end, color in ((x_end, (45, 55, 225)),
+                       (y_end, (70, 190, 75))):
+        cv2.arrowedLine(
+            tile, tuple(origin), tuple(end), (10, 12, 16), 5,
+            cv2.LINE_AA, tipLength=0.20)
+        cv2.arrowedLine(
+            tile, tuple(origin), tuple(end), color, 3,
+            cv2.LINE_AA, tipLength=0.20)
+    for label, point, color, offset in (
+            ('+x', x_end, (65, 75, 245), (3, 4)),
+            ('+y', y_end, (85, 220, 90), (3, -3))):
+        position = (int(point[0] + offset[0]), int(point[1] + offset[1]))
+        cv2.putText(
+            tile, label, position, cv2.FONT_HERSHEY_SIMPLEX, 0.43,
+            (10, 12, 16), 3, cv2.LINE_AA)
+        cv2.putText(
+            tile, label, position, cv2.FONT_HERSHEY_SIMPLEX, 0.43,
+            color, 1, cv2.LINE_AA)
     if horizon < len(pixels) - 1:
         cv2.polylines(
             tile, [pixels[horizon:]], False, (90, 210, 244), 1,
@@ -358,7 +380,7 @@ def _animation_frames(sample: dict, rendered: dict,
         draw.text(
             (22, 48),
             'orange diamond: current ego | orange line: travelled | '
-            'yellow dashed: future path',
+            'yellow dashed: future path | red +x forward | green +y left',
             fill=(70, 75, 84), font=body_font)
         for column, (key, label) in enumerate(methods):
             x = column * 533
@@ -668,6 +690,9 @@ def main():
             'All occupancy horizons, LiDAR points, and the ego path are '
             'expressed in the reference-frame coordinate; ego motion is '
             'not image jitter.'),
+        'coordinate_convention': (
+            'Reference-frame FLU: origin is the t=0 ego center, +x is the '
+            't=0 forward direction, and +y is the t=0 left direction.'),
         'rendered_voxel_counts': counts,
         'shared_render_crop_box_xyxy': crop_box,
         'new_model_inference_performed': False,
