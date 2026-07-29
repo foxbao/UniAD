@@ -31,10 +31,10 @@ def _audit(net, current=0, non_event=0):
 
 def test_b24_selector_uses_frozen_ranking_and_non_regression():
     baseline = _evaluation(0.80, 0.70, 0.20, 0.25)
-    result = select(baseline, [
-        (1, _evaluation(0.81, 0.71, 0.21, 0.26), _audit(3)),
-        (2, _evaluation(0.82, 0.72, 0.19, 0.27), _audit(8)),
-        (3, _evaluation(0.81, 0.73, 0.21, 0.26), _audit(5)),
+    result = select([
+        (1, baseline, _evaluation(0.81, 0.71, 0.21, 0.26), _audit(3)),
+        (2, baseline, _evaluation(0.82, 0.72, 0.19, 0.27), _audit(8)),
+        (3, baseline, _evaluation(0.81, 0.73, 0.21, 0.26), _audit(5)),
     ])
 
     assert result['selected_epoch'] == 3
@@ -45,8 +45,8 @@ def test_b24_selector_uses_frozen_ranking_and_non_regression():
 
 def test_b24_selector_rejects_spatial_invariant_violation():
     baseline = _evaluation(0.80, 0.70, 0.20, 0.25)
-    result = select(baseline, [
-        (1, _evaluation(0.90, 0.90, 0.30, 0.35),
+    result = select([
+        (1, baseline, _evaluation(0.90, 0.90, 0.30, 0.35),
          _audit(100, non_event=1)),
     ])
 

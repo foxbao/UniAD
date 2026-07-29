@@ -193,7 +193,7 @@ def test_event_reliability_softly_mixes_only_fixed_local_events():
 
     fused_logits = apply_event_reliability_fusion(
         raw_logits, candidate, event_mask, alpha)
-    fused_probability = fused_logits.exp()
+    fused_probability = fused_logits.softmax(dim=2)
     raw_probability = raw_logits.softmax(dim=2)
 
     assert candidate[0, 0, 0, 0].tolist() == [0, 2, 0, 0]
@@ -211,6 +211,9 @@ def test_event_reliability_softly_mixes_only_fixed_local_events():
     torch.testing.assert_close(
         fused_probability[0, 0, :, 0, 0, 3],
         raw_probability[0, 0, :, 0, 0, 3])
+    torch.testing.assert_close(
+        fused_logits[0, 0, :, 0, 0, 3],
+        raw_logits[0, 0, :, 0, 0, 3], rtol=0, atol=0)
 
 
 def test_motion_actor_raster_uses_legacy_z_and_image_aligned_rows():

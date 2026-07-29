@@ -41,26 +41,32 @@ def metrics(summary):
     }
 
 
-def select(baseline_summary, candidates):
-    baseline = metrics(baseline_summary)
+def select(candidates):
     rows = []
-    for epoch, evaluation, audit in candidates:
+    for epoch, raw_evaluation, final_evaluation, audit in candidates:
         current_difference = int(audit['current_difference_voxels'])
         non_event_difference = int(audit['non_event_difference_voxels'])
-        candidate_metrics = metrics(evaluation)
+        raw_metrics = metrics(raw_evaluation)
+        final_metrics = metrics(final_evaluation)
         invariants_pass = (
             current_difference == 0 and non_event_difference == 0)
         non_regression_pass = all((
-            candidate_metrics['future_semantic_miou'] >=
-            baseline['future_semantic_miou'],
-            candidate_metrics['future_visible_transition_miou'] >=
-            baseline['future_visible_transition_miou'],
-            candidate_metrics['future_instance_transition_miou'] >=
-            baseline['future_instance_transition_miou'],
+            final_metrics['future_semantic_miou'] >=
+            raw_metrics['future_semantic_miou'],
+            final_metrics['future_visible_transition_miou'] >=
+            raw_metrics['future_visible_transition_miou'],
+            final_metrics['future_instance_transition_miou'] >=
+            raw_metrics['future_instance_transition_miou'],
         ))
+        deltas = {
+            f'{key}_delta': final_metrics[key] - raw_metrics[key]
+            for key in final_metrics
+        }
         rows.append({
             'epoch': int(epoch),
-            **candidate_metrics,
+            'paired_raw': raw_metrics,
+            'final': final_metrics,
+            **deltas,
             'known_event_net_correct_voxels': int(
                 audit['corrections']['net_correct_voxels']),
             'current_difference_voxels': current_difference,
@@ -70,9 +76,9 @@ def select(baseline_summary, candidates):
             'eligible': invariants_pass and non_regression_pass,
         })
     rows.sort(key=lambda row: (
-        -row['future_semantic_miou'],
+        -row['final']['future_semantic_miou'],
         -row['known_event_net_correct_voxels'],
-        -row['future_instance_iou'],
+        -row['final']['future_instance_iou'],
         row['epoch']))
     eligible = [row for row in rows if row['eligible']]
     selected = None if not eligible else eligible[0]['epoch']
@@ -81,7 +87,7 @@ def select(baseline_summary, candidates):
         'protocol': (
             'invariants_then_future_semantic_miou_then_net_correct_then_'
             'future_instance_iou'),
-        'baseline': baseline,
+        'baseline_contract': 'same_forward_paired_raw_per_checkpoint',
         'candidates_ranked': rows,
         'selected_epoch': selected,
         'exploratory_pass': selected is not None,
@@ -92,10 +98,11 @@ def select(baseline_summary, candidates):
 
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--baseline-evaluation', type=Path, required=True)
     parser.add_argument(
-        '--candidate', nargs=3, action='append', required=True,
-        metavar=('EPOCH', 'EVALUATION_JSON', 'AUDIT_JSON'))
+        '--candidate', nargs=4, action='append', required=True,
+        metavar=(
+            'EPOCH', 'RAW_EVALUATION_JSON', 'FINAL_EVALUATION_JSON',
+            'AUDIT_JSON'))
     parser.add_argument('--out-file', type=Path, required=True)
     return parser.parse_args()
 
@@ -103,10 +110,11 @@ def parse_args():
 def main():
     args = parse_args()
     candidates = [
-        (int(epoch), _load(evaluation), _load(audit))
-        for epoch, evaluation, audit in args.candidate
+        (int(epoch), _load(raw_evaluation), _load(final_evaluation),
+         _load(audit))
+        for epoch, raw_evaluation, final_evaluation, audit in args.candidate
     ]
-    summary = select(_load(args.baseline_evaluation), candidates)
+    summary = select(candidates)
     args.out_file.parent.mkdir(parents=True, exist_ok=True)
     args.out_file.write_text(
         json.dumps(summary, ensure_ascii=False, indent=2) + '\n',

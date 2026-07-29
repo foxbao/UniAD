@@ -270,8 +270,10 @@ def apply_event_reliability_fusion(
     fused_probability = (
         (1.0 - alpha[:, :, None]) * raw_probability +
         alpha[:, :, None] * candidate_probability)
-    return fused_probability.clamp_min(
+    fused_logits = fused_probability.clamp_min(
         torch.finfo(raw_probability.dtype).tiny).log()
+    return torch.where(
+        event_mask[:, :, None].bool(), fused_logits, raw_future_logits)
 
 
 def rasterize_motion_actor_support(
