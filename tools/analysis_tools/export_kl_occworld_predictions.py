@@ -275,6 +275,7 @@ def export_checkpoint(model, wrapped_model, loader, dataset,
                       save_query_residual_ablation: bool = False,
                       save_motion_actor_diagnostic: bool = False,
                       save_motion_actor_overlay_diagnostic: bool = False,
+                      save_event_reliability_diagnostic: bool = False,
                       motion_actor_step_seconds: float = 0.5,
                       track_score_threshold: float = 0.1,
                       current_anchor_root: Path = None,
@@ -339,11 +340,15 @@ def export_checkpoint(model, wrapped_model, loader, dataset,
             motion_actor_arrival = motion_actor_arrival.detach().cpu()
         raw_prediction = None
         if save_raw_world_prediction:
-            if 'world_logits' not in occ:
+            raw_prediction = occ.get('world_raw_pred')
+            if raw_prediction is not None:
+                raw_prediction = raw_prediction.detach().cpu()
+            elif 'world_logits' not in occ:
                 raise RuntimeError(
                     f'No raw world logits for reference {reference_index}')
-            raw_prediction = occ['world_logits'].argmax(
-                dim=2).detach().cpu()
+            else:
+                raw_prediction = occ['world_logits'].argmax(
+                    dim=2).detach().cpu()
         query_dynamic_probability = None
         observation_class = None
         observation_known = None
@@ -390,6 +395,23 @@ def export_checkpoint(model, wrapped_model, loader, dataset,
         if physical_confidence_logits is not None:
             physical_confidence_probability = (
                 physical_confidence_logits.sigmoid().detach().cpu())
+        event_reliability_alpha = None
+        event_candidate_class = None
+        event_candidate_mask = None
+        if save_event_reliability_diagnostic:
+            event_reliability_alpha = occ.get('event_reliability_alpha')
+            event_candidate_class = occ.get('event_candidate_class')
+            event_candidate_mask = occ.get('event_candidate_mask')
+            if (event_reliability_alpha is None or
+                    event_candidate_class is None or
+                    event_candidate_mask is None):
+                raise RuntimeError(
+                    'Event reliability diagnostic requires an enabled '
+                    'event reliability head')
+            event_reliability_alpha = (
+                event_reliability_alpha.detach().cpu())
+            event_candidate_class = event_candidate_class.detach().cpu()
+            event_candidate_mask = event_candidate_mask.detach().cpu()
         if prediction.ndim != 5 or prediction.shape[0] != 1:
             raise ValueError(
                 f'Unexpected world prediction shape {prediction.shape}')
@@ -480,6 +502,23 @@ def export_checkpoint(model, wrapped_model, loader, dataset,
             physical_confidence_probability = (
                 physical_confidence_probability[0].numpy().astype(
                     np.float16, copy=False))
+        if event_reliability_alpha is not None:
+            expected_event = (
+                1, prediction.shape[0] - 1, *prediction.shape[1:])
+            if (tuple(event_reliability_alpha.shape) != expected_event or
+                    tuple(event_candidate_class.shape) != expected_event or
+                    tuple(event_candidate_mask.shape) != expected_event):
+                raise ValueError(
+                    'Unexpected event reliability diagnostic shapes')
+            event_reliability_alpha = (
+                event_reliability_alpha[0].numpy().astype(
+                    np.float16, copy=False))
+            event_candidate_class = (
+                event_candidate_class[0].numpy().astype(
+                    np.uint8, copy=False))
+            event_candidate_mask = (
+                event_candidate_mask[0].numpy().astype(
+                    np.bool_, copy=False))
         label_path = dataset.occworld_labels[reference_index]
         output_dir = epoch_root / f'{reference_index:06d}'
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -566,6 +605,11 @@ def export_checkpoint(model, wrapped_model, loader, dataset,
         if physical_confidence_probability is not None:
             payload['physical_confidence_probability_3d'] = (
                 physical_confidence_probability)
+        if event_reliability_alpha is not None:
+            payload['event_reliability_alpha_3d'] = (
+                event_reliability_alpha)
+            payload['event_candidate_class_3d'] = event_candidate_class
+            payload['event_candidate_mask_3d'] = event_candidate_mask
         np.savez_compressed(output_path, **payload)
         output_paths.append(str(output_path))
         del results, occ, prediction, valid_probability, payload
@@ -592,7 +636,7 @@ def parse_args():
     parser.add_argument(
         '--split', choices=(
             'train', 'validation', 'test', 'blind', 'final_holdout',
-            'fresh_holdout'),
+            'fresh_holdout', 'internal_train', 'internal_dev'),
         default='validation')
     parser.add_argument(
         '--output-root', type=Path,
@@ -600,6 +644,7 @@ def parse_args():
             'outputs/patent_2026_occ/'
             'occworld_predictions_world_only_v1'))
     parser.add_argument('--workers-per-gpu', type=int, default=0)
+    parser.add_argument('--gpu-id', type=int, default=0)
     parser.add_argument(
         '--save-track-boxes', action='store_true',
         help='Save filtered current TrackFormer boxes in each prediction.')
@@ -618,6 +663,9 @@ def parse_args():
     parser.add_argument(
         '--save-motion-actor-overlay-diagnostic', action='store_true',
         help='Save the model-side raw-free Motion actor arrival mask.')
+    parser.add_argument(
+        '--save-event-reliability-diagnostic', action='store_true',
+        help='Save B24 alpha, candidate class and event-mask volumes.')
     parser.add_argument(
         '--motion-actor-step-seconds', type=float, default=0.5,
         help='Time interval represented by consecutive motion steps.')
@@ -655,8 +703,9 @@ def main():
         shuffle=False)
     model = build_model(cfg.model, test_cfg=cfg.get('test_cfg'))
     model.CLASSES = dataset.CLASSES
-    model = model.cuda()
-    wrapped_model = MMDataParallel(model, device_ids=[0])
+    torch.cuda.set_device(args.gpu_id)
+    model = model.cuda(args.gpu_id)
+    wrapped_model = MMDataParallel(model, device_ids=[args.gpu_id])
     summaries = []
     for checkpoint_path in _discover_checkpoints(args):
         summary = export_checkpoint(
@@ -677,6 +726,8 @@ def main():
                 args.save_motion_actor_diagnostic),
             save_motion_actor_overlay_diagnostic=(
                 args.save_motion_actor_overlay_diagnostic),
+            save_event_reliability_diagnostic=(
+                args.save_event_reliability_diagnostic),
             motion_actor_step_seconds=args.motion_actor_step_seconds,
             track_score_threshold=args.track_score_threshold,
             current_anchor_root=args.current_anchor_root,

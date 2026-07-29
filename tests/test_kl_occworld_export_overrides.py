@@ -153,6 +153,18 @@ def test_exporter_exposes_opt_in_motion_actor_overlay_diagnostic(monkeypatch):
     assert args.save_motion_actor_overlay_diagnostic
 
 
+def test_exporter_exposes_opt_in_event_reliability_diagnostic(monkeypatch):
+    monkeypatch.setattr(sys, 'argv', [
+        'export_kl_occworld_predictions.py',
+        '--checkpoint', 'candidate.pth',
+        '--save-event-reliability-diagnostic',
+    ])
+
+    args = parse_args()
+
+    assert args.save_event_reliability_diagnostic
+
+
 def test_motion_actor_diagnostic_payload_preserves_geometry_and_time():
     future = torch.arange(48, dtype=torch.float32).reshape(1, 2, 12, 2)
     boxes = torch.arange(14, dtype=torch.float32).reshape(1, 2, 7)

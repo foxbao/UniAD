@@ -204,6 +204,76 @@ def apply_local_flow_overlay(
     return fused
 
 
+def fixed_local_flow_event_candidate(
+        observation_class: torch.Tensor,
+        observation_known: torch.Tensor,
+        warped_instance_probability: torch.Tensor,
+        threshold: float,
+        instance_class: int = 2) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Return fixed arrival/departure event labels for future voxels.
+
+    The returned candidate is deliberately independent of future GT and raw
+    semantic predictions. It is the fixed local-overlay event contract used
+    by B24's learned *continuous* reliability weight.
+    """
+    if warped_instance_probability.ndim != 5:
+        raise ValueError('Event candidate expects [B,T,Z,H,W] warp values')
+    batch_size, _, z_count, height, width = (
+        warped_instance_probability.shape)
+    expected_current = (batch_size, z_count, height, width)
+    if (tuple(observation_class.shape) != expected_current or
+            tuple(observation_known.shape) != expected_current):
+        raise ValueError('Event candidate observation shapes do not match')
+    if not 0.0 <= threshold <= 1.0:
+        raise ValueError('Event candidate threshold must be in [0, 1]')
+    current_instance = (
+        observation_known.bool() &
+        (observation_class == instance_class))
+    current_instance = current_instance[:, None].to(
+        warped_instance_probability.dtype)
+    arrival = warped_instance_probability - current_instance >= threshold
+    departure = current_instance - warped_instance_probability >= threshold
+    event_mask = arrival | departure
+    candidate_class = torch.where(
+        arrival,
+        torch.full_like(observation_class[:, None], instance_class),
+        torch.zeros_like(observation_class[:, None])).expand_as(
+            warped_instance_probability).long()
+    return candidate_class, event_mask
+
+
+def apply_event_reliability_fusion(
+        raw_future_logits: torch.Tensor,
+        candidate_class: torch.Tensor,
+        event_mask: torch.Tensor,
+        alpha: torch.Tensor) -> torch.Tensor:
+    """Mix raw and fixed-event probabilities only inside candidate events."""
+    if raw_future_logits.ndim != 6:
+        raise ValueError('Raw future logits must have shape [B,T,C,Z,H,W]')
+    expected_shape = (
+        raw_future_logits.shape[0], raw_future_logits.shape[1],
+        *raw_future_logits.shape[3:])
+    if (tuple(candidate_class.shape) != expected_shape or
+            tuple(event_mask.shape) != expected_shape or
+            tuple(alpha.shape) != expected_shape):
+        raise ValueError('Event reliability tensors do not match future logits')
+    class_count = raw_future_logits.shape[2]
+    if torch.any((candidate_class < 0) | (candidate_class >= class_count)):
+        raise ValueError('Event candidate has an invalid semantic class')
+    if torch.any((alpha < 0) | (alpha > 1)):
+        raise ValueError('Event reliability alpha must be in [0, 1]')
+    alpha = torch.where(event_mask.bool(), alpha, torch.zeros_like(alpha))
+    raw_probability = raw_future_logits.softmax(dim=2)
+    candidate_probability = F.one_hot(
+        candidate_class.long(), num_classes=class_count).permute(
+            0, 1, 5, 2, 3, 4).to(raw_probability)
+    fused_probability = (
+        (1.0 - alpha[:, :, None]) * raw_probability +
+        alpha[:, :, None] * candidate_probability)
+    return fused_probability.clamp_min(
+        torch.finfo(raw_probability.dtype).tiny).log()
+
+
 def rasterize_motion_actor_support(
         actor_future: torch.Tensor,
         actor_boxes_3d: torch.Tensor,
@@ -559,6 +629,11 @@ class DenseWorldDecoder(nn.Module):
                  use_physical_confidence: bool = False,
                  use_physical_confidence_signals: bool = False,
                  physical_confidence_prior: float = 0.8,
+                 use_event_reliability: bool = False,
+                 event_reliability_prior: float = 0.01,
+                 event_reliability_flow_threshold: float = 0.9,
+                 event_reliability_context_channels: int = 8,
+                 event_reliability_hidden_channels: int = 16,
                  observation_valid_logit_scale: float = 4.0):
         super().__init__()
         if min(in_channels, hidden_channels, horizon_count,
@@ -645,6 +720,25 @@ class DenseWorldDecoder(nn.Module):
             raise ValueError(
                 'Physical confidence prior must be between zero and one')
         self.physical_confidence_prior = float(physical_confidence_prior)
+        self.use_event_reliability = bool(use_event_reliability)
+        if self.use_event_reliability and not self.use_flow_warp:
+            raise ValueError('Event reliability requires flow warp')
+        if not 0.0 < event_reliability_prior < 1.0:
+            raise ValueError(
+                'Event reliability prior must be between zero and one')
+        if abs(event_reliability_flow_threshold - 0.9) > 1e-6:
+            raise ValueError(
+                'Event reliability fixes its local-flow threshold at 0.9')
+        if min(event_reliability_context_channels,
+               event_reliability_hidden_channels) < 1:
+            raise ValueError('Event reliability channel counts must be positive')
+        self.event_reliability_prior = float(event_reliability_prior)
+        self.event_reliability_flow_threshold = float(
+            event_reliability_flow_threshold)
+        self.event_reliability_context_channels = int(
+            event_reliability_context_channels)
+        self.event_reliability_hidden_channels = int(
+            event_reliability_hidden_channels)
         self.encoder = nn.Sequential(
             nn.Conv2d(in_channels, hidden_channels, 3, padding=1),
             nn.BatchNorm2d(hidden_channels),
@@ -740,6 +834,24 @@ class DenseWorldDecoder(nn.Module):
                 nn.Conv3d(signal_hidden_channels, 1, kernel_size=1))
         else:
             self.physical_confidence_signal_head = None
+        if self.use_event_reliability:
+            signal_count = (
+                self.event_reliability_context_channels +
+                2 * self.class_count + 9)
+            self.event_reliability_context_projection = nn.Conv2d(
+                hidden_channels,
+                self.event_reliability_context_channels,
+                kernel_size=1)
+            self.event_reliability_head = nn.Sequential(
+                nn.Conv3d(
+                    signal_count, self.event_reliability_hidden_channels,
+                    kernel_size=(1, 3, 3), padding=(0, 1, 1)),
+                nn.ReLU(inplace=True),
+                nn.Conv3d(self.event_reliability_hidden_channels, 1,
+                          kernel_size=1))
+        else:
+            self.event_reliability_context_projection = None
+            self.event_reliability_head = None
         for head in (self.current_head, self.future_residual_head,
                      self.valid_head):
             nn.init.zeros_(head.weight)
@@ -774,6 +886,13 @@ class DenseWorldDecoder(nn.Module):
         if self.use_physical_confidence_signals:
             nn.init.zeros_(self.physical_confidence_signal_head[-1].weight)
             nn.init.zeros_(self.physical_confidence_signal_head[-1].bias)
+        if self.use_event_reliability:
+            nn.init.zeros_(self.event_reliability_head[-1].weight)
+            nn.init.constant_(
+                self.event_reliability_head[-1].bias,
+                math.log(
+                    self.event_reliability_prior /
+                    (1.0 - self.event_reliability_prior)))
 
     def _load_from_state_dict(self, state_dict, prefix, local_metadata,
                               strict, missing_keys, unexpected_keys,
@@ -829,6 +948,90 @@ class DenseWorldDecoder(nn.Module):
             known[:, None].to(valid_logits.dtype) *
             self.observation_valid_logit_scale)
         return current_logits, valid_logits, known
+
+    def _event_reliability_alpha(
+            self, features: torch.Tensor, future_logits: torch.Tensor,
+            valid_logits: torch.Tensor, observation_class: torch.Tensor,
+            observation_known: torch.Tensor,
+            warped_instance_probability: torch.Tensor,
+            future_flow: torch.Tensor) -> Tuple[
+                torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Predict a local causal blend weight for fixed flow events."""
+        if self.event_reliability_context_projection is None:
+            raise ValueError('Event reliability head is disabled')
+        batch_size, future_count, class_count, z_count, height, width = (
+            future_logits.shape)
+        expected_future = (batch_size, future_count, z_count, height, width)
+        if (tuple(warped_instance_probability.shape) != expected_future or
+                tuple(future_flow.shape) != (
+                    batch_size, future_count, 2, height, width)):
+            raise ValueError('Event reliability flow inputs do not match logits')
+        if tuple(valid_logits[:, 1:].shape) != expected_future:
+            raise ValueError('Event reliability visibility does not match logits')
+        candidate_class, event_mask = fixed_local_flow_event_candidate(
+            observation_class, observation_known,
+            warped_instance_probability,
+            threshold=self.event_reliability_flow_threshold,
+            instance_class=class_count - 1)
+        arrival = event_mask & (candidate_class == class_count - 1)
+        departure = event_mask & ~arrival
+        raw_probability = future_logits.detach().softmax(dim=2)
+        raw_confidence, _ = raw_probability.max(dim=2)
+        if class_count > 1:
+            top_two = raw_probability.topk(2, dim=2).values
+            raw_margin = top_two[:, :, 0] - top_two[:, :, 1]
+        else:
+            raw_margin = raw_confidence
+        observation_one_hot = F.one_hot(
+            observation_class.long().clamp(min=0, max=class_count - 1),
+            num_classes=class_count).permute(0, 4, 1, 2, 3).to(
+                raw_probability.dtype)
+        observation_one_hot = observation_one_hot * observation_known[
+            :, None].to(raw_probability.dtype)
+        depth_count = future_count * z_count
+        context = self.event_reliability_context_projection(
+            features.detach())[:, :, None].expand(
+                -1, -1, depth_count, -1, -1)
+        raw_channels = raw_probability.permute(0, 2, 1, 3, 4, 5).reshape(
+            batch_size, class_count, depth_count, height, width)
+        observation_channels = observation_one_hot[:, :, None].expand(
+            -1, -1, future_count, -1, -1, -1).reshape(
+                batch_size, class_count, depth_count, height, width)
+
+        def depth_signal(values: torch.Tensor) -> torch.Tensor:
+            return values.reshape(
+                batch_size, 1, depth_count, height, width)
+
+        flow_norm = torch.linalg.vector_norm(
+            future_flow.detach(), dim=2)[:, :, None].expand(
+                -1, -1, z_count, -1, -1)
+        known = observation_known[:, None].expand(
+            -1, future_count, -1, -1, -1).to(raw_probability.dtype)
+        horizon = torch.arange(
+            future_count, dtype=raw_probability.dtype,
+            device=raw_probability.device).view(
+                1, future_count, 1, 1, 1)
+        horizon = horizon / max(1, future_count - 1)
+        horizon = horizon.expand(
+            batch_size, -1, z_count, height, width)
+        signals = torch.cat([
+            context,
+            raw_channels,
+            observation_channels,
+            depth_signal(raw_confidence),
+            depth_signal(raw_margin),
+            depth_signal(warped_instance_probability.detach()),
+            depth_signal(arrival.to(raw_probability.dtype)),
+            depth_signal(departure.to(raw_probability.dtype)),
+            depth_signal(flow_norm),
+            depth_signal(valid_logits[:, 1:].detach().sigmoid()),
+            depth_signal(known),
+            depth_signal(horizon),
+        ], dim=1)
+        alpha_logits = self.event_reliability_head(signals).reshape(
+            batch_size, future_count, z_count, height, width)
+        alpha = alpha_logits.sigmoid() * event_mask.to(alpha_logits.dtype)
+        return alpha, candidate_class, event_mask
 
     def forward(self, bev_feature: torch.Tensor,
                 observation_state: Optional[torch.Tensor] = None,
@@ -920,6 +1123,9 @@ class DenseWorldDecoder(nn.Module):
         flow_change_prior = None
         physical_confidence_logits = None
         query_instance_residual = None
+        event_reliability_alpha = None
+        event_candidate_class = None
+        event_candidate_mask = None
         if dynamic_occupancy_probability is not None:
             expected_dynamic_shape = (
                 batch_size, self.horizon_count, height, width)
@@ -1007,6 +1213,21 @@ class DenseWorldDecoder(nn.Module):
             future_logits = future_logits + (
                 query_instance_residual[:, :, None] *
                 instance_selector.view(1, 1, self.class_count, 1, 1, 1))
+        raw_future_logits = future_logits
+        if self.use_event_reliability:
+            if (observation_class is None or observation_known is None or
+                    warped_instance_probability is None or
+                    future_flow is None):
+                raise ValueError(
+                    'Event reliability requires observation and flow inputs')
+            (event_reliability_alpha, event_candidate_class,
+             event_candidate_mask) = self._event_reliability_alpha(
+                features, raw_future_logits, valid_logits,
+                observation_class, observation_known,
+                warped_instance_probability, future_flow)
+            future_logits = apply_event_reliability_fusion(
+                raw_future_logits.detach(), event_candidate_class,
+                event_candidate_mask, event_reliability_alpha)
         if self.use_physical_confidence:
             physical_confidence_logits = self.physical_confidence_head(
                 features).reshape(
@@ -1029,6 +1250,8 @@ class DenseWorldDecoder(nn.Module):
                         height, width)
                 physical_confidence_logits = (
                     physical_confidence_logits + signal_residual)
+        world_logits_raw = torch.cat(
+            [current_logits, raw_future_logits], dim=1)
         world_logits = torch.cat([current_logits, future_logits], dim=1)
         world_logits_without_query_adapter = None
         if self.query_occupancy_adapter is not None:
@@ -1037,6 +1260,7 @@ class DenseWorldDecoder(nn.Module):
             ], dim=1)
         return {
             'world_logits': world_logits,
+            'world_logits_raw': world_logits_raw,
             'world_logits_without_query_adapter': (
                 world_logits_without_query_adapter),
             'current_logits': current_logits,
@@ -1055,6 +1279,9 @@ class DenseWorldDecoder(nn.Module):
             'warped_instance_probability': warped_instance_probability,
             'flow_change_prior': flow_change_prior,
             'physical_confidence_logits': physical_confidence_logits,
+            'event_reliability_alpha': event_reliability_alpha,
+            'event_candidate_class': event_candidate_class,
+            'event_candidate_mask': event_candidate_mask,
         }
 
 
@@ -1196,6 +1423,7 @@ class OccWorldHead(OccHead):
                  world_flow_loss_weight: float = 0.0,
                  world_physical_confidence_loss_weight: float = 0.0,
                  world_physical_confidence_positive_weight: float = 1.0,
+                 world_event_reliability_loss_weight: float = 0.0,
                  world_visibility_loss_weight: float = 1.0,
                  world_valid_positive_weight: float = 5.0,
                  world_valid_prior: float = 0.16,
@@ -1229,6 +1457,8 @@ class OccWorldHead(OccHead):
                  world_physical_confidence_flow_threshold: float = 0.5,
                  world_physical_confidence_threshold: Optional[
                      float] = None,
+                 world_use_event_reliability: bool = False,
+                 world_event_reliability_prior: float = 0.01,
                  world_observation_valid_logit_scale: float = 4.0,
                  world_class_weights: Optional[Sequence[float]] = None,
                  **kwargs):
@@ -1242,6 +1472,7 @@ class OccWorldHead(OccHead):
             world_future_changed_class_loss_weight,
             world_flow_loss_weight,
             world_physical_confidence_loss_weight,
+            world_event_reliability_loss_weight,
             world_visibility_loss_weight)
         if any(weight < 0 for weight in loss_weights):
             raise ValueError('World loss weights must be non-negative')
@@ -1274,6 +1505,8 @@ class OccWorldHead(OccHead):
             world_physical_confidence_loss_weight)
         self.world_physical_confidence_positive_weight = float(
             world_physical_confidence_positive_weight)
+        self.world_event_reliability_loss_weight = float(
+            world_event_reliability_loss_weight)
         if world_physical_flow_fusion_threshold is not None:
             if not 0.0 <= world_physical_flow_fusion_threshold <= 1.0:
                 raise ValueError(
@@ -1345,6 +1578,23 @@ class OccWorldHead(OccHead):
         self.world_physical_confidence_threshold = (
             None if world_physical_confidence_threshold is None
             else float(world_physical_confidence_threshold))
+        self.world_use_event_reliability = bool(
+            world_use_event_reliability)
+        if (self.world_event_reliability_loss_weight > 0 and
+                not self.world_use_event_reliability):
+            raise ValueError(
+                'Event reliability loss requires its prediction head')
+        if self.world_use_event_reliability:
+            if (not world_use_flow_warp or not world_use_observation_anchor or
+                    world_history_count < 1):
+                raise ValueError(
+                    'Event reliability requires flow, observation and history')
+            if (self.world_physical_flow_fusion_threshold is not None or
+                    self.world_local_flow_overlay_threshold is not None or
+                    self.world_use_motion_actor_arrival_overlay or
+                    self.world_physical_confidence_threshold is not None):
+                raise ValueError(
+                    'Event reliability is exclusive with hard world fusion')
         self.world_visibility_loss_weight = float(
             world_visibility_loss_weight)
         self.world_valid_positive_weight = float(
@@ -1384,6 +1634,8 @@ class OccWorldHead(OccHead):
             use_physical_confidence_signals=(
                 world_use_physical_confidence_signals),
             physical_confidence_prior=world_physical_confidence_prior,
+            use_event_reliability=self.world_use_event_reliability,
+            event_reliability_prior=world_event_reliability_prior,
             observation_valid_logit_scale=(
                 world_observation_valid_logit_scale))
         if world_class_weights is None:
@@ -1602,6 +1854,26 @@ class OccWorldHead(OccHead):
             losses['loss_world_physical_confidence'] = (
                 confidence_loss * self.world_loss_weight *
                 self.world_physical_confidence_loss_weight)
+        event_reliability_loss_weight = getattr(
+            self, 'world_event_reliability_loss_weight', 0.0)
+        if event_reliability_loss_weight > 0:
+            alpha = outputs['event_reliability_alpha']
+            event_mask = outputs['event_candidate_mask']
+            if alpha is None or event_mask is None:
+                raise ValueError(
+                    'Event reliability loss requires its causal event head')
+            future_target = gt_world_occ[:, 1:]
+            known_event = (
+                event_mask.bool() &
+                (future_target != self.world_ignore_index))
+            reliability_loss = selected_world_cross_entropy(
+                outputs['world_logits'][:, 1:], future_target,
+                known_event,
+                ignore_index=self.world_ignore_index,
+                class_weights=class_weights)
+            losses['loss_world_event_reliability'] = (
+                reliability_loss * self.world_loss_weight *
+                event_reliability_loss_weight)
         return losses
 
     def forward_train(self, bev_feat, outs_dict, gt_inds_list=None,
@@ -1667,9 +1939,11 @@ class OccWorldHead(OccHead):
             history_world_state=history_world_state,
             history_world_valid=history_world_valid)
         outputs.update(world_outputs)
-        raw_world_prediction = world_outputs['world_logits'].argmax(dim=2)
+        raw_world_prediction = world_outputs['world_logits_raw'].argmax(
+            dim=2)
+        fused_base_prediction = world_outputs['world_logits'].argmax(dim=2)
         world_prediction = self._fuse_world_prediction(
-            raw_world_prediction, world_outputs, outs_dict=outs_dict)
+            fused_base_prediction, world_outputs, outs_dict=outs_dict)
         if 'motion_actor_arrival_mask' in world_outputs:
             outputs['motion_actor_arrival_mask'] = world_outputs[
                 'motion_actor_arrival_mask']
@@ -1681,6 +1955,7 @@ class OccWorldHead(OccHead):
                     ablation_logits.argmax(dim=2), world_outputs,
                     outs_dict=outs_dict))
         outputs['world_pred'] = world_prediction
+        outputs['world_raw_pred'] = raw_world_prediction
         outputs['world_valid_probability'] = world_outputs[
             'valid_logits'].sigmoid()
         for key in (

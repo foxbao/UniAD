@@ -710,7 +710,7 @@ def parse_args():
     parser.add_argument(
         '--split', choices=(
             'train', 'validation', 'test', 'blind', 'final_holdout',
-            'fresh_holdout'),
+            'fresh_holdout', 'internal_train', 'internal_dev'),
         default='test')
     parser.add_argument('--prediction-root', type=Path)
     parser.add_argument(

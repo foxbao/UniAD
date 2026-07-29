@@ -34,6 +34,7 @@ def parse_args():
     parser.add_argument(
         '--backward', action='store_true',
         help='Backpropagate the summed training losses for one batch.')
+    parser.add_argument('--gpu-id', type=int, default=0)
     return parser.parse_args()
 
 
@@ -70,7 +71,9 @@ def main():
             f'Existing OccHead weights did not load: {non_world_missing}')
     model.CLASSES = dataset.CLASSES
     model.train()
-    wrapped = MMDataParallel(model.cuda(), device_ids=[0])
+    torch.cuda.set_device(args.gpu_id)
+    wrapped = MMDataParallel(
+        model.cuda(args.gpu_id), device_ids=[args.gpu_id])
     batch = next(iter(loader))
     torch.cuda.reset_peak_memory_stats()
     context = torch.enable_grad() if args.backward else torch.no_grad()
@@ -115,6 +118,8 @@ def main():
         required.add('occ.loss_world_flow')
     if occ_head_cfg.get('world_physical_confidence_loss_weight', 0) > 0:
         required.add('occ.loss_world_physical_confidence')
+    if occ_head_cfg.get('world_event_reliability_loss_weight', 0) > 0:
+        required.add('occ.loss_world_event_reliability')
     missing_losses = sorted(required.difference(occ_losses))
     if missing_losses:
         raise RuntimeError(
@@ -129,7 +134,8 @@ def main():
         'checkpoint': checkpoint_path,
         'dataset_type': type(dataset).__name__,
         'dataset_length': len(dataset),
-        'reference_indices': dataset.valid_data_indices,
+        'reference_count': len(dataset.valid_data_indices),
+        'reference_indices_preview': dataset.valid_data_indices[:10],
         'world_target_shape': list(world_target.shape),
         'world_valid_voxels': int(world_valid.sum()),
         'occ_losses': occ_losses,

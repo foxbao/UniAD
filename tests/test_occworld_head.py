@@ -12,6 +12,7 @@ from projects.mmdet3d_plugin.uniad.dense_heads.occworld_head import (
     OccWorldHead,
     apply_physical_confidence_fusion,
     apply_physical_flow_fusion,
+    apply_event_reliability_fusion,
     apply_local_flow_overlay,
     apply_motion_actor_arrival_overlay,
     apply_query_conditioned_local_flow_overlay,
@@ -22,6 +23,7 @@ from projects.mmdet3d_plugin.uniad.dense_heads.occworld_head import (
     masked_world_cross_entropy,
     physical_confidence_supervision,
     physical_confidence_signal_tensor,
+    fixed_local_flow_event_candidate,
     selected_binary_cross_entropy_with_logits,
     selected_smooth_l1_loss,
     selected_world_cross_entropy,
@@ -174,6 +176,41 @@ def test_local_flow_overlay_preserves_raw_outside_instance_events():
         warped, threshold=0.7)
 
     assert fused[0, 1, 0, 0].tolist() == [1, 2, 0, 0]
+
+
+def test_event_reliability_softly_mixes_only_fixed_local_events():
+    observation_class = torch.tensor([[[[2, 0, 2, 0]]]])
+    observation_known = torch.ones_like(observation_class, dtype=torch.bool)
+    warped = torch.tensor([[[[[0.0, 1.0, 0.0, 0.0]]]]])
+    candidate, event_mask = fixed_local_flow_event_candidate(
+        observation_class, observation_known, warped, threshold=0.9)
+    raw_logits = torch.tensor([
+        0.0, 0.0, 0.0, 2.0,
+        0.0, 0.0, 2.0, 0.0,
+        3.0, 0.0, 0.0, 0.0,
+    ]).reshape(1, 1, 3, 1, 1, 4)
+    alpha = torch.tensor([[[[[1.0, 0.5, 0.0, 1.0]]]]])
+
+    fused_logits = apply_event_reliability_fusion(
+        raw_logits, candidate, event_mask, alpha)
+    fused_probability = fused_logits.exp()
+    raw_probability = raw_logits.softmax(dim=2)
+
+    assert candidate[0, 0, 0, 0].tolist() == [0, 2, 0, 0]
+    assert event_mask[0, 0, 0, 0].tolist() == [True, True, True, False]
+    torch.testing.assert_close(
+        fused_probability[0, 0, :, 0, 0, 0],
+        torch.tensor([1.0, 0.0, 0.0]))
+    torch.testing.assert_close(
+        fused_probability[0, 0, :, 0, 0, 1],
+        0.5 * raw_probability[0, 0, :, 0, 0, 1] +
+        torch.tensor([0.0, 0.0, 0.5]))
+    torch.testing.assert_close(
+        fused_probability[0, 0, :, 0, 0, 2],
+        raw_probability[0, 0, :, 0, 0, 2])
+    torch.testing.assert_close(
+        fused_probability[0, 0, :, 0, 0, 3],
+        raw_probability[0, 0, :, 0, 0, 3])
 
 
 def test_motion_actor_raster_uses_legacy_z_and_image_aligned_rows():
@@ -574,6 +611,49 @@ def test_physical_confidence_head_starts_at_configured_prior():
     assert decoder.physical_confidence_head.bias.grad is not None
 
 
+def test_event_reliability_head_is_local_and_incremental():
+    base = DenseWorldDecoder(
+        in_channels=4, hidden_channels=6,
+        horizon_count=3, class_count=3, z_count=1,
+        history_count=1, use_flow_warp=True)
+    adapted = DenseWorldDecoder(
+        in_channels=4, hidden_channels=6,
+        horizon_count=3, class_count=3, z_count=1,
+        history_count=1, use_flow_warp=True,
+        use_event_reliability=True,
+        event_reliability_prior=0.01)
+    missing, unexpected = adapted.load_state_dict(
+        base.state_dict(), strict=False)
+
+    assert unexpected == []
+    assert all('event_reliability_' in key for key in missing)
+    with torch.no_grad():
+        adapted.future_flow_head.bias[1] = 1.0
+    state = torch.tensor([[[[3, 1], [1, 1]]]])
+    valid = torch.ones_like(state, dtype=torch.bool)
+    feature = torch.randn(1, 4, 2, 2)
+    base_output = base(
+        feature, observation_state=state, observation_valid=valid,
+        history_state=state[:, None], history_valid=valid[:, None])
+    output = adapted(
+        feature, observation_state=state, observation_valid=valid,
+        history_state=state[:, None], history_valid=valid[:, None])
+
+    torch.testing.assert_close(
+        output['world_logits_raw'], base_output['world_logits'])
+    alpha = output['event_reliability_alpha']
+    event_mask = output['event_candidate_mask']
+    assert torch.all(alpha[~event_mask] == 0)
+    assert torch.any(alpha[event_mask] > 0)
+    raw_probability = output['world_logits_raw'][:, 1:].softmax(dim=2)
+    fused_probability = output['world_logits'][:, 1:].softmax(dim=2)
+    non_event = ~event_mask[:, :, None].expand_as(raw_probability)
+    torch.testing.assert_close(
+        fused_probability[non_event], raw_probability[non_event])
+    output['world_logits'][:, 1:].sum().backward()
+    assert adapted.event_reliability_head[-1].bias.grad is not None
+
+
 def test_candidate_signal_confidence_is_zero_residual_at_initialization():
     decoder = DenseWorldDecoder(
         in_channels=4, hidden_channels=8,
@@ -821,6 +901,41 @@ def test_occworld_stability_loss_only_backpropagates_on_stable_known_voxels():
     assert torch.count_nonzero(future_gradient[:, 1, ..., 1]).item() > 0
     assert torch.count_nonzero(future_gradient[:, 1, ..., 2]).item() > 0
     assert torch.count_nonzero(future_gradient[..., 3]).item() == 0
+
+
+def test_event_reliability_loss_only_backpropagates_on_known_events():
+    head = SimpleNamespace(
+        world_class_weights=torch.tensor([]),
+        world_ignore_index=255,
+        world_valid_positive_weight=1.0,
+        world_loss_weight=1.0,
+        world_current_loss_weight=0.0,
+        world_future_loss_weight=0.0,
+        world_visibility_loss_weight=0.0,
+        world_future_transition_loss_weight=0.0,
+        world_future_stability_loss_weight=0.0,
+        world_future_change_gate_loss_weight=0.0,
+        world_future_changed_class_loss_weight=0.0,
+        world_flow_loss_weight=0.0,
+        world_physical_confidence_loss_weight=0.0,
+        world_event_reliability_loss_weight=1.0)
+    world_logits = torch.zeros(
+        (1, 2, 3, 1, 1, 2), requires_grad=True)
+    outputs = {
+        'world_logits': world_logits,
+        'valid_logits': torch.zeros((1, 2, 1, 1, 2)),
+        'event_reliability_alpha': torch.tensor([[[[[0.1, 0.0]]]]]),
+        'event_candidate_mask': torch.tensor([[[[[True, False]]]]]),
+    }
+    target = torch.tensor([0, 1, 2, 1]).reshape(1, 2, 1, 1, 2)
+    valid = target != 255
+
+    losses = OccWorldHead.loss_world(head, outputs, target, valid)
+    losses['loss_world_event_reliability'].backward()
+
+    future_gradient = world_logits.grad[:, 1]
+    assert torch.count_nonzero(future_gradient[..., 0]).item() > 0
+    assert torch.count_nonzero(future_gradient[..., 1]).item() == 0
 
 
 def test_selected_binary_cross_entropy_only_uses_selected_voxels():
