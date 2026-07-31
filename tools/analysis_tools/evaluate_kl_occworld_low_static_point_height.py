@@ -351,10 +351,12 @@ def evaluate_labels(sequence_root: Path, ann_file: Path, workers: int,
     totals['downgraded_fraction_of_all_known'] = (
         totals['downgraded_voxels'] / totals['all_world_known_voxels']
         if totals['all_world_known_voxels'] else None)
+    totals['downgraded_next_state_evaluated_voxels'] = int(sum(
+        totals['downgraded_next_state_histogram'].values()))
     totals['downgraded_next_state_fraction'] = {
         key: (
-            value / totals['downgraded_voxels']
-            if totals['downgraded_voxels'] else None)
+            value / totals['downgraded_next_state_evaluated_voxels']
+            if totals['downgraded_next_state_evaluated_voxels'] else None)
         for key, value in totals['downgraded_next_state_histogram'].items()}
     return {
         'sequence_root': str(sequence_root),
