@@ -45,6 +45,34 @@ from tools.data_converter.generate_kl_occworld_temporal_labels import (
 )
 
 
+def _draw_ego_orientation(image: np.ndarray) -> None:
+    """Draw the reference ego FLU axes as a persistent panel orientation cue."""
+    origin = (34, image.shape[0] - 30)
+    x_end = (84, image.shape[0] - 30)
+    y_end = (34, image.shape[0] - 80)
+    for end, color in ((x_end, (45, 55, 225)),   # red: vehicle forward
+                       (y_end, (70, 190, 75))):  # green: vehicle left
+        cv2.arrowedLine(
+            image, origin, end, (8, 10, 14), 5, cv2.LINE_AA,
+            tipLength=0.22)
+        cv2.arrowedLine(
+            image, origin, end, color, 3, cv2.LINE_AA,
+            tipLength=0.22)
+    cv2.circle(image, origin, 3, (20, 180, 245), -1, cv2.LINE_AA)
+    cv2.putText(
+        image, '+x', (88, image.shape[0] - 24),
+        cv2.FONT_HERSHEY_SIMPLEX, 0.48, (65, 75, 245), 1,
+        cv2.LINE_AA)
+    cv2.putText(
+        image, '+y', (39, image.shape[0] - 84),
+        cv2.FONT_HERSHEY_SIMPLEX, 0.48, (85, 220, 90), 1,
+        cv2.LINE_AA)
+    cv2.putText(
+        image, 'ego', (10, image.shape[0] - 8),
+        cv2.FONT_HERSHEY_SIMPLEX, 0.39, (245, 185, 75), 1,
+        cv2.LINE_AA)
+
+
 def _panel(image: np.ndarray, title: str,
            content_size=(460, 340)) -> np.ndarray:
     target_width, target_height = content_size
@@ -56,6 +84,9 @@ def _panel(image: np.ndarray, title: str,
     top = (target_height - resized.shape[0]) // 2
     left = (target_width - resized.shape[1]) // 2
     content[top:top + resized.shape[0], left:left + resized.shape[1]] = resized
+    # Candidate crops often exclude (0, 0); retain the ego-frame direction
+    # marker in every panel so their position remains interpretable.
+    _draw_ego_orientation(content)
     header = np.full((34, target_width, 3), (28, 30, 34), dtype=np.uint8)
     cv2.putText(header, title, (9, 23), cv2.FONT_HERSHEY_SIMPLEX,
                 0.47, (238, 238, 238), 1, cv2.LINE_AA)
