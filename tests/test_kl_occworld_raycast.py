@@ -2,6 +2,7 @@ import numpy as np
 
 from projects.mmdet3d_plugin.datasets.pipelines.kl_drivable_label import (
     RaycastDrivableBuilder,
+    visible_ground_recovery_mask,
 )
 from tools.data_converter.generate_kl_occworld_labels import (
     FREE,
@@ -77,6 +78,53 @@ def _builder():
     )
 
 
+def test_visible_ground_recovery_requires_visible_local_component():
+    base = np.zeros((7, 7), dtype=np.uint8)
+    base[3, 3] = 1
+    relaxed = np.zeros_like(base)
+    relaxed[3, 4] = 1
+    relaxed[2, 4] = 1
+    relaxed[1, 1:3] = 1
+    free = np.ones_like(base)
+    blocked = np.zeros_like(base)
+    blocked[3, 2] = 1
+
+    recovered = visible_ground_recovery_mask(
+        base, relaxed, free, blocked, max_distance=1.5,
+        min_component_cells=2)
+
+    # The blocked neighbour and the isolated two-cell component must not be
+    # restored, while the visible, connected cell on the other side is kept.
+    assert recovered[3, 2] == 0
+    assert recovered[3, 4] == 1
+    assert recovered[2, 4] == 1
+    assert recovered[1, 1] == 0
+    assert recovered[1, 2] == 0
+
+
+def test_visible_ground_recovery_geodesic_does_not_cross_candidate_gap():
+    base = np.zeros((7, 7), dtype=np.uint8)
+    base[3, 1] = 1
+    relaxed = np.zeros_like(base)
+    relaxed[3, 2] = 1
+    relaxed[3, 4] = 1
+    free = np.ones_like(base)
+    blocked = np.zeros_like(base)
+
+    euclidean = visible_ground_recovery_mask(
+        base, relaxed, free, blocked, max_distance=4.0,
+        min_component_cells=1, distance_mode='euclidean')
+    geodesic = visible_ground_recovery_mask(
+        base, relaxed, free, blocked, max_distance=4.0,
+        min_component_cells=1, distance_mode='geodesic')
+
+    assert euclidean[3, 2] == 1
+    assert euclidean[3, 4] == 1
+    assert geodesic[3, 2] == 1
+    # Cell (3, 3) is not a valid candidate, so geodesic cannot jump to 4.
+    assert geodesic[3, 4] == 0
+
+
 def test_explicit_zero_origin_preserves_legacy_output():
     builder = _builder()
     points = np.asarray([
@@ -131,6 +179,142 @@ def test_optional_voxel_evidence_does_not_change_bev_result():
                 'raw_obstacle_voxels', 'semantic_voxels', 'free_voxels']:
         assert with_voxels[key].ndim == 2
         assert with_voxels[key].shape[1] == 3
+
+
+def test_endpoint_point_percentile_avoids_voxel_center_ground_error():
+    common = dict(
+        pc_range=[0, 0, -1, 2, 2, 1],
+        bev_size=[2, 2],
+        occ_size=[2, 2, 2],
+        ground_height_threshold=0.10,
+        ground_smooth_radius=0,
+        fill_ground=False,
+        obstacle_min_component_voxels=1,
+        ego_ignore_range=None,
+    )
+    points = np.asarray([
+        [0.2, 0.2, -0.65, 1.0],
+        [0.3, 0.3, -0.62, 1.0],
+    ], dtype=np.float32)
+    boxes = np.empty((0, 7), dtype=np.float32)
+    voxel = np.asarray([[0, 0, 0]], dtype=np.int64)
+
+    center_builder = RaycastDrivableBuilder(**common)
+    center_result = center_builder.build(points, boxes, return_voxels=True)
+    assert np.any(np.all(center_result['raw_obstacle_voxels'] == voxel,
+                         axis=1))
+
+    point_builder = RaycastDrivableBuilder(
+        **common, ground_endpoint_height_mode='point_percentile',
+        ground_endpoint_point_percentile=0.90)
+    point_result = point_builder.build(points, boxes, return_voxels=True)
+    assert np.any(np.all(point_result['ground_voxels'] == voxel, axis=1))
+    assert point_result['raw_obstacle_voxels'].shape == (0, 3)
+
+    rescue_builder = RaycastDrivableBuilder(
+        **common, ground_endpoint_height_mode='point_percentile_rescue',
+        ground_endpoint_point_percentile=0.90)
+    rescue_result = rescue_builder.build(points, boxes, return_voxels=True)
+    assert np.any(np.all(rescue_result['ground_voxels'] == voxel, axis=1))
+
+
+def test_endpoint_point_percentile_rescue_does_not_add_obstacles():
+    common = dict(
+        pc_range=[0, 0, -1, 2, 2, 1],
+        bev_size=[2, 2],
+        occ_size=[2, 2, 2],
+        ground_height_threshold=0.55,
+        ground_smooth_radius=0,
+        fill_ground=False,
+        obstacle_min_component_voxels=1,
+        ego_ignore_range=None,
+    )
+    points = np.asarray([
+        [0.2, 0.2, -0.95, 1.0],
+        [0.3, 0.3, -0.05, 1.0],
+    ], dtype=np.float32)
+    boxes = np.empty((0, 7), dtype=np.float32)
+
+    point_result = RaycastDrivableBuilder(
+        **common, ground_endpoint_height_mode='point_percentile').build(
+            points, boxes, return_voxels=True)
+    assert point_result['raw_obstacle_voxels'].shape == (1, 3)
+
+    rescue_result = RaycastDrivableBuilder(
+        **common, ground_endpoint_height_mode='point_percentile_rescue').build(
+            points, boxes, return_voxels=True)
+    assert rescue_result['raw_obstacle_voxels'].shape == (0, 3)
+    assert rescue_result['ground_voxels'].shape == (1, 3)
+
+
+def test_endpoint_point_percentile_rescue_keeps_vertical_structure_base():
+    builder = RaycastDrivableBuilder(
+        pc_range=[0, 0, -1, 2, 2, 1],
+        bev_size=[2, 2],
+        occ_size=[2, 2, 2],
+        ground_height_threshold=0.10,
+        ground_smooth_radius=0,
+        fill_ground=False,
+        obstacle_min_component_voxels=1,
+        ego_ignore_range=None,
+        ground_endpoint_height_mode='point_percentile_rescue',
+        ground_endpoint_point_percentile=0.90,
+    )
+    points = np.asarray([
+        [0.2, 0.2, -0.65, 1.0],
+        [0.3, 0.3, -0.62, 1.0],
+        [0.2, 0.2, 0.70, 1.0],
+    ], dtype=np.float32)
+    result = builder.build(
+        points, np.empty((0, 7), dtype=np.float32), return_voxels=True)
+    low_voxel = np.asarray([[0, 0, 0]], dtype=np.int64)
+    assert np.any(np.all(result['raw_obstacle_voxels'] == low_voxel, axis=1))
+
+
+def test_endpoint_rescue_does_not_cascade_through_component_filtering():
+    """Only the verified P90 endpoint may leave a valid old component."""
+    builder = RaycastDrivableBuilder(
+        pc_range=[0, 0, -1, 3, 1, 1],
+        bev_size=[1, 3],
+        occ_size=[3, 1, 2],
+        ground_height_threshold=0.10,
+        ground_smooth_radius=0,
+        fill_ground=False,
+        obstacle_min_points_per_voxel=1,
+        obstacle_min_component_voxels=3,
+        ego_ignore_range=None,
+        ground_endpoint_height_mode='point_percentile_rescue',
+        ground_endpoint_point_percentile=0.90,
+    )
+    # All endpoints lie in the same z voxel.  The first is ground-like by
+    # its actual point height; the other two are genuine high returns.  The
+    # historical three-voxel component passes the component-size filter.
+    points = np.asarray([
+        [0.1, 0.2, -0.95],
+        [1.1, 0.2, -0.10],
+        [2.1, 0.2, -0.10],
+    ], dtype=np.float32)
+    voxels = np.asarray([[0, 0, 0], [1, 0, 0], [2, 0, 0]], dtype=np.int64)
+    builder.estimate_ground_height = lambda _points, _voxels: (
+        np.full((3, 1), -1.0, dtype=np.float32),
+        np.ones((3, 1), dtype=bool))
+
+    ground, obstacle, raw_obstacle, historical_obstacle = (
+        builder.split_scene_ground_obstacle(
+        points, voxels, voxels, np.empty((0, 3), dtype=np.int64))
+    )
+
+    np.testing.assert_array_equal(ground, np.asarray([[0, 0, 0]]))
+    np.testing.assert_array_equal(
+        raw_obstacle, np.asarray([[1, 0, 0], [2, 0, 0]]))
+    np.testing.assert_array_equal(obstacle, raw_obstacle)
+    np.testing.assert_array_equal(historical_obstacle, np.asarray(
+        [[0, 0, 0], [1, 0, 0], [2, 0, 0]]))
+
+    result = builder.build(
+        points, np.empty((0, 7), dtype=np.float32), return_voxels=True)
+    np.testing.assert_array_equal(result['raw_obstacle_voxels'], raw_obstacle)
+    np.testing.assert_array_equal(result['obstacle_voxels'], raw_obstacle)
 
 
 def test_xyz_to_zhw_keeps_z_and_reverses_bev_rows():

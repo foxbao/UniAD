@@ -1,4 +1,5 @@
 import pickle
+import heapq
 import os.path as osp
 import re
 from dataclasses import dataclass, field
@@ -489,6 +490,86 @@ def windowed_count(mask_bool: np.ndarray, radius: int) -> np.ndarray:
             integral[x1, y0] + integral[x0, y0])
 
 
+def visible_ground_recovery_mask(base_ground: np.ndarray,
+                                 relaxed_ground: np.ndarray,
+                                 free: np.ndarray,
+                                 blocked: np.ndarray,
+                                 max_distance: float,
+                                 min_component_cells: int,
+                                 distance_mode: str = 'euclidean') -> np.ndarray:
+    """Recover local, visible ground gaps without extrapolating to unknown.
+
+    ``relaxed_ground`` uses the same local ground-height estimate as
+    ``base_ground``, but a wider support window. A candidate remains valid
+    only when LiDAR rays see it, no obstacle or annotation box blocks it,
+    and it stays close to reliable ground. ``euclidean`` measures direct
+    image distance. ``geodesic`` measures the shortest 8-neighbour path
+    through ``base_ground`` and valid candidate cells, so a gap cannot be
+    crossed by a straight-line shortcut.
+    """
+    masks = [np.asarray(value, dtype=bool) for value in
+             (base_ground, relaxed_ground, free, blocked)]
+    if any(mask.shape != masks[0].shape for mask in masks[1:]):
+        raise ValueError('visible-ground recovery masks must share one shape')
+    if max_distance < 0:
+        raise ValueError('visible-ground recovery max_distance must be >= 0')
+    if min_component_cells < 1:
+        raise ValueError(
+            'visible-ground recovery min_component_cells must be >= 1')
+    if distance_mode not in ('euclidean', 'geodesic'):
+        raise ValueError(
+            "visible-ground recovery distance_mode must be 'euclidean' "
+            f"or 'geodesic', got {distance_mode!r}")
+
+    base, relaxed, free_mask, blocked_mask = masks
+    if not base.any():
+        return np.zeros_like(base, dtype=np.uint8)
+    candidate = relaxed & free_mask & ~blocked_mask & ~base
+    if not candidate.any():
+        return np.zeros_like(base, dtype=np.uint8)
+
+    if distance_mode == 'euclidean':
+        # OpenCV computes distance to zero-valued pixels, hence ``~base``.
+        distance = cv2.distanceTransform((~base).astype(np.uint8),
+                                         cv2.DIST_L2, 3)
+    else:
+        # Dijkstra on the small BEV grid. Restricting traversal to base and
+        # valid candidates gives a true connected-ground distance.
+        allowed = base | candidate
+        distance = np.full(base.shape, np.inf, dtype=np.float32)
+        heap = []
+        for start in np.argwhere(base):
+            start_xy = (int(start[0]), int(start[1]))
+            distance[start_xy] = 0.0
+            heapq.heappush(heap, (0.0, *start_xy))
+        neighbours = (
+            (-1, -1, np.sqrt(2.0)), (-1, 0, 1.0), (-1, 1, np.sqrt(2.0)),
+            (0, -1, 1.0), (0, 1, 1.0),
+            (1, -1, np.sqrt(2.0)), (1, 0, 1.0), (1, 1, np.sqrt(2.0)))
+        height, width = base.shape
+        while heap:
+            current, row, col = heapq.heappop(heap)
+            if current > float(distance[row, col]) + 1e-6:
+                continue
+            for d_row, d_col, step_cost in neighbours:
+                next_row, next_col = row + d_row, col + d_col
+                if (next_row < 0 or next_row >= height or next_col < 0 or
+                        next_col >= width or not allowed[next_row, next_col]):
+                    continue
+                next_distance = current + step_cost
+                if next_distance + 1e-6 < distance[next_row, next_col]:
+                    distance[next_row, next_col] = next_distance
+                    heapq.heappush(heap, (next_distance, next_row, next_col))
+    recovered = candidate & (distance <= float(max_distance))
+    if min_component_cells > 1 and recovered.any():
+        count, labels, stats, _ = cv2.connectedComponentsWithStats(
+            recovered.astype(np.uint8), connectivity=8)
+        keep_labels = np.flatnonzero(
+            stats[1:count, cv2.CC_STAT_AREA] >= min_component_cells) + 1
+        recovered = np.isin(labels, keep_labels)
+    return recovered.astype(np.uint8)
+
+
 class RaycastDrivableBuilder:
     """Numpy port of the KL raycast OCC ground/obstacle target generator."""
 
@@ -497,10 +578,18 @@ class RaycastDrivableBuilder:
                  bev_size: Sequence[int],
                  occ_size: Optional[Sequence[int]] = None,
                  ground_height_threshold: float = 0.55,
+                 ground_endpoint_height_mode: str = 'voxel_center',
+                 ground_endpoint_point_percentile: float = 0.90,
                  ground_smooth_radius: int = 3,
                  fill_ground: bool = True,
                  ground_fill_radius: int = 2,
                  ground_fill_min_neighbors: int = 5,
+                 visible_ground_recovery: bool = False,
+                 visible_ground_recovery_radius: int = 3,
+                 visible_ground_recovery_min_neighbors: int = 5,
+                 visible_ground_recovery_max_distance: float = 1.5,
+                 visible_ground_recovery_min_component_cells: int = 8,
+                 visible_ground_recovery_distance_mode: str = 'euclidean',
                  remove_ground_under_obstacle: bool = True,
                  obstacle_min_points_per_voxel: int = 2,
                  obstacle_min_component_voxels: int = 8,
@@ -532,10 +621,52 @@ class RaycastDrivableBuilder:
             self.occ_size.astype(np.float32))
         self.ray_origin = np.zeros(3, dtype=np.float32)
         self.ground_height_threshold = float(ground_height_threshold)
+        if ground_endpoint_height_mode not in (
+                'voxel_center', 'point_percentile',
+                'point_percentile_rescue'):
+            raise ValueError(
+                'ground_endpoint_height_mode must be voxel_center, '
+                'point_percentile, or point_percentile_rescue, got '
+                f'{ground_endpoint_height_mode}')
+        if not 0.0 <= ground_endpoint_point_percentile <= 1.0:
+            raise ValueError(
+                'ground_endpoint_point_percentile must be in [0, 1], got '
+                f'{ground_endpoint_point_percentile}')
+        self.ground_endpoint_height_mode = ground_endpoint_height_mode
+        self.ground_endpoint_point_percentile = float(
+            ground_endpoint_point_percentile)
         self.ground_smooth_radius = int(ground_smooth_radius)
         self.fill_ground = bool(fill_ground)
         self.ground_fill_radius = int(ground_fill_radius)
         self.ground_fill_min_neighbors = int(ground_fill_min_neighbors)
+        self.visible_ground_recovery = bool(visible_ground_recovery)
+        self.visible_ground_recovery_radius = int(
+            visible_ground_recovery_radius)
+        self.visible_ground_recovery_min_neighbors = int(
+            visible_ground_recovery_min_neighbors)
+        self.visible_ground_recovery_max_distance = float(
+            visible_ground_recovery_max_distance)
+        self.visible_ground_recovery_min_component_cells = int(
+            visible_ground_recovery_min_component_cells)
+        self.visible_ground_recovery_distance_mode = (
+            str(visible_ground_recovery_distance_mode))
+        if self.visible_ground_recovery_radius < 0:
+            raise ValueError('visible_ground_recovery_radius must be >= 0')
+        if self.visible_ground_recovery_min_neighbors < 1:
+            raise ValueError(
+                'visible_ground_recovery_min_neighbors must be >= 1')
+        if self.visible_ground_recovery_max_distance < 0:
+            raise ValueError(
+                'visible_ground_recovery_max_distance must be >= 0')
+        if self.visible_ground_recovery_min_component_cells < 1:
+            raise ValueError(
+                'visible_ground_recovery_min_component_cells must be >= 1')
+        if self.visible_ground_recovery_distance_mode not in (
+                'euclidean', 'geodesic'):
+            raise ValueError(
+                "visible_ground_recovery_distance_mode must be "
+                "'euclidean' or 'geodesic', got "
+                f"{self.visible_ground_recovery_distance_mode!r}")
         self.remove_ground_under_obstacle = bool(remove_ground_under_obstacle)
         self.obstacle_min_points_per_voxel = int(
             obstacle_min_points_per_voxel)
@@ -777,6 +908,18 @@ class RaycastDrivableBuilder:
             ground_raw, self.ground_smooth_radius, 0.25)
         return ground_est, raw_ground_xy
 
+    def ground_voxels_from_fill(self, ground_est: np.ndarray,
+                                fill_xy: np.ndarray) -> np.ndarray:
+        """Place one ground voxel at the local height estimate per BEV cell."""
+        xy = np.argwhere(fill_xy)
+        if xy.shape[0] == 0:
+            return np.empty((0, 3), dtype=np.int64)
+        z_idx = np.floor(
+            (ground_est[fill_xy] - self.pc_range[2]) /
+            self.voxel_size[2]).astype(np.int64)
+        valid = (z_idx >= 0) & (z_idx < self.occ_size[2])
+        return np.column_stack([xy[valid], z_idx[valid]])
+
     def component_point_count(self, component: Sequence[Tuple[int, int, int]],
                               point_counts: Optional[np.ndarray]) -> int:
         if point_counts is None:
@@ -919,26 +1062,98 @@ class RaycastDrivableBuilder:
             self, scene_points_xyz: np.ndarray,
             scene_point_voxels: np.ndarray,
             scene_hit_voxels: np.ndarray,
-            semantic_voxels: np.ndarray) -> Tuple[np.ndarray, np.ndarray,
-                                                  np.ndarray]:
+            semantic_voxels: np.ndarray,
+            return_recovery_candidates: bool = False):
         if scene_hit_voxels.shape[0] == 0 or scene_points_xyz.shape[0] == 0:
             empty = np.empty((0, 3), dtype=np.int64)
-            return empty, empty, empty
+            result = (empty, empty, empty, empty)
+            return (result + (empty,) if return_recovery_candidates
+                    else result)
 
         ground_est, raw_ground_xy = self.estimate_ground_height(
             scene_points_xyz, scene_point_voxels)
-        center_z = (self.pc_range[2] +
-                    (scene_hit_voxels[:, 2].astype(np.float32) + 0.5) *
-                    self.voxel_size[2])
+        center_height = (
+            self.pc_range[2] +
+            (scene_hit_voxels[:, 2].astype(np.float32) + 0.5) *
+            self.voxel_size[2])
+        if self.ground_endpoint_height_mode == 'voxel_center':
+            endpoint_height = center_height
+        else:
+            occ_y, occ_z = int(self.occ_size[1]), int(self.occ_size[2])
+            point_cell = (
+                scene_point_voxels[:, 0].astype(np.int64) * occ_y * occ_z +
+                scene_point_voxels[:, 1].astype(np.int64) * occ_z +
+                scene_point_voxels[:, 2].astype(np.int64))
+            endpoint_cell = (
+                scene_hit_voxels[:, 0].astype(np.int64) * occ_y * occ_z +
+                scene_hit_voxels[:, 1].astype(np.int64) * occ_z +
+                scene_hit_voxels[:, 2].astype(np.int64))
+            point_height, _ = grouped_linear_percentile(
+                point_cell, scene_points_xyz[:, 2],
+                self.ground_endpoint_point_percentile,
+                int(np.prod(self.occ_size)))
+            endpoint_height = point_height[endpoint_cell]
         cell_ground = ground_est[scene_hit_voxels[:, 0],
                                  scene_hit_voxels[:, 1]]
-        is_ground = (
+        center_is_ground = (
             np.isfinite(cell_ground) &
-            (center_z <= cell_ground + self.ground_height_threshold))
+            np.isfinite(endpoint_height) &
+            (center_height <= cell_ground + self.ground_height_threshold))
+        baseline_raw_obstacle = scene_hit_voxels[~center_is_ground]
+        if self.ground_endpoint_height_mode == 'point_percentile_rescue':
+            point_is_ground = (
+                np.isfinite(cell_ground) &
+                np.isfinite(endpoint_height) &
+                (endpoint_height <=
+                 cell_ground + self.ground_height_threshold))
+            # Do not relabel the bottom of a vertically supported structure.
+            # The rescue is only for isolated low endpoints where voxel
+            # quantisation or a small calibration residual caused false static.
+            flat_xy = (
+                scene_hit_voxels[:, 0].astype(np.int64) * int(self.occ_size[1]) +
+                scene_hit_voxels[:, 1].astype(np.int64))
+            highest_center_obstacle = np.full(
+                int(self.occ_size[0] * self.occ_size[1]), -1,
+                dtype=np.int64)
+            np.maximum.at(
+                highest_center_obstacle, flat_xy[~center_is_ground],
+                scene_hit_voxels[~center_is_ground, 2])
+            has_higher_center_obstacle = (
+                highest_center_obstacle[flat_xy] > scene_hit_voxels[:, 2])
+            rescue_ground = (~center_is_ground & point_is_ground &
+                             ~has_higher_center_obstacle)
+            is_ground = center_is_ground | rescue_ground
+        elif self.ground_endpoint_height_mode == 'point_percentile':
+            is_ground = (
+                np.isfinite(cell_ground) &
+                np.isfinite(endpoint_height) &
+                (endpoint_height <=
+                 cell_ground + self.ground_height_threshold))
+        else:
+            is_ground = center_is_ground
         observed_ground = scene_hit_voxels[is_ground]
         raw_obstacle = scene_hit_voxels[~is_ground]
-        obstacle = self.filter_obstacle_voxels(
-            raw_obstacle, scene_point_voxels)
+        if self.ground_endpoint_height_mode == 'point_percentile_rescue':
+            # Filter the historical obstacle set first, then remove only the
+            # individually verified rescue endpoints.  Re-filtering after
+            # deleting rescue endpoints can split a formerly valid connected
+            # component and silently erase adjacent, non-rescued obstacles.
+            baseline_obstacle = self.filter_obstacle_voxels(
+                baseline_raw_obstacle, scene_point_voxels)
+            rescue_keys = np.zeros(tuple(self.occ_size.tolist()), dtype=bool)
+            rescue_voxels = scene_hit_voxels[rescue_ground]
+            if rescue_voxels.shape[0] > 0:
+                rescue_keys[rescue_voxels[:, 0], rescue_voxels[:, 1],
+                            rescue_voxels[:, 2]] = True
+            keep = ~rescue_keys[
+                baseline_obstacle[:, 0], baseline_obstacle[:, 1],
+                baseline_obstacle[:, 2]]
+            obstacle = baseline_obstacle[keep]
+            historical_obstacle = baseline_obstacle
+        else:
+            obstacle = self.filter_obstacle_voxels(
+                raw_obstacle, scene_point_voxels)
+            historical_obstacle = np.empty((0, 3), dtype=np.int64)
 
         if self.fill_ground:
             # Old code counted finite ground neighbours per cell with an
@@ -949,14 +1164,20 @@ class RaycastDrivableBuilder:
             fill_xy = (
                 (neighbor_counts >= self.ground_fill_min_neighbors) &
                 np.isfinite(ground_est))
-            xy = np.argwhere(fill_xy)
-            z_idx = np.floor(
-                (ground_est[fill_xy] - self.pc_range[2]) /
-                self.voxel_size[2]).astype(np.int64)
-            valid = (z_idx >= 0) & (z_idx < self.occ_size[2])
-            ground = np.column_stack([xy[valid], z_idx[valid]])
+            ground = self.ground_voxels_from_fill(ground_est, fill_xy)
         else:
             ground = observed_ground
+
+        recovery_ground = np.empty((0, 3), dtype=np.int64)
+        if return_recovery_candidates:
+            recovery_counts = windowed_count(
+                raw_ground_xy, self.visible_ground_recovery_radius)
+            recovery_fill_xy = (
+                (recovery_counts >=
+                 self.visible_ground_recovery_min_neighbors) &
+                np.isfinite(ground_est))
+            recovery_ground = self.ground_voxels_from_fill(
+                ground_est, recovery_fill_xy)
 
         if self.remove_ground_under_obstacle and ground.shape[0] > 0:
             # Drop ground voxels whose (x,y) column is blocked by an obstacle
@@ -971,7 +1192,9 @@ class RaycastDrivableBuilder:
             ground_keys = ground[:, 0] * occ_y + ground[:, 1]
             keep = ~np.isin(ground_keys, blocked_keys)
             ground = ground[keep]
-        return ground, obstacle, raw_obstacle
+        result = (ground, obstacle, raw_obstacle, historical_obstacle)
+        return (result + (recovery_ground,) if return_recovery_candidates
+                else result)
 
     def voxels_to_bev(self, voxels: np.ndarray) -> np.ndarray:
         mask = np.zeros((self.bev_h, self.bev_w), dtype=np.uint8)
@@ -1008,7 +1231,7 @@ class RaycastDrivableBuilder:
         if point_voxels.shape[0] == 0:
             empty = np.zeros((self.bev_h, self.bev_w), dtype=np.uint8)
             result = dict(ground=empty, obstacle=empty, free=empty,
-                          blocked=empty)
+                          blocked=empty, visible_ground_recovery=empty)
             if return_voxels:
                 empty_voxels = np.empty((0, 3), dtype=np.int64)
                 result.update(
@@ -1040,11 +1263,36 @@ class RaycastDrivableBuilder:
         scene_hit_voxels = hit_voxels[~hit_in_box]
         semantic_voxels = hit_voxels[hit_in_box]
 
-        (ground_voxels, obstacle_voxels,
-         raw_obstacle_voxels) = self.split_scene_ground_obstacle(
-             scene_points, scene_point_voxels, scene_hit_voxels,
-             semantic_voxels)
-        if obstacle_voxels.shape[0] > 0:
+        split_result = self.split_scene_ground_obstacle(
+            scene_points, scene_point_voxels, scene_hit_voxels,
+            semantic_voxels,
+            return_recovery_candidates=self.visible_ground_recovery)
+        (ground_voxels, obstacle_voxels, raw_obstacle_voxels,
+         historical_obstacle_voxels) = split_result[:4]
+        recovery_ground_voxels = (
+            split_result[4] if self.visible_ground_recovery else
+            np.empty((0, 3), dtype=np.int64))
+        if self.ground_endpoint_height_mode == 'point_percentile_rescue':
+            # Preserve the historical final static set, then subtract only
+            # endpoints that passed the per-voxel rescue test.  In
+            # particular, an extra post-box component filter must not turn a
+            # neighbouring, non-rescued return into a new false negative.
+            historical = historical_obstacle_voxels
+            if historical.shape[0] > 0:
+                near_box = self.obstacle_near_box_mask(historical, boxes)
+                historical = historical[~near_box]
+                if historical.shape[0] > 0:
+                    historical = self.filter_obstacle_voxels(
+                        historical, scene_point_voxels)
+            raw_mask = np.zeros(tuple(self.occ_size.tolist()), dtype=bool)
+            if raw_obstacle_voxels.shape[0] > 0:
+                raw_mask[raw_obstacle_voxels[:, 0],
+                         raw_obstacle_voxels[:, 1],
+                         raw_obstacle_voxels[:, 2]] = True
+            keep = raw_mask[historical[:, 0], historical[:, 1],
+                            historical[:, 2]]
+            obstacle_voxels = historical[keep]
+        elif obstacle_voxels.shape[0] > 0:
             near_box = self.obstacle_near_box_mask(obstacle_voxels, boxes)
             obstacle_voxels = obstacle_voxels[~near_box]
             if obstacle_voxels.shape[0] > 0:
@@ -1064,11 +1312,29 @@ class RaycastDrivableBuilder:
             free_mask[ego_ignore_mask > 0] = 0
             blocked_mask[ego_ignore_mask > 0] = 0
 
+        visible_recovery_mask = np.zeros_like(ground_mask, dtype=np.uint8)
+        if self.visible_ground_recovery and recovery_ground_voxels.shape[0]:
+            relaxed_ground_mask = self.voxels_to_bev(recovery_ground_voxels)
+            visible_recovery_mask = visible_ground_recovery_mask(
+                ground_mask, relaxed_ground_mask, free_mask, blocked_mask,
+                self.visible_ground_recovery_max_distance,
+                self.visible_ground_recovery_min_component_cells,
+                self.visible_ground_recovery_distance_mode)
+            ground_mask = np.maximum(ground_mask, visible_recovery_mask)
+            rows = self.bev_h - 1 - recovery_ground_voxels[:, 1]
+            cols = recovery_ground_voxels[:, 0]
+            recovered_voxels = recovery_ground_voxels[
+                visible_recovery_mask[rows, cols] > 0]
+            if recovered_voxels.shape[0]:
+                ground_voxels = np.concatenate(
+                    [ground_voxels, recovered_voxels], axis=0)
+
         result = dict(
             ground=ground_mask,
             obstacle=obstacle_mask,
             free=free_mask,
-            blocked=blocked_mask)
+            blocked=blocked_mask,
+            visible_ground_recovery=visible_recovery_mask)
         if return_voxels:
             result.update(
                 ground_voxels=ground_voxels,
@@ -1102,10 +1368,19 @@ class GenerateKLDrivableMapLabels:
                  box_z_origin: str = 'bottom',
                  raycast_occ_size: Optional[Sequence[int]] = None,
                  raycast_ground_height_threshold: float = 0.55,
+                 raycast_ground_endpoint_height_mode: str = 'voxel_center',
+                 raycast_ground_endpoint_point_percentile: float = 0.90,
                  raycast_ground_smooth_radius: int = 3,
                  raycast_fill_ground: bool = True,
                  raycast_ground_fill_radius: int = 2,
                  raycast_ground_fill_min_neighbors: int = 5,
+                 raycast_visible_ground_recovery: bool = False,
+                 raycast_visible_ground_recovery_radius: int = 3,
+                 raycast_visible_ground_recovery_min_neighbors: int = 5,
+                 raycast_visible_ground_recovery_max_distance: float = 1.5,
+                 raycast_visible_ground_recovery_min_component_cells: int = 8,
+                 raycast_visible_ground_recovery_distance_mode: str = (
+                     'euclidean'),
                  raycast_remove_ground_under_obstacle: bool = True,
                  raycast_obstacle_min_points_per_voxel: int = 2,
                  raycast_obstacle_min_component_voxels: int = 8,
@@ -1157,10 +1432,25 @@ class GenerateKLDrivableMapLabels:
             self.bev_size,
             occ_size=raycast_occ_size,
             ground_height_threshold=raycast_ground_height_threshold,
+            ground_endpoint_height_mode=(
+                raycast_ground_endpoint_height_mode),
+            ground_endpoint_point_percentile=(
+                raycast_ground_endpoint_point_percentile),
             ground_smooth_radius=raycast_ground_smooth_radius,
             fill_ground=raycast_fill_ground,
             ground_fill_radius=raycast_ground_fill_radius,
             ground_fill_min_neighbors=raycast_ground_fill_min_neighbors,
+            visible_ground_recovery=raycast_visible_ground_recovery,
+            visible_ground_recovery_radius=(
+                raycast_visible_ground_recovery_radius),
+            visible_ground_recovery_min_neighbors=(
+                raycast_visible_ground_recovery_min_neighbors),
+            visible_ground_recovery_max_distance=(
+                raycast_visible_ground_recovery_max_distance),
+            visible_ground_recovery_min_component_cells=(
+                raycast_visible_ground_recovery_min_component_cells),
+            visible_ground_recovery_distance_mode=(
+                raycast_visible_ground_recovery_distance_mode),
             remove_ground_under_obstacle=raycast_remove_ground_under_obstacle,
             obstacle_min_points_per_voxel=raycast_obstacle_min_points_per_voxel,
             obstacle_min_component_voxels=raycast_obstacle_min_component_voxels,

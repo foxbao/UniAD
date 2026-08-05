@@ -97,6 +97,17 @@ train_pipeline = [
         bev_size=canvas_size,
         augment_raycast_ground=True,
         keep_raycast_obstacles=False,
+        raycast_ground_endpoint_height_mode='point_percentile_rescue',
+        raycast_ground_endpoint_point_percentile=0.90,
+        raycast_visible_ground_recovery=True,
+        raycast_visible_ground_recovery_radius=3,
+        raycast_visible_ground_recovery_min_neighbors=5,
+        # Follow connected, visible candidate ground for up to 2.5 BEV
+        # cells. This handles a continuous, slightly raised road surface
+        # without bridging an unseen or blocked gap.
+        raycast_visible_ground_recovery_distance_mode='geodesic',
+        raycast_visible_ground_recovery_max_distance=2.5,
+        raycast_visible_ground_recovery_min_component_cells=8,
         box_z_origin='bottom'),
     dict(type='PointShuffle'),
     dict(type='DefaultFormatBundle3D', class_names=class_names),
@@ -136,6 +147,14 @@ test_pipeline = [
         bev_size=canvas_size,
         augment_raycast_ground=True,
         keep_raycast_obstacles=False,
+        raycast_ground_endpoint_height_mode='point_percentile_rescue',
+        raycast_ground_endpoint_point_percentile=0.90,
+        raycast_visible_ground_recovery=True,
+        raycast_visible_ground_recovery_radius=3,
+        raycast_visible_ground_recovery_min_neighbors=5,
+        raycast_visible_ground_recovery_distance_mode='geodesic',
+        raycast_visible_ground_recovery_max_distance=2.5,
+        raycast_visible_ground_recovery_min_component_cells=8,
         box_z_origin='bottom'),
     dict(
         type='DefaultFormatBundle3D',
